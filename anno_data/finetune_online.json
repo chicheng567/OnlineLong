@@ -23,15 +23,21 @@
         "data_augment": false,
         "repeat_time": 1
     },
-    "queryd_tg_train": {
+    "queryd" : {
         "annotation": "anno_online/temporal_grounding/queryd.json",
         "data_root": "/workspace/chicheng/datasets/queryd/videos",
         "data_augment": false,
         "repeat_time": 1
     },
     "got10k_track_train": {
-        "annotation":"anno_online/object_tracking/got10k_dynamic.json",
+        "annotation": "anno_online/object_tracking/got10k_dynamic.json",
         "data_root": "/workspace/chicheng/datasets/got10k/full_data/train",
+        "data_augment": false,
+        "repeat_time": 1
+    },
+    "charades_tg_train": {
+        "annotation": "anno_online/temporal_grounding/charades.json",
+        "data_root": "/workspace/chicheng/datasets/charades/videos",
         "data_augment": false,
         "repeat_time": 1
     }

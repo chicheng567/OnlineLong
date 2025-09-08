@@ -17,7 +17,7 @@ NUM_CPU=1
 
 GPUS=$((NNODE * NUM_GPUS))
 BATCH_SIZE=${BATCH_SIZE:-512}
-PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-2}
+PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-1}
 GRADIENT_ACC=$((BATCH_SIZE / PER_DEVICE_BATCH_SIZE / GPUS))
 
 MASTER_NODE='localhost'
@@ -51,7 +51,7 @@ torchrun \
       --drop_path_rate 0.1 \
       --freeze_llm False \
       --freeze_mlp False \
-      --freeze_backbone False \
+      --freeze_backbone True \
       --vision_select_layer -1 \
       --dataloader_num_workers 8 \
       --bf16 True \
