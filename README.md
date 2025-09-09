@@ -1,178 +1,165 @@
+---
+license: mit
+extra_gated_prompt: 
+  You agree to not use the dataset to conduct experiments that cause harm to
+  human subjects. Please note that the data in this dataset may be subject to
+  other agreements. Before using the data, be sure to read the relevant
+  agreements carefully to ensure compliant use. Video copyrights belong to the
+  original video creators or platforms and are for academic research use only.
+task_categories:
+- visual-question-answering
+- question-answering
+extra_gated_fields:
+  Name: text
+  Company/Organization: text
+  Country: text
+  E-Mail: text
+language:
+- en
+size_categories:
+- 1M<n<10M
+configs:
+- config_name: dense_video_captioning
+  data_files:
+  - split: anet
+    path: dense_video_captioning/anet.json
+  - split: vitt
+    path: dense_video_captioning/vitt.json
+  - split: youcook2
+    path: dense_video_captioning/youcook2.json
 
-# <img src="assets/videochat_logo.png" style="vertical-align: -10px;" :height="50px" width="50px">VideoChat-Online
-<div style="text-align: center;">
-    <h2 style="display: inline-block; vertical-align: middle; margin-left: 10px; margin-bottom: 0;">
-        <a href="https://videochat-online.github.io">[CVPR2025] Online Video Understanding: OVBench and VideoChat-Online</a>
-    </h2>
-</div>
+- config_name: object_tracking
+  data_files:
+  - split: got10k_dynamic
+    path: object_tracking/got10k_dynamic.json
+  - split: lasot_dynamic
+    path: object_tracking/lasot_dynamic.json
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2501.00584"><img src="https://img.shields.io/badge/arXiv-2501.00584-b31b1b.svg" alt="arXiv"></a>
-  <a href="https://huggingface.co/datasets/MCG-NJU/VideoChatOnline-IT"><img src="https://img.shields.io/badge/🤗%20Dataset-VideoChatOnline--IT-ffca28" alt="Dataset"></a>
-  <a href="https://huggingface.co/MCG-NJU/VideoChatOnline-4B"><img src="https://img.shields.io/badge/🤗%20Model-VideoChatOnline-4dc0b0" alt="Model"></a>
-  <a href="https://videochat-online.github.io/"><img src="https://img.shields.io/badge/🏆%20Leaderboard-Ranking-8b5cf6" alt="Leaderboard"></a>
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
-</p>
+- config_name: refcoco
+  data_files:
+  - split: refcoco_50k
+    path: refcoco/refcoco_50k.json
 
+- config_name: spatial_temporal_action_localization
+  data_files:
+  - split: ava
+    path: spatial_temporal_action_localization/ava.json
 
+- config_name: step_localization
+  data_files:
+  - split: coin
+    path: step_localization/coin/coin.json
+  - split: hirest_step
+    path: step_localization/hirest_step/hirest_step.json
 
-# 📝 **Highlights**
+- config_name: temporal_grounding
+  data_files:
+  - split: charades
+    path: temporal_grounding/charades.json
+  - split: didemo
+    path: temporal_grounding/didemo.json
+  - split: hirest
+    path: temporal_grounding/hirest.json
+  - split: queryd
+    path: temporal_grounding/queryd.json
 
-🚀 **Introducing OVBench**
- OVBench is a benchmark tailored for **real-time video understanding**:
+- config_name: visual_genome
+  data_files:
+  - split: vg_86k
+    path: visual_genome/vg_86k.json
+---
 
-- **Memory, Perception, and Prediction of Temporal Contexts**: Questions are framed to reference the present state of entities, requiring models to memorize/perceive/predict past/present/future temporal contexts over time.
-- **Dynamic Spatio-temporal Interaction**: The benchmark demands precise real-time interactions with video content, where actions, objects, and events must be understood in the context of their spatial and temporal relationships.
-- **Contextual Awareness at Specific Moments**: Real-time questions are contextual, changing based on the specific timestamp they are asked, requiring a deep understanding of how temporal context evolves.
+## Overview  
+This dataset provides a comprehensive collection for **Online Spatial-Temporal Understanding tasks**, covering multiple domains including Dense Video Captioning, Video Grounding, Step Localization, Spatial-Temporal Action Localization, and Object Tracking.
+
+## Data Formation
+Our pipeline begins with 96K high-quality samples curated from 5 tasks across 12 datasets. The conversion process enhances online spatiotemporal understanding through template transformation. We strategically insert queries along the timeline in an organized interleaved format for each video sample to facilitate temporal context differentiation.
+| **Category**                           | **Dataset**                      | **Count**  | **Query** | **Response** |
+|----------------------------------------|----------------------------------|-----------|-----------|-------------|
+| **Temporal Grounding**                 | DiDeMo                           | 33,002    | Identify whether a specific event is still ongoing at present or has it concluded. Provide the start time of the event and its duration up to the query timestamp. | `<start time> - <event duration>: duration up to query timestamp.` |
+|                                        | QuerYD                           | 14,620    |           |             |
+|                                        | HiREST                           | 459       |           |             |
+|                                        | Charades-STA                     | 12,408    |           |             |
+| **Object Tracking**                    | LaSOT                            | 1,120     | Track the object currently based on a brief description or box. | (1) Past trajectory up to the present with brief descriptions; (2) Track the object sequentially in future frames as they become available. |
+|                                        | GOT10k                           | 8,250     |           |             |
+| **Step Localization and Captioning**   | COIN                             | 9,029     | List steps completed up to the current point, excluding previously reported ones. | `<start time> - <end time>, <step description>...` |
+|                                        | HiREST                           | 459       |           |             |
+| **Dense Video Captioning**             | ActivityNet Captions             | 10,009    | Identify and list events up to the current point, excluding previously reported ones. | `<start time> - <end time>, <event description>...` |
+|                                        | VITT                             | 5,141     |           |             |
+|                                        | YouCook2                         | 1,192     |           |             |
+| **Spatial Temporal Action Localization** | AVA                              | 160       | Identify current and past actions of a person at a specific box at present. | List actions for the person over time, with corresponding positions. |
+| **Total number of datasets:**          |                                  | **96k**   |           |             |
 
 ---
 
-🏗️  **Pyramid Memory Bank**
+### Additional Information:
+- **Interleave Format:** Temporally Random Insert (T3, T2, T1)
+- **Video Timeline:** Processed for **Online Video LLM**
 
-To tackle the challenges of infinite video streams, we propose a **multi-layered Pyramid Memory Bank** that balances **spatial and temporal information**:  
-
-1. **Spatial Anchors**: The lower layers retain high-resolution features to preserve fine-grained spatial cues, capturing keyframes as "spatial anchors" with a lower sampling rate.
-2. **Progressive Abstraction**: As the layers progress, spatial resolution decays  while the temporal sampling rate grows proportionally, forming an abstract representation of fine-grained long-short-term patterns.
-3. **Dynamic Eviction**: A dynamic eviction mechanism detects temporal redundancy via similarity, combined with pooling for spatial compression, improving storage efficiency.
-
----
-
-🎯 **Offline-to-Online Learning Paradigm** 
-
-A novel training strategy designed for online video streams:  
-
-- **Interleaved Dialogue Tuning**: Combines offline video data with online instruction tuning in a dialogue format.  
-- **Progressive Learning**: Bridges offline and online video understanding, enhancing real-time adaptability.  
-
-<div style="text-align: center;">
-    <div style="display: inline-block; margin-right: 10px;">
-        <img src="assets/spatial_perception.png" alt="image-20250311180653255" style="zoom: 15%;" />
-    </div>
-    <div style="display: inline-block;">
-        <img src="assets/past_memory.png" alt="image-20250311184752494" style="zoom: 15%;" />
-    </div>
-        <div style="display: inline-block;">
-        <img src="assets/comparison.png" alt="image-202503111847524942" style="zoom: 15%;" />
-    </div>
-</div>
-
-
-## To-Do
-
-- [x] Model checkpoint Upload
-- [ ] A more interactive demo
-
----
-
-# 🏆 OVBench Leaderboard 
-
-See our leaderboard [here](https://videochat-online.github.io/#leaderboard)
-
-
-## Evaluate your model
-
-
-Evaluation of Existing Models on OVBench Using [lmms_eval](https://github.com/EvolvingLMMs-Lab/lmms-eval).
-
-#### Preparatory Steps
-
-- Environment Setup: Ensure that all dependencies required by [lmms_eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) are properly installed.
-
-- Please perform a global search for the field `/path_to_your` in the lmms-eval-ovbench directory and replace it with the corresponding file path on your local system.
-
-#### Predefined Model Evaluation
-
-- Execute the script `lmms-eval-ovbench/scripts/eval_models/eval_internvl2-8B.sh` to initiate the benchmark evaluation.
-
-#### Custom Model Evaluation
-
-- Given that the video data used in this benchmark consists of both image sequences and video clips, it is necessary to utilize the `lmms-eval-ovbench/llava/video_utils.py` to read video data correctly.
-
-- You may refer to the implementation of the `load_video` function in `lmms-eval-ovbench/lmms_eval/models/internvl2.py` as a guideline. Integrate this function into your custom model as needed to enable compatibility with the lmms_eval evaluation framework.
-
-
-
-
-## Submit the results
-
-Email xinhaoli00@outlook.com with your result.json or open an issue in this repo.
-
-
----
-
-
-# 🎥 Demo
-
-To launch the demo, use the following script:
-
-
-https://github.com/user-attachments/assets/4cdc3e57-3dae-4656-8366-a10cc6648884
-
-
-```bash
-bash gradio_demo.sh
-```
-# 🛠️ Installation
-To install the necessary dependencies, use the following commands:
-
-```bash
-conda create -n your_env python=3.9
-pip install -r requirements.txt
-```
-
----
-
-# 📦 Offline Data Preparation
-
-The anno_data file provides the paths for different types of datasets:
-
+    
+## Data Formats
+* Format 1: Conversational QA (LLaVA-style)
 ```json
-"coin_sl_train": {
-    "annotation": "Path to the annotations json file.",
-    "data_root": "your data path",
-},
-...
+{
+    "video": "116/NLy71UrHElw.mp4",
+    "conversations": [
+        {
+            "from": "human",
+            "timestamps": 1026.0,  # Video timestamp in seconds
+            "value": "<video>\nBased on current observation, list events..."
+        },
+        {
+            "from": "gpt",
+            "value": "21.0s - 22.0s (duration: 1.0s), begin to run up..."
+        }
+    ]
+}
 ```
-We support the data reading formats `LLaVA` and `VideoChat2-IT` for specific data JSON formats.
-
----
-
-# 🔄 [Online SFT Data](https://huggingface.co/datasets/MCG-NJU/VideoChatOnline-IT) Download
-
-For the construction format of online data, please refer to [VideoChatOnline-IT](https://huggingface.co/datasets/MCG-NJU/VideoChatOnline-IT)
-
-# 📈 Evaluations Results of  VideoChatOnline-4B on Long Video Benchmarks
-| Benchmark          | Result                                                 |
-|--------------------|--------------------------------------------------------|
-| **OVBench**        | 54.9                                                   |
-| **VideoMME**       | Short: 65.8<br>Medium: 50.2<br>Long: 47.1<br>Avg: 54.4  |
-| **MVBench**        | 65.2                                                   |
-| **EgoSchema** | 54.7                                                   |
-| **MLVU**           | 60.8                                                   |
-| **LongVideoBench** | 54.1                                                   |
-
----
-
-# 🚀 Training
-To run the training, execute the following bash commands for different stages:
-```bash
-#Offline SFT:
-bash shell/online_4b/videochat_online_4b_stage1_ft.sh
-```
-```bash
-#Online & Offline Joint SFT:
-bash shell/online_4b/videochat_online_4b_stage2_ft.sh
+Format 2: Template-based Tracking
+```json
+{
+    "video": "GOT-10k_Train_006457",
+    "fps": 1,  # Frame rate
+    "all_image_files": ["00000001.jpg", ...],  # Keyframe paths
+    "image_bboxes": [  # Temporal object tracking data
+        {
+            "timestamp": 0.0,
+            "bbox": [0.412, 0.517, 0.452, 0.753]  # [x1,y1,x2,y2]
+        },
+        ...
+    ],
+    "query_template": {  # Randomized temporal insertion
+        "from": "human",
+        "value": "Track the location of \"person\" at <bbox> over time..."
+    }
+}
 ```
 
----
+## Source Data
 
-# 📊 Evaluation on [OVBench](https://huggingface.co/datasets/MCG-NJU/OVBench)
+| **Task**                          | **Dataset**         | **Source**                                                                             |
+|-------------------------------|----------------------------|------------------------------------------------------------------------------------|
+| Dense Video Captioning        | `ActivityNet Captions` | [Source](http://activity-net.org/download.html)                                    |
+|                               | `ViTT`                  | [Source](https://github.com/google-research-datasets/Video-Timeline-Tags-ViTT)     |
+|                               | `YouCook2`              | [Source](http://youcook2.eecs.umich.edu/)                                          |
+| Temporal Video Grounding      | `DiDeMo`                | [Source](https://github.com/LisaAnne/LocalizingMoments?tab=readme-ov-file#dataset) |
+|                               | `QuerYD`                | [Source](https://www.robots.ox.ac.uk/~vgg/data/queryd/)                            |
+|                               | `HiREST_grounding`     | [Source](https://github.com/j-min/HiREST)                                          |
+|                               | `Charades-STA`        | [Source](https://github.com/jiyanggao/TALL)                                        |
+| Step Localization             | `COIN`                | [Source](https://github.com/coin-dataset/annotations)                              |
+|                               | `HiREST_step`          | [Source](https://github.com/j-min/HiREST)                                          |
+| Spatial Temporal Action Localization             | `AVA`               | [Source](https://research.google.com/ava/download.html)                              |
+| Object Tracking             | `GOT 10K`               | [Source](http://got-10k.aitestunion.com/)                              |
+|              | `LaSOT`               | [Source](http://vision.cs.stonybrook.edu/~lasot/)                              |
 
-```bash
-#Sliding Window Setting:
-bash shell/eval/online_bench_sliding_window.sh
-#Streaming Setting:
-bash shell/eval/online_bench_stream.sh
+## Citation
+If you find this project useful in your research, please consider cite:
+```BibTeX
+@article{huang2024online,
+  title={Online Video Understanding: A Comprehensive Benchmark and Memory-Augmented Method},
+  author={Huang, Zhenpeng and Li, Xinhao and Li, Jiaqi and Wang, Jing and Zeng, Xiangyu and Liang, Cheng and Wu, Tao and Chen, Xi and Li, Liang and Wang, Limin},
+  journal={arXiv preprint arXiv:2501.00584},
+  year={2024}
+}
 ```
-
 
