@@ -1,0 +1,55 @@
+# VideoLLaMA3-MemoryBank Requirements for Python 3.12
+# Updated for Python 3.12 compatibility
+
+--extra-index-url https://download.pytorch.org/whl/cu121
+# Core PyTorch - 確保使用支援Python 3.12的版本
+torch>=2.4.0
+torchvision>=0.19.0
+
+# Transformers ecosystem - 保持相近版本
+transformers==4.46.3
+tokenizers==0.20.3
+datasets==2.21.0
+accelerate==1.0.1
+peft==0.4.0
+huggingface_hub==0.23.4
+
+# Core ML - 更新為支援Python 3.12的版本
+numpy>=1.26.0  # 1.24.4不支援Python 3.12
+scikit-learn>=1.4.0  # 1.2.2過舊
+timm==1.0.3
+einops==0.6.1
+einops-exts==0.0.4
+
+# 可能需要特殊處理的套件
+# bitsandbytes==0.44.1  # 更新版本，如果仍有問題則條件安裝
+# deepspeed>=0.15.4     # 可能需要從source安裝
+
+# Data processing - 更新版本
+# decord==0.6.0  # 如果失敗，提供替代方案
+imageio==2.34.0
+imageio-ffmpeg==0.4.9
+moviepy==1.0.3
+opencv-python>=4.8.0  # 更新版本以支援Python 3.12
+pyarrow
+pysubs2
+ffmpeg-python
+
+# Web frameworks - 更新為兼容版本
+gradio>=4.0.0  # 3.50.0太舊，不支援Python 3.12
+gradio_client>=0.8.0
+httpx==0.24.1
+requests
+openai
+uvicorn
+fastapi
+
+# Monitoring and utilities
+tensorboard
+wandb
+tabulate
+Levenshtein
+shortuuid
+sentencepiece==0.1.99
+pydantic>=2.0
+markdown2[all]
