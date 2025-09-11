@@ -100,3 +100,5 @@ anno_online/
 anno_data/
 work_dirs/
 referenceCode/
+utils/video_check_report.json
+utils/video_check_report_missing_by_dataset.json
