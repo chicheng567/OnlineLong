@@ -71,6 +71,7 @@ class Videollama3MetaModel:
                 similarity_threshold=getattr(config, 'memory_similarity_threshold', 0.8)
             )
             self.memory_bank = HierarchicalMemoryBank(memory_config)
+            self.max_frames_before_compression = getattr(config, 'max_frames_before_compression', 100)
 
     def get_vision_encoder(self):
         vision_encoder = getattr(self, 'vision_encoder', None)
@@ -163,11 +164,73 @@ class Videollama3MetaForCausalLM(ABC):
     def has_memory_bank(self):
         return self.get_model().has_memory_bank()
 
+    def _needs_compression(self, video_features):
+        """Check if compression is needed"""
+        if not self.has_memory_bank():
+            return False
+        # Check if number of frames exceeds threshold
+        if hasattr(video_features, 'shape') and len(video_features.shape) >= 2:
+            max_frames = getattr(self.get_model(), 'max_frames_before_compression', 100)
+            return video_features.size(0) > max_frames  # Check sequence length
+        return False
+
+    def _apply_memory_bank_compression(self, video_features):
+        """Apply memory bank compression to video features"""
+        if not self.has_memory_bank():
+            return video_features
+
+        memory_bank = self.get_memory_bank()
+        memory_bank.clear_memory()  # Reset for new video sequence
+
+        # Process frames sequentially through memory bank
+        seq_len = video_features.size(0)
+        chunk_size = 50  # Process in chunks to simulate streaming
+
+        for i in range(0, seq_len, chunk_size):
+            chunk_end = min(i + chunk_size, seq_len)
+            chunk = video_features[i:chunk_end]
+
+            # Update memory bank with each frame in chunk
+            for frame_idx in range(chunk.size(0)):
+                frame_features = chunk[frame_idx:frame_idx+1]
+                # Reshape to add spatial dimensions for memory bank
+                if frame_features.dim() == 2:  # [1, feature_dim]
+                    spatial_size = int((frame_features.size(1) // 1152) ** 0.5) if frame_features.size(1) > 1152 else 1
+                    if spatial_size > 1:
+                        frame_features = frame_features.view(1, spatial_size, spatial_size, 1152)
+                    else:
+                        frame_features = frame_features.unsqueeze(-1).unsqueeze(-1)  # [1, 1152, 1, 1]
+
+                memory_bank.update_memory(
+                    new_tokens=frame_features,
+                    index=i + frame_idx,
+                    timestamp=None
+                )
+
+        # Get compressed representation by collecting all stored memories
+        all_features = []
+        for group in memory_bank.groups:
+            for item in group["tokens"]:
+                # Flatten spatial dimensions back to sequence format
+                features = item["tokens"]
+                if features.dim() == 4:  # [1, H, W, C]
+                    features = features.view(features.size(0), -1, features.size(-1))
+                elif features.dim() == 3 and features.size(1) == 1:  # [1, 1, C]
+                    features = features  # Keep as is
+                all_features.append(features)
+
+        if all_features:
+            compressed_features = torch.cat(all_features, dim=0)
+            return compressed_features
+        else:
+            return video_features
+
     def encode_images(
         self,
         pixel_values: torch.FloatTensor,
         grid_sizes: torch.LongTensor,
         merge_sizes: torch.LongTensor,
+        apply_compression: bool = True,
     ) -> torch.FloatTensor:
         mm_features = self.get_model().get_vision_encoder()(
             pixel_values=pixel_values,
@@ -175,6 +238,13 @@ class Videollama3MetaForCausalLM(ABC):
             merge_sizes=merge_sizes,
         )
         mm_features = self.get_model().mm_projector(mm_features)
+
+        # Apply memory bank compression if enabled and needed
+        if (apply_compression and
+            self.has_memory_bank() and
+            self._needs_compression(mm_features)):
+            mm_features = self._apply_memory_bank_compression(mm_features)
+
         return mm_features
         
     def encode_images_with_memory(
@@ -200,8 +270,8 @@ class Videollama3MetaForCausalLM(ABC):
         Returns:
             Tuple of (encoded features, memory retrieval info)
         """
-        # Encode images normally
-        mm_features = self.encode_images(pixel_values, grid_sizes, merge_sizes)
+        # Encode images normally (without automatic compression here as we handle memory manually)
+        mm_features = self.encode_images(pixel_values, grid_sizes, merge_sizes, apply_compression=False)
         
         memory_info = None
         if self.has_memory_bank() and frame_indices is not None:

@@ -73,10 +73,13 @@ class HierarchicalMemoryBank:
         ]
         
         # Feature adapter for SigLIP -> processing dimensions
-        self.feature_adapter = FeatureAdapter(
-            input_dim=config.feature_dim,
-            output_dim=config.feature_dim
-        ) if config.feature_dim != 1152 else None
+        # Only create adapter if we need dimension transformation
+        self.feature_adapter = None
+        if hasattr(config, 'input_feature_dim') and config.input_feature_dim != config.feature_dim:
+            self.feature_adapter = FeatureAdapter(
+                input_dim=config.input_feature_dim,
+                output_dim=config.feature_dim
+            )
         
     def _adapt_features(self, tokens: torch.Tensor) -> torch.Tensor:
         """Adapt features if needed for dimension compatibility."""

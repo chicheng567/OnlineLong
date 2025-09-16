@@ -34,6 +34,14 @@ class Videollama3Qwen2Config(Qwen2Config):
         super().__init__(**kwargs)
         self.model_type = "videollama3_qwen2"
 
+        # Memory bank configurations
+        self.enable_memory_bank = kwargs.get('enable_memory_bank', False)
+        self.memory_capacities = kwargs.get('memory_capacities', [8, 4, 1])
+        self.memory_reduced_sizes = kwargs.get('memory_reduced_sizes', [144, 64, 36])
+        self.max_frames_before_compression = kwargs.get('max_frames_before_compression', 100)
+        self.memory_enable_compression = kwargs.get('memory_enable_compression', True)
+        self.memory_similarity_threshold = kwargs.get('memory_similarity_threshold', 0.8)
+
 
 class Videollama3Qwen2Model(Videollama3MetaModel, Qwen2Model):
     config_class = Videollama3Qwen2Config
