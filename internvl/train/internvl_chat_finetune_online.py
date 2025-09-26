@@ -883,8 +883,6 @@ class LazySupervisedDataset(Dataset):
             ds_name=self.ds_name,
             num_image=num_patches,
         )
-        print(ret)
-        exit()
         # Create the final return dictionary
         ret = dict(
             input_ids=ret["input_ids"][0],
