@@ -400,3 +400,14 @@ register_conv_template(
         sep='<|im_end|>\n',
     )
 )
+
+register_conv_template(
+    Conversation(
+        name='videollama3',
+        system_template='<|im_start|>system\n{system_message}',
+        system_message='You are VideoLLaMA3 created by Alibaba DAMO Academy, a helpful assistant to help people understand images and videos.',
+        roles=('<|im_start|>user\n', '<|im_start|>assistant\n'),
+        sep_style=SeparatorStyle.MPT,
+        sep='<|im_end|>\n',
+    )
+)

@@ -19,7 +19,6 @@ from PIL import Image
 from torch.utils.data import ConcatDataset, WeightedRandomSampler
 from torchvision.transforms.functional import InterpolationMode
 import decord
-
 decord.logging.set_level(decord.logging.ERROR)
 os.environ["FFMPEG_LOG_LEVEL"] = "error"
 from .constants import (
@@ -560,6 +559,9 @@ def preprocess_internvl2_5(
         attention_mask=input_ids.ne(tokenizer.pad_token_id),
     )
 
+def preprocess_videollama3():
+    
+    raise NotImplementedError
 def preprocess(
     template_name,
     sources,
@@ -642,12 +644,6 @@ def preprocess(
                 cur_len -= 1
 
         target[cur_len:] = IGNORE_TOKEN_ID
-
-        if False:  # Inspect and check the correctness of masking
-            z = target.clone()
-            z = torch.where(z == IGNORE_TOKEN_ID, tokenizer.unk_token_id, z)
-            logger.info(tokenizer.decode(z))
-            exit()
 
         if cur_len < tokenizer.model_max_length:
             if cur_len != total_len:

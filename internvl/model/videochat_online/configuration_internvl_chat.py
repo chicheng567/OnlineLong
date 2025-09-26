@@ -54,17 +54,24 @@ class InternVLChatConfig(PretrainedConfig):
             )
 
         self.vision_config = InternVisionConfig(**vision_config)
-        if llm_config["architectures"][0] == "LlamaForCausalLM":
+
+        # Handle architectures key safely
+        if "architectures" not in llm_config or not llm_config["architectures"]:
+            # Default to Phi3 if architectures is missing
+            llm_config["architectures"] = ["Phi3ForCausalLM"]
+
+        architecture = llm_config["architectures"][0]
+        if architecture == "LlamaForCausalLM":
             self.llm_config = LlamaConfig(**llm_config)
-        elif llm_config["architectures"][0] == "InternLM2ForCausalLM":
+        elif architecture == "InternLM2ForCausalLM":
             self.llm_config = InternLM2Config(**llm_config)
-        elif llm_config["architectures"][0] == "Phi3ForCausalLM":
+        elif architecture == "Phi3ForCausalLM":
             self.llm_config = Phi3Config(**llm_config)
-        elif llm_config["architectures"][0] == "Qwen2ForCausalLM":
+        elif architecture == "Qwen2ForCausalLM":
             self.llm_config = Qwen2Config(**llm_config)
         else:
             raise ValueError(
-                "Unsupported architecture: {}".format(llm_config["architectures"][0])
+                "Unsupported architecture: {}".format(architecture)
             )
         self.use_backbone_lora = use_backbone_lora
         self.use_llm_lora = use_llm_lora
