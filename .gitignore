@@ -96,6 +96,7 @@ CLAUDE.md
 .claude/
 
 shell/videochat_online_test.sh
+shell/videollama3_test.sh
 anno_online/
 anno_data/
 work_dirs/

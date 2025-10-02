@@ -11,10 +11,16 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 import random
+from matplotlib.pyplot import sca
 import numpy as np
+import pandas as pd
 import torch
 import os
-
+from videollama3.model.processor import Videollama3Processor
+from videollama3.model.videollama3_encoder.image_processing_videollama3 import Videollama3ImageProcessor
+from transformers import AutoTokenizer
+from videollama3.constants import (DEFAULT_IMAGE_TOKEN, STREAM_START_TOKEN, STREAM_END_TOKEN)
+from videollama3.mm_utils import load_video
 # decord.logging.set_level(logging.ERROR)
 import io
 from ipdb import set_trace
@@ -27,13 +33,6 @@ except:
 import ast
 
 import io
-from decord import VideoReader
-import wandb
-
-import time
-import func_timeout
-from func_timeout import func_set_timeout
-from einops import rearrange
 import numpy as np
 import json
 import torch
@@ -49,19 +48,8 @@ from internvl.patch import (
     replace_llama_rmsnorm_with_fused_rmsnorm,
     replace_train_sampler,
 )
-from internvl.train.constants import (
-    BOX_END_TOKEN,
-    BOX_START_TOKEN,
-    IMG_CONTEXT_TOKEN,
-    IMG_END_TOKEN,
-    IMG_START_TOKEN,
-    QUAD_END_TOKEN,
-    QUAD_START_TOKEN,
-    REF_END_TOKEN,
-    REF_START_TOKEN,
-    VIDEO_CONTEXT_TOKEN,
-)
-from internvl.train.dataset import (
+
+from videollama3.train.dataset import (
     ConcatDataset,
     TCSLoader,
     WeightedConcatDataset,
@@ -74,7 +62,7 @@ from internvl.train.dataset import (
     preprocess_internvl2_5,
 )
 from internvl.train.trainer_monkey_patch import replace_create_optimizer
-from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
+from PIL import Image, ImageFile, PngImagePlugin
 from torch.utils.data import Dataset
 from transformers import (
     AutoTokenizer,
@@ -91,9 +79,7 @@ from transformers.utils.logging import (
 )
 import signal
 import random
-import traceback
 import os
-from PIL import UnidentifiedImageError
 import torch
 from typing import Dict
 
@@ -227,6 +213,27 @@ class ModelArguments:
             "Please use `v2` to fix the bug of transposed image."
         },
     )
+    tokenizer_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Pretrained tokenizer name or path if not the same as model_name"
+        },
+    )
+    ####Arg for videollama3
+    # LLM Arguments
+    model_path: Optional[str] = field(default="lmsys/vicuna-7b-v1.5")
+    version: Optional[str] = field(default="v1", metadata={"help": "Version of the conversation template."})
+    # Connector Arguments
+    mm_projector_type: Optional[str] = field(default='linear')
+    pretrain_mm_projector: Optional[str] = field(default=None)
+    # Vision tower Arguments
+    vision_encoder: Optional[str] = field(default=None)
+    mm_vision_select_layer: Optional[int] = field(default=-1)
+    mm_vision_select_feature: Optional[str] = field(default="patch")
+    mm_attn_implementation: Optional[str] = field(default="flash_attention_2")
+    # Token downsampling Arguments
+    use_token_compression: Optional[bool] = field(default=False)
+    use_flash_loss: Optional[bool] = field(default=False)
 
 
 @dataclass
@@ -311,6 +318,7 @@ class DataTrainingArguments:
         default="fps1",
         metadata={"help": "The sampling_method of video. Default is fps=1."},
     )
+    
 
 
 class LazySupervisedDataset(Dataset):
@@ -692,22 +700,17 @@ class LazySupervisedDataset(Dataset):
         if image_files is None:
             video_file = data_item["video"]
             video_path = os.path.join(self.root, video_file)
-
             if len(video_path.split(".")) == 1:
                 video_formats = [".mp4", ".avi", ".mov", ".mkv", ".webm"]
                 for fmt in video_formats:  # Added this line
                     if os.path.exists(f"{video_path}{fmt}"):
                         video_path = f"{video_path}{fmt}"
                         break
-            clip = data_item.get("clip", None)
-            image_list, timestamps = self.tcs_loader(
+            fps = int(self.sampling_method[3:])
+            image_list, timestamps = load_video(
                 video_path,
-                image_type="video",
-                max_num_frames=self.max_num_frame,
-                min_num_frames=self.min_num_frame,
-                sample=self.sampling_method,
-                clip=clip,
-                return_timestamps=True,
+                max_frames=self.max_num_frame,
+                fps=fps,
             )
         else:
             # here, we load images from image files and bboxes from data_item
@@ -784,7 +787,7 @@ class LazySupervisedDataset(Dataset):
                 }
                 conversations.extend([human_query_after, gpt_response_after])
             data_item.update({"conversations": conversations})
-
+        
         if "QA" in data_item:
             data_item["conversations"] = self.process_qa(data_item["QA"])
         # Ensure the first conversation contains a video placeholder
@@ -792,11 +795,12 @@ class LazySupervisedDataset(Dataset):
             data_item["conversations"][i]["value"] = data_item["conversations"][i][
                 "value"
             ].replace("<image>", "<video>")
+            #adding video token to the first conversation if not exist
             if "<video>" not in data_item["conversations"][i]["value"]:
                 data_item["conversations"][i]["value"] = (
                     "<video>\n" + data_item["conversations"][i]["value"]
                 )
-
+        
         if data_item.get("need_reset_timestamp", False):
             timestamps = [t - timestamps[0] for t in timestamps]
 
@@ -804,7 +808,6 @@ class LazySupervisedDataset(Dataset):
 
         assert len(image_list) > 1
         # Generate special tokens for each video frame
-        #TODO: 改成videollama3 的格式
         special_tokens = [
             f"Frame{i+1} at {round(timestamps[i], 1)}s: <image>"
             for i in range(len(image_list))
@@ -824,16 +827,40 @@ class LazySupervisedDataset(Dataset):
             for end_index in range(start_index, len(timestamps)):
                 if timestamps[end_index] > end:
                     break
-            # end_index = min(random.randint(end_index, end_index+5), len(timestamps)-1)
-            special_tokens_split = "\n".join(special_tokens[start_index:end_index])
-            data_item["conversations"][i]["value"] = data_item["conversations"][i][
-                "value"
-            ].replace("<video>", special_tokens_split)
+            data_item["conversations"][i].append({"type": "video", "num_frames": len(images[0]), "timestamps": timestamps})
             start_index = end_index
+        #把影片截止到query的時間點
         image_list = image_list[:end_index]
+        num_frames = len(image_list)
+        assert num_frames == len(timestamps), f"{num_frames} != {len(timestamps)}"
+        
         # Transform each frame image and stack them into a tensor
-        pixel_values = [transform(image) for image in image_list]
-        pixel_values = torch.stack(pixel_values)
+        image_processor = Videollama3ImageProcessor(
+            do_convert_rgb=True,
+            do_normalize=True,
+            do_rescale=True,
+            do_resize=True,
+            image_mean=[0.5, 0.5, 0.5],
+            image_std=[0.5, 0.5, 0.5],
+            max_tokens=16384,
+            min_tokens=16,
+            patch_size=14,
+            resample=3,
+            rescale_factor=0.00392156862745098
+        )
+        vlprocessor = Videollama3Processor(
+            image_processor=image_processor,
+            tokenizer=self.tokenizer,
+        )
+        data_dict = vlprocessor(
+            images=image_list,
+            text=deepcopy(data_item["conversations"]),
+            merge_size=2,
+            return_labels=True,
+            return_tensors="pt",
+        )
+        assert len(data_dict['pixel_values']) > 0 and len(data_dict['grid_sizes']) > 0, f"Invalid image data: {data_dict['images']}, {data_dict['grid_thws']}"
+        
         num_patches = pixel_values.size(0)
         if num_patches <= 1:
             raise NotImplementedError
@@ -862,6 +889,7 @@ class LazySupervisedDataset(Dataset):
             ds_name=self.ds_name,
             num_image=num_patches,
         )
+        
         # Create the final return dictionary
         ret = dict(
             input_ids=ret["input_ids"][0],
@@ -1112,28 +1140,16 @@ def main():
     set_seed(training_args.seed)
 
     # Load pretrained model, tokenizer, and image processor
-    tokenizer_path = model_args.model_name_or_path or model_args.llm_path
+    tokenizer_path = model_args.tokenizer_name
     logger.info(f"Loading Tokenizer: {tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_path, add_eos_token=False, trust_remote_code=True, use_fast=False
+        model_args.tokenizer_name
     )
+    num_new_tokens = tokenizer.add_tokens([DEFAULT_IMAGE_TOKEN, STREAM_START_TOKEN, STREAM_END_TOKEN], special_tokens=True)
     tokenizer.tokenizer_path = tokenizer_path
     tokenizer.model_max_length = data_args.max_seq_length
-    token_list = [
-        IMG_START_TOKEN,
-        IMG_END_TOKEN,
-        IMG_CONTEXT_TOKEN,
-        QUAD_START_TOKEN,
-        QUAD_END_TOKEN,
-        REF_START_TOKEN,
-        REF_END_TOKEN,
-        BOX_START_TOKEN,
-        BOX_END_TOKEN,
-    ]
-    num_new_tokens = tokenizer.add_tokens(token_list, special_tokens=True)
-    img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     tcs_loader = TCSLoader("~/petreloss.conf") if has_tcs_loader else None
-
+    
     if model_args.model_name_or_path is not None:
         logger.info("Loading VideoChatOnline_IT...")
         config = InternVLChatConfig.from_pretrained(model_args.model_name_or_path)
@@ -1159,7 +1175,7 @@ def main():
             local_files_only=True,
         )
 
-    model.img_context_token_id = img_context_token_id
+    model.image_token_index = tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
 
     assert model.config.downsample_ratio == data_args.down_sample_ratio
 

@@ -558,6 +558,7 @@ def preprocess_internvl2_5(
         labels=targets,
         attention_mask=input_ids.ne(tokenizer.pad_token_id),
     )
+from videollama3.model.processor import Videollama3Processor
 def preprocess_videollama3():
     
     raise NotImplementedError

@@ -1,0 +1,11 @@
+[
+    {
+        "from": "human",
+        "timestamps": 101.4,
+        "value": "<video>\nHas the event 'a person puts some groceries away onto the shelf' been completed or is it still in progress? If still ongoing, format as: <start time> - now (duration: <x> seconds). If completed, use: <start time> - <end time> (duration: <x> seconds)."
+    },
+    {
+        "from": "gpt",
+        "value": "The event happens from 3.5s to 10.1s (duration: 6.6 seconds)."
+    }
+]
