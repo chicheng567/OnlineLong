@@ -38,6 +38,9 @@ from videollama3.mm_utils import load_video, load_images
 DEFAULT_CHAT_TEMPLATE = """
 {%- set identifier = 'im' %}
 {% for message in messages %}
+    {% if add_system_prompt and loop.first and message['role'] != 'system' %}
+        {{- '<|im_start|>system\nYou are VideoLLaMA3 created by Alibaba DAMO Academy, a helpful assistant to help people understand images and videos.<|im_end|>\n' -}}
+    {% endif %}
     {% if message['role'] == 'stream' %}
         {% set identifier = 'stream' %}
     {% else %}
@@ -48,16 +51,20 @@ DEFAULT_CHAT_TEMPLATE = """
         {{- message['content'] + '<|' + identifier + '_end|>\n' -}}
     {% else %}
         {% for content in message['content'] %}
-            {% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}
-                {% if 'time' in content %}
-                    {{- 'Time ' + content['time'] | round(1) | string + 's: ' -}}
+            {% if content is string %}
+                {{- content -}}
+            {% elif content['type'] == 'text' or 'text' in content %}
+                {{- content['text'] -}}
+            {% elif content['type'] == 'image' or 'image' in content %}
+                {% if 'timestamp' in content %}
+                    {{- 'Time ' + content['timestamp'] | round(1) | string + 's: ' -}}
                 {% endif %}
 """
 DEFAULT_CHAT_TEMPLATE += """
                 {{- '%s\n' -}}
 """ % DEFAULT_IMAGE_TOKEN
 DEFAULT_CHAT_TEMPLATE += """
-            {% elif content['type'] == 'video' or 'video' in content or 'video_url' in content %}
+            {% elif content['type'] == 'video' or 'video' in content %}
                 {% for i in range(content['num_frames']) %}
                     {% if 'timestamps' in content %}
                         {{- 'Time ' + content['timestamps'][i] | round(1) | string + 's:' -}}
@@ -76,11 +83,13 @@ DEFAULT_CHAT_TEMPLATE += """
 DEFAULT_CHAT_TEMPLATE += """
                     {% endif %}
                 {% endfor %}
-            {% elif content['type'] == 'text' or 'text' in content %}
-                {{- content['text'] -}}
             {% endif %}
         {% endfor %}
-        {{- '<|' + identifier + '_end|>\n' -}}
+        {% if identifier == 'stream' %}
+            {{- '<|' + identifier + '_end|>' -}}
+        {% else %}
+            {{- '<|' + identifier + '_end|>\n' -}}
+        {% endif %}
     {% endif %}
 {% endfor %}
 {% if add_generation_prompt %}
@@ -159,20 +168,27 @@ class Videollama3Processor(ProcessorMixin):
         targets_list = []
         sample_types_list = []
         image_idx = 0
-
         for message_idx, message in enumerate(text):
+            image_idx = 0
             # 1. set chat template and append image tokens
-            prompt = self.tokenizer.apply_chat_template([message], tokenize=False, add_generation_prompt=False)
+            # Only add system prompt for the first message
+            prompt = self.tokenizer.apply_chat_template([message], tokenize=False, add_generation_prompt=False, add_system_prompt=(message_idx == 0))
             prompt_chunks = prompt.split(DEFAULT_IMAGE_TOKEN)
             prompt = []
             for chunk_idx in range(len(prompt_chunks) - 1):
                 prompt.append(prompt_chunks[chunk_idx])
+                if image_idx >= len(grid_sizes):
+                    with open("error_log.txt", "a") as f:
+                        for line in text:
+                            f.write(str(line) + "\n")
+                        f.write("\n")
+                    raise ValueError("More image tokens in the text than provided images.")
                 thw = grid_sizes[image_idx]
                 prompt.append(DEFAULT_IMAGE_TOKEN * thw.prod().long())
                 image_idx += 1
             prompt.append(prompt_chunks[-1])
             prompt = "".join(prompt)
-
+            
             input_ids = self.tokenizer.encode(prompt, return_tensors="pt")[0]
             input_ids_list.append(input_ids)
 
@@ -187,7 +203,7 @@ class Videollama3Processor(ProcessorMixin):
                 sample_types = targets.clone()
                 sample_types[torch.logical_and(sample_types > 0, sample_types != self.eos_token_id)] = 0
                 targets[-2] = input_ids[-2]    # <|im_end|>
-
+            
             # if message_idx > 0 and text[message_idx - 1]["role"] == "stream":
             #     targets[0] = input_ids[0]
             #     # TODO: consider non-special tokens
@@ -195,9 +211,6 @@ class Videollama3Processor(ProcessorMixin):
 
             targets_list.append(targets)
             sample_types_list.append(sample_types)
-
-        assert len(grid_sizes) == image_idx, "Number of images does not match the number of image tokens in the text."
-
         targets = torch.cat(targets_list)
         sample_types = torch.cat(sample_types_list)
         types, counts = torch.unique(sample_types[sample_types > -1], return_counts=True)
@@ -216,7 +229,6 @@ class Videollama3Processor(ProcessorMixin):
             "input_ids": torch.cat(input_ids_list),
             "labels": targets,
         }
-
         return text_inputs
 
     def _process_text_without_label(
@@ -325,7 +337,6 @@ class Videollama3Processor(ProcessorMixin):
         )
         output_kwargs["text_kwargs"].pop("padding")
         output_kwargs["text_kwargs"].pop("padding_side")
-
         image_inputs = self.process_images(images, merge_size, **output_kwargs["images_kwargs"])
         text_inputs = self.process_text(text, image_inputs, return_labels, **output_kwargs["text_kwargs"])
 

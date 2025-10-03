@@ -764,6 +764,7 @@ def preprocess_phi3(
     use_packed_ds: bool = False,
     ds_name: str = None,
     num_image: int = 1,
+    save_conversations: bool = False,
 ) -> Dict:
     conv = get_conv_template(template_name)
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}

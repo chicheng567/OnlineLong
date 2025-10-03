@@ -232,6 +232,7 @@ class Videollama3ImageProcessor(BaseImageProcessor):
         self.max_tokens = max_tokens
         self.patch_size = patch_size
         self.do_convert_rgb = do_convert_rgb
+        self.force_size = force_size
 
     def _preprocess(
         self,

@@ -6,18 +6,34 @@ import math
 import os
 import random
 import sys
+import traceback
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+import csv
+import glob
+import os.path as osp
+import pickle
 import random
+from matplotlib.pyplot import sca
 import numpy as np
+import pandas as pd
 import torch
 import os
+import torchvision.transforms as T
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+import torchvision.transforms as T
+import wandb
+import decord
+from decord import cpu
 
 # decord.logging.set_level(logging.ERROR)
 import io
 from ipdb import set_trace
+
+# from internvl.model.internvl_chat.modeling_internvl_sam_chat_finetune import VideoChatOnline_IT_SAM_IT
 try:
     from petrel_client.client import Client
 
@@ -40,8 +56,12 @@ import torch
 import torch.distributed as dist
 import transformers
 from internvl.dist_utils import init_dist
+from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
 from internvl.model.videochat_online import (
+    InternVisionConfig,
+    InternVisionModel,
     InternVLChatConfig,
+    # VideoChatOnline_IT,
     VideoChatOnline_IT,
 )
 from internvl.patch import (
@@ -77,6 +97,8 @@ from internvl.train.trainer_monkey_patch import replace_create_optimizer
 from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
 from torch.utils.data import Dataset
 from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
     AutoTokenizer,
     HfArgumentParser,
     Trainer,
@@ -660,7 +682,6 @@ class LazySupervisedDataset(Dataset):
                 [2**s for s in range(len(self.reverse_memory_sample_ratio))],
             )
             num_image_tokens = [self.num_image_token // s**2 for s in scale]
-
         ret = preprocess_function(
             self.template_name,
             [deepcopy(data_item["conversations"])],
@@ -685,8 +706,8 @@ class LazySupervisedDataset(Dataset):
 
     def online_video_get_item(self, data_item):
         # Build transformation function
-        #used in online video dataset, where each data item contains multiple frames with bbox and timestamp info
-        transform = transform = self.get_transform()
+        transform = self.get_transform()
+
         # Get the video file path
         image_files = data_item.get("all_image_files", None)
         if image_files is None:
@@ -710,13 +731,11 @@ class LazySupervisedDataset(Dataset):
                 return_timestamps=True,
             )
         else:
-            # here, we load images from image files and bboxes from data_item
             fps = data_item.get("fps", 1)  # Default to 1 fps if not specified
             video_file = data_item["video"]
             video_root = os.path.join(self.root, video_file)
 
             # Uniformly sample to the max_num_frame length
-            #TODO: change this loading method for long videos.
             if len(image_files) > self.max_num_frame:
                 # Use np.linspace to generate evenly spaced indices
                 sampled_indices = np.linspace(
@@ -736,7 +755,7 @@ class LazySupervisedDataset(Dataset):
             timestamps = [round(bbox["timestamp"], 1) for bbox in image_bboxes]
 
             # Get the corresponding bbox
-            
+            # Randomly select one image's bbox to replace <bbox> in query_template
             random_index = random.randint(0, len(image_bboxes) - 1)
             selected_bbox = image_bboxes[random_index]
             selected_timestamp = timestamps[random_index]
@@ -751,7 +770,6 @@ class LazySupervisedDataset(Dataset):
             # f"Track the location and actions of the \"person\" at position {selected_bbox['bbox']} over time. Provide start and end timestamps for each instance in seconds with bounding box coordinates."
 
             # Generate GPT output (timestamps and bbox from 0 to t)
-            # 如果task是object traking，把bounding box轉換為GPT對話格式。
             gpt_output = {
                 "from": "gpt",
                 "value": "\n".join(
@@ -804,7 +822,6 @@ class LazySupervisedDataset(Dataset):
 
         assert len(image_list) > 1
         # Generate special tokens for each video frame
-        #TODO: 改成videollama3 的格式
         special_tokens = [
             f"Frame{i+1} at {round(timestamps[i], 1)}s: <image>"
             for i in range(len(image_list))
@@ -830,7 +847,10 @@ class LazySupervisedDataset(Dataset):
                 "value"
             ].replace("<video>", special_tokens_split)
             start_index = end_index
+            
+
         image_list = image_list[:end_index]
+
         # Transform each frame image and stack them into a tensor
         pixel_values = [transform(image) for image in image_list]
         pixel_values = torch.stack(pixel_values)
@@ -845,14 +865,13 @@ class LazySupervisedDataset(Dataset):
         if self.num_image_token == 64:
             num_image_tokens = [self.num_image_token] * num_patches
         else:
-            # tokens_arrange is a static method
             scale = VideoChatOnline_IT.tokens_arrange(
                 num_patches,
                 self.reverse_memory_sample_ratio,
                 [2**s for s in range(len(self.reverse_memory_sample_ratio))],
             )
             num_image_tokens = [self.num_image_token // s**2 for s in scale]
-
+    
         ret = preprocess_function(
             self.template_name,
             [deepcopy(data_item["conversations"])],
@@ -862,6 +881,7 @@ class LazySupervisedDataset(Dataset):
             ds_name=self.ds_name,
             num_image=num_patches,
         )
+
         # Create the final return dictionary
         ret = dict(
             input_ids=ret["input_ids"][0],
@@ -871,6 +891,58 @@ class LazySupervisedDataset(Dataset):
             image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
             num_patches=torch.tensor([num_patches], dtype=torch.long),
             is_video=torch.tensor([1], dtype=torch.long),
+        )
+        return ret
+
+    def pure_text_get_item(self, data_item):
+        # Build transformation function
+        transform = self.get_transform()
+
+        # Create a blank white image
+        image = Image.new("RGB", (224, 224), (255, 255, 255))
+
+        # Dynamically preprocess the image to generate patches
+        images = dynamic_preprocess(
+            image,
+            min_num=self.min_dynamic_patch,
+            max_num=1,
+            image_size=self.image_size,
+            use_thumbnail=self.use_thumbnail,
+        )
+
+        # Apply the transformation to each image patch and stack them into a tensor
+        pixel_values = [transform(image) for image in images]
+        pixel_values = torch.stack(pixel_values)
+        num_patches = pixel_values.size(0)
+
+        # Ensure there is only one patch
+        assert (
+            num_patches == 1
+        ), f"The number of patches should be 1, but got {num_patches}."
+
+        # Select the appropriate preprocessing function based on the template name
+        preprocess_function = self.get_preprocess_function()
+
+        # Preprocess the conversations and generate the return dictionary
+        ret = preprocess_function(
+            self.template_name,
+            [deepcopy(data_item["conversations"])],
+            self.tokenizer,
+            [self.num_image_token * num_patches],
+            text_only=True,
+            group_by_length=self.group_by_length,
+            ds_name=self.ds_name,
+        )
+
+        # Create the final return dictionary
+        ret = dict(
+            input_ids=ret["input_ids"][0],
+            labels=ret["labels"][0],
+            attention_mask=ret["attention_mask"][0],
+            pixel_values=pixel_values,
+            image_flags=torch.tensor([0] * num_patches, dtype=torch.long),
+            num_patches=torch.tensor([num_patches], dtype=torch.long),
+            is_video=torch.tensor([0], dtype=torch.long),
         )
         return ret
 
@@ -931,7 +1003,6 @@ class LazySupervisedDataset(Dataset):
                             data_item["conversations"][0].get("timestamps", None)
                             is not None
                         ):
-                            #online video entrance here.
                             ret = self.online_video_get_item(data_item)
                         else:
                             ret = self.video_get_item(data_item)

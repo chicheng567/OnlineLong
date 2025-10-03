@@ -60,6 +60,7 @@ from videollama3.train.dataset import (
     preprocess_mpt,
     preprocess_phi3,
     preprocess_internvl2_5,
+    preprocess_videollama3,
 )
 from internvl.train.trainer_monkey_patch import replace_create_optimizer
 from PIL import Image, ImageFile, PngImagePlugin
@@ -439,6 +440,8 @@ class LazySupervisedDataset(Dataset):
             preprocess_function = preprocess_phi3
         elif self.template_name == "internvl2_5":
             preprocess_function = preprocess_internvl2_5
+        elif self.template_name == "videollama3":
+            preprocess_function = preprocess_videollama3
         else:
             preprocess_function = preprocess
         return preprocess_function
@@ -712,6 +715,8 @@ class LazySupervisedDataset(Dataset):
                 max_frames=self.max_num_frame,
                 fps=fps,
             )
+            assert len(image_list) > 0, f"Failed to load video frames from {video_path}"
+            assert len(image_list) == len(timestamps), f"Number of frames and timestamps do not match in {video_path}, {len(image_list)} != {len(timestamps)}"
         else:
             # here, we load images from image files and bboxes from data_item
             fps = data_item.get("fps", 1)  # Default to 1 fps if not specified
@@ -805,36 +810,33 @@ class LazySupervisedDataset(Dataset):
             timestamps = [t - timestamps[0] for t in timestamps]
 
         # assert not data_item["need_reset_timestamp"], timestamps
-
         assert len(image_list) > 1
         # Generate special tokens for each video frame
-        special_tokens = [
-            f"Frame{i+1} at {round(timestamps[i], 1)}s: <image>"
-            for i in range(len(image_list))
-        ]
         start_index = 0
         for i in range(0, len(data_item["conversations"]), 2):
             if image_files is not None:
                 image_file = data_item["conversations"][i].get("image_file", None)
-                if image_file is not None and image_file not in image_file:
+                if image_file is not None and image_file not in image_files:
                     break
-
+            #some query timestamps in the conversation may longer than the video length
             data_item["conversations"][i]["timestamps"] = min(
                 round(timestamps[-1], 1) + 0.1,
                 data_item["conversations"][i]["timestamps"],
             )
             end = data_item["conversations"][i]["timestamps"]
+            #find the end index
             for end_index in range(start_index, len(timestamps)):
                 if timestamps[end_index] > end:
                     break
-            data_item["conversations"][i].append({"type": "video", "num_frames": len(images[0]), "timestamps": timestamps})
+            else:
+                end_index = len(timestamps)
             start_index = end_index
-        #把影片截止到query的時間點
+        #把影片截止到最後一個query的時間點
         image_list = image_list[:end_index]
+        timestamps = np.array([round(t, 1) for t in timestamps[:end_index]])
         num_frames = len(image_list)
         assert num_frames == len(timestamps), f"{num_frames} != {len(timestamps)}"
-        
-        # Transform each frame image and stack them into a tensor
+        assert self.template_name == "videollama3", "Only videollama3 template is supported in online video dataset."
         image_processor = Videollama3ImageProcessor(
             do_convert_rgb=True,
             do_normalize=True,
@@ -846,60 +848,30 @@ class LazySupervisedDataset(Dataset):
             min_tokens=16,
             patch_size=14,
             resample=3,
-            rescale_factor=0.00392156862745098
+            rescale_factor=0.00392156862745098,
+            force_size=[448, 448]
         )
         vlprocessor = Videollama3Processor(
             image_processor=image_processor,
             tokenizer=self.tokenizer,
         )
-        data_dict = vlprocessor(
+        preprocess_function = self.get_preprocess_function()
+        message = preprocess_function(
+            self.template_name,
+            deepcopy(data_item["conversations"]),
+            timestamps,
+        )
+        ret = vlprocessor(
             images=image_list,
-            text=deepcopy(data_item["conversations"]),
+            text=message,
             merge_size=2,
             return_labels=True,
-            return_tensors="pt",
-        )
-        assert len(data_dict['pixel_values']) > 0 and len(data_dict['grid_sizes']) > 0, f"Invalid image data: {data_dict['images']}, {data_dict['grid_thws']}"
-        
-        num_patches = pixel_values.size(0)
-        if num_patches <= 1:
-            raise NotImplementedError
-
-        # Select the appropriate preprocessing function based on the template name
-        preprocess_function = self.get_preprocess_function()
-
-        # Preprocess the conversations and generate the return dictionary
-        if self.num_image_token == 64:
-            num_image_tokens = [self.num_image_token] * num_patches
-        else:
-            # tokens_arrange is a static method
-            scale = VideoChatOnline_IT.tokens_arrange(
-                num_patches,
-                self.reverse_memory_sample_ratio,
-                [2**s for s in range(len(self.reverse_memory_sample_ratio))],
-            )
-            num_image_tokens = [self.num_image_token // s**2 for s in scale]
-
-        ret = preprocess_function(
-            self.template_name,
-            [deepcopy(data_item["conversations"])],
-            self.tokenizer,
-            num_image_tokens,
-            group_by_length=self.group_by_length,
-            ds_name=self.ds_name,
-            num_image=num_patches,
+            return_tensors="pt"
         )
         
-        # Create the final return dictionary
-        ret = dict(
-            input_ids=ret["input_ids"][0],
-            labels=ret["labels"][0],
-            attention_mask=ret["attention_mask"][0],
-            pixel_values=pixel_values,
-            image_flags=torch.tensor([1] * num_patches, dtype=torch.long),
-            num_patches=torch.tensor([num_patches], dtype=torch.long),
-            is_video=torch.tensor([1], dtype=torch.long),
-        )
+        print(ret["pixel_values"].shape)
+        print(self.num_image_token)
+        exit()
         return ret
 
     def process_qa(self, qa, msg=""):
@@ -1143,11 +1115,13 @@ def main():
     tokenizer_path = model_args.tokenizer_name
     logger.info(f"Loading Tokenizer: {tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name
+        model_args.tokenizer_name,
+        model_max_length=data_args.max_seq_length,
+        padding_side="right",
+        use_fast=True,
     )
     num_new_tokens = tokenizer.add_tokens([DEFAULT_IMAGE_TOKEN, STREAM_START_TOKEN, STREAM_END_TOKEN], special_tokens=True)
     tokenizer.tokenizer_path = tokenizer_path
-    tokenizer.model_max_length = data_args.max_seq_length
     tcs_loader = TCSLoader("~/petreloss.conf") if has_tcs_loader else None
     
     if model_args.model_name_or_path is not None:
@@ -1207,8 +1181,6 @@ def main():
     model.config.force_image_size = data_args.force_image_size
     model.num_image_token = int(
         (data_args.force_image_size // patch_size) ** 2
-        * (data_args.down_sample_ratio**2)
-        * (data_args.avg_pooling_down_sample_ratio**2)
     )
 
     if num_new_tokens > 0:
