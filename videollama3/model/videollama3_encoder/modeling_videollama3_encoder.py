@@ -481,7 +481,6 @@ class Videollama3VisionEncoderModel(PreTrainedModel):
 
         hidden_states_chunks = hidden_states.split(grid_sizes.prod(dim=1).tolist(), dim=0)
         outputs = []
-
         for hidden_states, grid_size, merge_size in zip(hidden_states_chunks, grid_sizes, merge_sizes):
             # NOTE: previous implementation, which supports downsampling with any factor
             c = hidden_states.shape[-1]

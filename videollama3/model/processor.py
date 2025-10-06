@@ -174,15 +174,10 @@ class Videollama3Processor(ProcessorMixin):
             # Only add system prompt for the first message
             prompt = self.tokenizer.apply_chat_template([message], tokenize=False, add_generation_prompt=False, add_system_prompt=(message_idx == 0))
             prompt_chunks = prompt.split(DEFAULT_IMAGE_TOKEN)
+            frames_count = len(prompt_chunks) - 1
             prompt = []
             for chunk_idx in range(len(prompt_chunks) - 1):
                 prompt.append(prompt_chunks[chunk_idx])
-                if image_idx >= len(grid_sizes):
-                    with open("error_log.txt", "a") as f:
-                        for line in text:
-                            f.write(str(line) + "\n")
-                        f.write("\n")
-                    raise ValueError("More image tokens in the text than provided images.")
                 thw = grid_sizes[image_idx]
                 prompt.append(DEFAULT_IMAGE_TOKEN * thw.prod().long())
                 image_idx += 1
@@ -190,6 +185,8 @@ class Videollama3Processor(ProcessorMixin):
             prompt = "".join(prompt)
             
             input_ids = self.tokenizer.encode(prompt, return_tensors="pt")[0]
+            image_token_num = (input_ids == self.image_token_id).sum().item()
+            assert image_token_num == frames_count*grid_sizes[0].prod().long(), f"Number of image tokens does not match the number of images in the text: {image_token_num} vs {frames_count*grid_sizes[0].prod().long()}.\n{prompt}"
             input_ids_list.append(input_ids)
 
             targets = torch.full_like(input_ids, IGNORE_INDEX)

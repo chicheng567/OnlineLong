@@ -227,7 +227,6 @@ class Videollama3MetaForCausalLM(ABC):
     ):
         mm_features = mm_features[compression_mask]
         image_selected = (input_ids == self.config.image_token_index)
-
         text_masks = torch.logical_not(image_selected)
         text_masks[image_selected] = compression_mask
         input_ids = input_ids[text_masks]

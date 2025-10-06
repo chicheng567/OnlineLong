@@ -212,6 +212,7 @@ class LazySupervisedDataset(Dataset):
         self.list_data_dict = list_data_dict
         self.data_args = data_args
         print(f"Loaded {len(self.list_data_dict)} samples")
+        
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -487,7 +488,7 @@ class LazySupervisedDataset(Dataset):
                     modal, images, messages, merge_size = self._convert_stream(data_dict)
                 else:
                     modal, images, messages, merge_size = self._convert_normal(data_dict)
-
+            
             data_dict = self.vlprocessor(
                 images=images,
                 text=messages,
@@ -503,7 +504,6 @@ class LazySupervisedDataset(Dataset):
                 data_dict['merge_sizes'] = torch.as_tensor([self.data_args.image_merge_size])
             elif modal == 'image' or modal == 'video':
                 assert len(data_dict['pixel_values']) > 0 and len(data_dict['grid_sizes']) > 0, f"Invalid image data: {data_dict['images']}, {data_dict['grid_thws']}"
-
             data_dict['modals'] = [modal] * len(images)
 
         except Exception as e:
