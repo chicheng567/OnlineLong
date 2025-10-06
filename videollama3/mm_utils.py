@@ -614,3 +614,77 @@ class KeywordsStoppingCriteria(StoppingCriteria):
         for i in range(output_ids.shape[0]):
             outputs.append(self.call_for_batch(output_ids[i].unsqueeze(0), scores))
         return all(outputs)
+# Copy from internvl2
+import random
+def process_qa(self, qa, msg=""):
+        # randomly shuffle qa for conversation
+        if len(qa) > 1:
+            random.shuffle(qa)
+
+        conversation = list()
+        # logger.info(f"origin qa {qa}")
+        for _, sentence in enumerate(qa):
+            i = sentence.get("i", "")
+            q = sentence["q"]
+            a = sentence["a"]
+            user = i
+            if q != "":
+                user += " " + q
+            else:
+                # no question, often in caption dataset
+                pass
+            assistant = a
+            conversation.append(
+                {
+                    "from": "human",
+                    "value": user.strip(),
+                }
+            )
+            conversation.append(
+                {
+                    "from": "gpt",
+                    "value": assistant.strip(),
+                }
+            )
+        conversation[0]["value"] = msg.rstrip() + " " + conversation[0]["value"]
+        conversation[0]["value"] = conversation[0]["value"].strip()
+        assert conversation[0]["from"] == "human"
+        # logger.info(f"conversation {conversation}")
+        return conversation
+    
+#from internvl type to videollama3 type
+def preprocess_videollama3(
+    conversations: list,
+    timestamps: np.array,
+) -> list:
+    #This function only convert input style to videollama3 style, other preprocessing, including tokenization and apply prompt templates, are inplemented in the dataset class
+    assert isinstance(conversations, list), "conversations should be a list."
+    messages = []
+    for i, conv in enumerate(conversations):
+        if conv["from"] == "human":
+            modal = "<video>" if "<video>" in conv["value"] else "<image>"
+            assert modal == "<video>", "Only <video> is supported in videollama3."
+            query_time = conv["timestamps"]
+            chunks = conv["value"].split(modal)
+            assert len(chunks) == 2, f"Only one {modal} is supported in videollama3."
+            messages.append({
+                "role": "user",
+                "content": []
+            })
+            timestamps_clip = timestamps[timestamps <= query_time].tolist()
+            assert len(timestamps_clip) > 0, f"No frames before {query_time}s."
+            for chunk_idx in range(1, 4):
+                if chunk_idx % 2 == 1:
+                    chunk = chunks[chunk_idx // 2].strip()
+                    messages[-1]["content"].append({"type": "text",  "text": chunk}) if chunk else None
+                else:
+                    if modal == '<image>':
+                        messages[-1]["content"].append({"type": "image"})
+                    elif modal == '<video>':
+                        messages[-1]["content"].append({"type": "video", "num_frames": len(timestamps_clip), "timestamp": timestamps_clip})
+        else:
+            messages.append({
+                "role": "assistant",
+                "content": conv['value']
+            })
+    return messages

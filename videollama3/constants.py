@@ -36,6 +36,4 @@ MODAL_INDEX_MAP = {
     "<audio>": -202,
 }
 
-BOX_START_TOKEN = '<|box_start|>'
-BOX_END_TOKEN = '<|box_end|>'
 subimage_token_num=196

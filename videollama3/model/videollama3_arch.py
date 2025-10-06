@@ -72,7 +72,6 @@ class Videollama3MetaModel:
         vision_encoder = model_args.vision_encoder
         mm_vision_select_layer = model_args.mm_vision_select_layer
         mm_vision_select_feature = model_args.mm_vision_select_feature
-        pretrain_mm_projector = model_args.pretrain_mm_projector
 
         self.config.mm_vision_encoder = vision_encoder
 
@@ -103,27 +102,6 @@ class Videollama3MetaModel:
             # In case it is frozen by LoRA
             for p in self.mm_projector.parameters():
                 p.requires_grad = True
-
-        if pretrain_mm_projector is not None:
-            if os.path.exists(pretrain_mm_projector):
-                is_local = True
-                if os.path.isdir(pretrain_mm_projector):
-                    mm_projector_weights = load_mm_projector(pretrain_mm_projector)
-                else:
-                    mm_projector_weights = torch.load(pretrain_mm_projector, map_location='cpu')
-            else:
-                # Support loading projector weights from remote HuggingFace model hub
-                is_local = False
-                pretrain_mm_projector = pretrain_mm_projector.replace('mm_projector.bin', '')
-                pretrain_mm_projector = pretrain_mm_projector.strip('/').strip('\\').strip()
-                mm_projector_weights = load_mm_projector(pretrain_mm_projector)
-
-            def get_w(weights, keyword):
-                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
-
-            # self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
-            # set strict=False to avoid missing key error regarding bert.embeddings.position_ids
-            self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'), strict=False)
 
 
 class Videollama3MetaForCausalLM(ABC):

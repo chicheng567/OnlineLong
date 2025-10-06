@@ -1067,6 +1067,8 @@ def build_datasets(
     ds_collections = dict()
     for meta_path in data_args.meta_path:
         ds_collections.update(json.loads(open(meta_path).read()))
+        print(ds_collections)
+        exit()
     for ds_idx, ds_name in enumerate(ds_collections.keys()):
         repeat_time = ds_collections[ds_name]["repeat_time"]
         if "max_dynamic_patch" in ds_collections[ds_name]:

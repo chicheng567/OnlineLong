@@ -288,7 +288,6 @@ class Videollama3ImageProcessor(BaseImageProcessor):
                 - `"none"` or `ChannelDimension.NONE`: image in (height, width) format.   - `"none"` or `ChannelDimension.NONE`: image in (height, width) format.
         """
         images = make_list_of_images(images)
-
         if do_convert_rgb:
             images = [convert_to_rgb(image) for image in images]
 
