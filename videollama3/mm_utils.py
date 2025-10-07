@@ -660,6 +660,7 @@ def preprocess_videollama3(
     #This function only convert input style to videollama3 style, other preprocessing, including tokenization and apply prompt templates, are inplemented in the dataset class
     assert isinstance(conversations, list), "conversations should be a list."
     messages = []
+    start_idx = 0 # the start index of the current conversation
     for i, conv in enumerate(conversations):
         if conv["from"] == "human":
             modal = "<video>" if "<video>" in conv["value"] else "<image>"
@@ -672,7 +673,9 @@ def preprocess_videollama3(
                 "content": []
             })
             timestamps_clip = timestamps[timestamps <= query_time].tolist()
-            assert len(timestamps_clip) > 0, f"No frames before {query_time}s."
+            timestamps_clip = timestamps_clip[start_idx:]  # only use the timestamps after the last query
+            start_idx += len(timestamps_clip)
+            assert len(timestamps_clip) > 0, f"No frames between {start_idx} and {query_time}s."
             for chunk_idx in range(1, 4):
                 if chunk_idx % 2 == 1:
                     chunk = chunks[chunk_idx // 2].strip()

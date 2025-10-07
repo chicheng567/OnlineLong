@@ -461,12 +461,12 @@ class LazySupervisedDataset(Dataset):
             end = data_dict["conversations"][i]["timestamps"]
             #find the end index
             for end_index in range(start_index, len(timestamps)):
-                if timestamps[end_index] > end:
+                if timestamps[end_index] >= end:
                     break
             else:
                 end_index = len(timestamps)
             start_index = end_index
-        #把影片截止到最後一個query的時間點
+        #把影片截止到最後一個query的時間點)
         image_list = image_list[:end_index]
         timestamps = np.array([round(t, 1) for t in timestamps[:end_index]])
         num_frames = len(image_list)

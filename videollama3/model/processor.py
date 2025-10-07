@@ -169,7 +169,6 @@ class Videollama3Processor(ProcessorMixin):
         sample_types_list = []
         image_idx = 0
         for message_idx, message in enumerate(text):
-            image_idx = 0
             # 1. set chat template and append image tokens
             # Only add system prompt for the first message
             prompt = self.tokenizer.apply_chat_template([message], tokenize=False, add_generation_prompt=False, add_system_prompt=(message_idx == 0))
@@ -208,10 +207,10 @@ class Videollama3Processor(ProcessorMixin):
 
             targets_list.append(targets)
             sample_types_list.append(sample_types)
+        assert len(grid_sizes) == image_idx, f"Number of images does not match the number of image tokens in the text: {len(grid_sizes)} vs {image_idx}."
         targets = torch.cat(targets_list)
         sample_types = torch.cat(sample_types_list)
         types, counts = torch.unique(sample_types[sample_types > -1], return_counts=True)
-
         if len(types) > 0:
             target_num_samples = counts.amin()
 
