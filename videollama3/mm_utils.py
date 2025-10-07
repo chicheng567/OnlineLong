@@ -675,7 +675,7 @@ def preprocess_videollama3(
             timestamps_clip = timestamps[timestamps <= query_time].tolist()
             timestamps_clip = timestamps_clip[start_idx:]  # only use the timestamps after the last query
             start_idx += len(timestamps_clip)
-            assert len(timestamps_clip) > 0, f"No frames between {start_idx} and {query_time}s."
+            assert len(timestamps_clip) > 0, f"No frames between {start_idx} and {query_time}s. {timestamps}, {query_time}, {conv}"
             for chunk_idx in range(1, 4):
                 if chunk_idx % 2 == 1:
                     chunk = chunks[chunk_idx // 2].strip()

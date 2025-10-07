@@ -37,6 +37,7 @@ from packaging import version
 from datasets import load_dataset, concatenate_datasets
 from torch.utils.data import Dataset
 from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
+from transformers import TrainerCallback
 import logging
 from transformers.utils.logging import (
     enable_default_handler,
@@ -62,9 +63,12 @@ local_rank = None
 
 
 def rank0_print(*args):
-    
     if local_rank == 0:
-        print(*args)
+        message = ' '.join(str(arg) for arg in args)
+        print(message)
+        # Also log to logger if available
+        if logging.getLogger().hasHandlers():
+            logging.info(message)
 
 
 def set_seed(seed=42):
@@ -163,6 +167,28 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
 
 from torch.utils.data import ConcatDataset
+
+
+class LoggingCallback(TrainerCallback):
+    """Custom callback to log training metrics to file."""
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Log metrics to file when trainer logs."""
+        if state.is_local_process_zero and logs is not None:
+            # Format metrics for logging
+            metrics_str = f"Step {state.global_step}"
+            if "loss" in logs:
+                metrics_str += f" | Loss: {logs['loss']:.4f}"
+            if "learning_rate" in logs:
+                metrics_str += f" | LR: {logs['learning_rate']:.2e}"
+            if "grad_norm" in logs:
+                metrics_str += f" | Grad Norm: {logs['grad_norm']:.4f}"
+            if "epoch" in logs:
+                metrics_str += f" | Epoch: {logs['epoch']:.2f}"
+
+            logging.info(metrics_str)
+
+
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -461,7 +487,7 @@ class LazySupervisedDataset(Dataset):
             end = data_dict["conversations"][i]["timestamps"]
             #find the end index
             for end_index in range(start_index, len(timestamps)):
-                if timestamps[end_index] >= end:
+                if timestamps[end_index] > end:
                     break
             else:
                 end_index = len(timestamps)
@@ -636,11 +662,19 @@ def train(attn_implementation=None):
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
     # Setup logging
+    log_file = os.path.join(training_args.output_dir, "training.log")
+    os.makedirs(training_args.output_dir, exist_ok=True)
+
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file, mode='a')
+        ],
+        level=logging.INFO,
     )
     local_rank = training_args.local_rank
 
@@ -838,7 +872,13 @@ def train(attn_implementation=None):
         data_module = make_supervised_data_module(vlprocessor=vlprocessor, data_args=data_args)
 
     # select a Trainer
-    trainer = VideoLLaMA3Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer = VideoLLaMA3Trainer(
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        callbacks=[LoggingCallback()],
+        **data_module
+    )
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

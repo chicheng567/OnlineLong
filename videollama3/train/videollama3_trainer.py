@@ -370,9 +370,9 @@ class VideoLLaMA3Trainer(Trainer):
                     torch.save(non_lora_state_dict, os.path.join(output_dir, 'non_lora_trainables.bin'))
 
                 # save for acquring lora adapter parameters & trainer states: `adapter_config.json`, `adapter_model.safetensors`
-                super(VideoLLaMA3Trainer, self)._save_checkpoint(model, trial, metrics)
+                super(VideoLLaMA3Trainer, self)._save_checkpoint(trial, metrics)
             else:
-                super(VideoLLaMA3Trainer, self)._save_checkpoint(model, trial, metrics)
+                super(VideoLLaMA3Trainer, self)._save_checkpoint(trial, metrics)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'is_alignment', False):
