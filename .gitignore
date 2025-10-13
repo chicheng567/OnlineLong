@@ -103,3 +103,4 @@ work_dirs/
 referenceCode/
 utils/video_check_report.json
 utils/video_check_report_missing_by_dataset.json
+attention_visualizations/
