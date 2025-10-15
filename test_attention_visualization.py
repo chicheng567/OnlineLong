@@ -110,6 +110,8 @@ with torch.no_grad():
     else:
         print("Warning: No attention weights in outputs!")
 
+response = processor.batch_decode(outputs, skip_special_tokens=True)[0].strip()
+print(response)
 # Clean up memory before generation
 print("Cleaning up memory...")
 import gc
