@@ -19,7 +19,15 @@ import warnings
 import shutil
 
 import torch
-from transformers import PretrainedConfig, AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
+from transformers import PretrainedConfig, BitsAndBytesConfig
+
+# Use local qwen2 implementation
+from qwen2 import Qwen2Tokenizer
+try:
+    from qwen2 import Qwen2TokenizerFast
+    AutoTokenizer = Qwen2TokenizerFast
+except ImportError:
+    AutoTokenizer = Qwen2Tokenizer
 
 from .projector import load_mm_projector
 from .videollama3_qwen2 import Videollama3Qwen2ForCausalLM, Videollama3Qwen2Config
@@ -44,7 +52,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     # if want to put model into a single device, you can set device_map={"": "cuda:0"}
     kwargs = {"device_map": device_map, **kwargs}
 
-    config = AutoConfig.from_pretrained(model_path)
+    # Load config directly using Videollama3Qwen2Config
+    config = Videollama3Qwen2Config.from_pretrained(model_path)
     config._attn_implementation = kwargs.pop('attn_implementation', "flash_attention_2") # default to flash_attention_2
 
     torch_dtype = config.torch_dtype if hasattr(config, "torch_dtype") else kwargs.pop('torch_dtype', torch.float16)
@@ -71,14 +80,12 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
     # NOTE: lora/qlora model loading
     if 'lora' in model_name.lower() or 'qlora' in model_name.lower():
-        cfg_pretrained = PretrainedConfig.from_pretrained(model_path, token=token)
-        # NOTE: AutoConfig will modify `_name_or_path` property to `model_path` if `model_path` is not None.
-        # cfg_pretrained = AutoConfig.from_pretrained(model_path, token=token)
+        cfg_pretrained = Videollama3Qwen2Config.from_pretrained(model_path, token=token)
         model_base = model_base if model_base is not None else cfg_pretrained._name_or_path
 
-        # NOTE: remove qlora training quantization config 
-        if hasattr(lora_cfg_pretrained, 'quantization_config'):
-            del lora_cfg_pretrained.quantization_config
+        # NOTE: remove qlora training quantization config
+        if hasattr(cfg_pretrained, 'quantization_config'):
+            del cfg_pretrained.quantization_config
         tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, token=token)
         print('Loading VideoLLaMA from base model...')
 
@@ -119,9 +126,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     elif model_base is not None or '-base' in model_name.lower() or is_alignment:
         # NOTE: Base/Pretrain model loading
         print('Loading VideoLLaMA 2 from base model...')
-        cfg_pretrained = PretrainedConfig.from_pretrained(model_path, token=token)
-        # NOTE: AutoConfig will modify `_name_or_path` property to `model_path` if `model_path` is not None.
-        # cfg_pretrained = AutoConfig.from_pretrained(model_path, token=token)
+        cfg_pretrained = Videollama3Qwen2Config.from_pretrained(model_path, token=token)
         model_base = model_base if model_base is not None else cfg_pretrained._name_or_path
 
         tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False, token=token)
@@ -148,8 +153,9 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         else:
             model = Videollama3Qwen2ForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, config=config, **kwargs)
     else:
+        # Fallback: use Videollama3Qwen2ForCausalLM for all other cases
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, token=token)
-        model = AutoModelForCausalLM.from_pretrained(model_path, config=config, **kwargs)
+        model = Videollama3Qwen2ForCausalLM.from_pretrained(model_path, config=config, **kwargs)
 
     processor = None
 

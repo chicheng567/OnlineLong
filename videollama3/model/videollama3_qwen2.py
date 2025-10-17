@@ -18,10 +18,11 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from transformers import (AutoConfig, AutoModelForCausalLM, Qwen2Config,
-                          Qwen2ForCausalLM, Qwen2Model)
 from transformers.generation.utils import GenerateOutput
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+# Use local qwen2 implementation instead of transformers
+from qwen2 import Qwen2Config, Qwen2ForCausalLM, Qwen2Model
 
 from videollama3.constants import IGNORE_INDEX
 from .videollama3_arch import Videollama3MetaForCausalLM, Videollama3MetaModel
@@ -335,5 +336,5 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         return _inputs
 
 
-AutoConfig.register("videollama3_qwen2", Videollama3Qwen2Config)
-AutoModelForCausalLM.register(Videollama3Qwen2Config, Videollama3Qwen2ForCausalLM)
+# Note: Model registration is now handled in videollama3/model/__init__.py
+# No need to use transformers AutoConfig/AutoModelForCausalLM registration

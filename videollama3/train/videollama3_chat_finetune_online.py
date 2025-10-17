@@ -760,12 +760,21 @@ def train(attn_implementation=None):
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name_or_path,
-        model_max_length=training_args.model_max_length,
-        padding_side="right",
-        use_fast=True,
-    )
+    # Use local qwen2 tokenizer instead of transformers AutoTokenizer
+    try:
+        from qwen2 import Qwen2TokenizerFast
+        tokenizer = Qwen2TokenizerFast.from_pretrained(
+            model_args.tokenizer_name_or_path,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+        )
+    except ImportError:
+        from qwen2 import Qwen2Tokenizer
+        tokenizer = Qwen2Tokenizer.from_pretrained(
+            model_args.tokenizer_name_or_path,
+            model_max_length=training_args.model_max_length,
+            padding_side="right",
+        )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.unk_token
