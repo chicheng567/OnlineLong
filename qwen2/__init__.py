@@ -12,26 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Simplified imports without lazy loading
+"""Qwen2 model - local implementation compatible with transformers 4.46.3"""
+
 from .configuration_qwen2 import Qwen2Config
 from .tokenization_qwen2 import Qwen2Tokenizer
 
 try:
     from .tokenization_qwen2_fast import Qwen2TokenizerFast
 except ImportError:
-    pass
+    Qwen2TokenizerFast = None
 
-try:
-    from .modeling_qwen2 import (
-        Qwen2ForCausalLM,
-        Qwen2ForQuestionAnswering,
-        Qwen2Model,
-        Qwen2PreTrainedModel,
-        Qwen2ForSequenceClassification,
-        Qwen2ForTokenClassification,
-    )
-except ImportError:
-    pass
+from .modeling_qwen2 import (
+    Qwen2ForCausalLM,
+    Qwen2ForSequenceClassification,
+    Qwen2ForTokenClassification,
+    Qwen2Model,
+    Qwen2PreTrainedModel,
+)
 
 __all__ = [
     "Qwen2Config",
@@ -40,7 +37,6 @@ __all__ = [
     "Qwen2ForCausalLM",
     "Qwen2Model",
     "Qwen2PreTrainedModel",
-    "Qwen2ForQuestionAnswering",
     "Qwen2ForSequenceClassification",
     "Qwen2ForTokenClassification",
 ]
