@@ -21,7 +21,7 @@ logs/
 *.out
 *.err
 nohup.out
-
+*.mp4
 # Weights & Biases logs
 wandb/
 *.wandb
