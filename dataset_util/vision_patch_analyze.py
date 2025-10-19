@@ -182,6 +182,164 @@ def plot_token_similarity_and_pca(patches, frame_idx, timestamp, output_dir, ori
     return token_similarity, patches_3d, pca
 
 
+def plot_patch_temporal_similarity(patches, timestamps, output_dir, num_patches_to_analyze=16):
+    """
+    Plot 3: Analyze temporal similarity of the same patch position across frames.
+    Compare patch-wise temporal trends with overall frame similarity.
+
+    Args:
+        patches: (num_frames, num_patches, hidden_size)
+        timestamps: list of timestamps
+        output_dir: output directory path
+        num_patches_to_analyze: number of patch positions to analyze
+    """
+    print(f"\nComputing temporal similarity for {num_patches_to_analyze} patch positions...")
+
+    num_frames, num_patches, hidden_size = patches.shape
+
+    # Select patch positions to analyze (evenly distributed across spatial locations)
+    # For a 32x32 grid, we want to sample patches from different regions
+    grid_size = int(np.sqrt(num_patches))  # e.g., 32 for 1024 patches
+
+    # Sample patches in a grid pattern (e.g., 4x4 sampling for 16 patches)
+    samples_per_dim = int(np.sqrt(num_patches_to_analyze))
+    patch_indices = []
+
+    for i in range(samples_per_dim):
+        for j in range(samples_per_dim):
+            row = int((i + 0.5) * grid_size / samples_per_dim)
+            col = int((j + 0.5) * grid_size / samples_per_dim)
+            patch_idx = row * grid_size + col
+            if patch_idx < num_patches:
+                patch_indices.append(patch_idx)
+
+    # Limit to available patches
+    patch_indices = patch_indices[:num_patches_to_analyze]
+
+    print(f"Analyzing patches at spatial positions: {patch_indices[:5]}... (total: {len(patch_indices)})")
+
+    # Compute frame-level similarity (for reference)
+    frame_embeddings = patches.mean(dim=1)  # (num_frames, hidden_size)
+    frame_similarity = compute_cosine_similarity(frame_embeddings, frame_embeddings)
+    frame_similarity = frame_similarity.cpu().float().numpy()
+
+    # Extract diagonal values (adjacent frame similarity) for frame-level
+    frame_temporal_sim = np.array([frame_similarity[i, i+1] for i in range(num_frames-1)])
+
+    # Compute temporal similarity for each selected patch
+    patch_temporal_sims = []
+    patch_labels = []
+
+    for patch_idx in patch_indices:
+        # Extract this patch across all frames: (num_frames, hidden_size)
+        patch_across_frames = patches[:, patch_idx, :]
+
+        # Compute pairwise similarity for this patch across frames
+        patch_sim_matrix = compute_cosine_similarity(patch_across_frames, patch_across_frames)
+        patch_sim_matrix = patch_sim_matrix.cpu().float().numpy()
+
+        # Extract diagonal values (adjacent frame similarity) for this patch
+        patch_temporal_sim = np.array([patch_sim_matrix[i, i+1] for i in range(num_frames-1)])
+
+        patch_temporal_sims.append(patch_temporal_sim)
+
+        # Label with spatial position
+        row = patch_idx // grid_size
+        col = patch_idx % grid_size
+        patch_labels.append(f'P[{row},{col}]')
+
+    # Create comprehensive visualization
+    fig = plt.figure(figsize=(20, 12))
+
+    # Calculate grid layout for subplots
+    n_patches = len(patch_indices)
+    n_cols = 4  # 4 columns for individual patch plots
+    n_rows = (n_patches + n_cols - 1) // n_cols + 2  # +2 for summary plots
+
+    # Subplot 1: Overall comparison - temporal similarity trends
+    ax1 = plt.subplot(n_rows, n_cols, (1, n_cols))  # Span first row
+
+    # Plot frame-level temporal similarity
+    frame_x = np.arange(len(frame_temporal_sim))
+    ax1.plot(frame_x, frame_temporal_sim, 'k-', linewidth=3, label='Frame-level (avg)', alpha=0.8)
+
+    # Plot each patch temporal similarity
+    colors = plt.cm.tab20(np.linspace(0, 1, len(patch_indices)))
+    for i, (patch_sim, label) in enumerate(zip(patch_temporal_sims, patch_labels)):
+        ax1.plot(frame_x, patch_sim, '-', linewidth=1.5, alpha=0.6,
+                color=colors[i], label=label)
+
+    ax1.set_xlabel('Frame Transition', fontsize=12)
+    ax1.set_ylabel('Cosine Similarity', fontsize=12)
+    ax1.set_title('Temporal Similarity: Frame-level vs Patch-level', fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8, ncol=2)
+    ax1.set_ylim([0, 1])
+
+    # Subplot 2: Correlation heatmap - how similar are patch trends to frame trend?
+    ax2 = plt.subplot(n_rows, n_cols, (n_cols+1, 2*n_cols))  # Span second row
+
+    # Compute correlation between each patch trend and frame trend
+    correlations = []
+    for patch_sim in patch_temporal_sims:
+        corr = np.corrcoef(frame_temporal_sim, patch_sim)[0, 1]
+        correlations.append(corr)
+
+    # Reshape correlations to spatial grid for visualization
+    corr_grid = np.zeros((samples_per_dim, samples_per_dim))
+    for idx, corr in enumerate(correlations):
+        i = idx // samples_per_dim
+        j = idx % samples_per_dim
+        if i < samples_per_dim and j < samples_per_dim:
+            corr_grid[i, j] = corr
+
+    sns.heatmap(corr_grid, annot=True, fmt='.3f', cmap='RdYlGn', center=0.5,
+                vmin=0, vmax=1, ax=ax2, cbar_kws={'label': 'Correlation'})
+    ax2.set_title('Spatial Map: Correlation with Frame-level Similarity',
+                  fontsize=14, fontweight='bold')
+    ax2.set_xlabel('Spatial Column', fontsize=11)
+    ax2.set_ylabel('Spatial Row', fontsize=11)
+
+    # Subplots 3-N: Individual patch similarity matrices
+    for idx, (patch_idx, label) in enumerate(zip(patch_indices, patch_labels)):
+        if idx >= n_patches:
+            break
+
+        ax = plt.subplot(n_rows, n_cols, 2*n_cols + idx + 1)
+
+        # Get full similarity matrix for this patch
+        patch_across_frames = patches[:, patch_idx, :]
+        patch_sim_matrix = compute_cosine_similarity(patch_across_frames, patch_across_frames)
+        patch_sim_matrix = patch_sim_matrix.cpu().float().numpy()
+
+        # Plot as heatmap
+        im = ax.imshow(patch_sim_matrix, cmap='coolwarm', vmin=0, vmax=1, aspect='auto')
+        ax.set_title(f'{label}', fontsize=10, fontweight='bold')
+        ax.set_xlabel('Frame', fontsize=8)
+        ax.set_ylabel('Frame', fontsize=8)
+
+        # Add colorbar for the first subplot in each row
+        if idx % n_cols == 0:
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+
+    output_path = os.path.join(output_dir, 'patch_temporal_similarity_analysis.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Saved patch temporal similarity analysis to: {output_path}")
+    plt.close()
+
+    # Print statistics
+    print("\nPatch-level Temporal Similarity Statistics:")
+    print(f"  Frame-level mean similarity: {frame_temporal_sim.mean():.4f} ± {frame_temporal_sim.std():.4f}")
+    print(f"  Patch-level mean similarity: {np.mean([p.mean() for p in patch_temporal_sims]):.4f}")
+    print(f"  Mean correlation with frame-level: {np.mean(correlations):.4f} ± {np.std(correlations):.4f}")
+    print(f"  Max correlation: {np.max(correlations):.4f} (Patch {patch_labels[np.argmax(correlations)]})")
+    print(f"  Min correlation: {np.min(correlations):.4f} (Patch {patch_labels[np.argmin(correlations)]})")
+
+    return patch_temporal_sims, correlations
+
+
 def main():
     parser = argparse.ArgumentParser(description='Vision Patch Semantic Analysis for VideoLLaMA3')
     parser.add_argument('--video_path', type=str, default='v__7a80bvsbk8.mp4',
@@ -200,6 +358,8 @@ def main():
                         help='Specific frame indices to analyze in detail (e.g., --sample_frames 0 10 20)')
     parser.add_argument('--num_sample_frames', type=int, default=5,
                         help='Number of evenly-spaced frames to analyze if --sample_frames not specified')
+    parser.add_argument('--num_patches_analyze', type=int, default=16,
+                        help='Number of patch positions to analyze for temporal similarity (default: 16 for 4x4 grid)')
 
     args = parser.parse_args()
 
@@ -258,7 +418,11 @@ def main():
     # Analysis 1: Frame-to-frame similarity
     plot_frame_similarity(patches, timestamps, args.output_dir)
 
-    # Analysis 2: Token-level analysis for selected frames
+    # Analysis 2: Patch temporal similarity analysis (NEW!)
+    plot_patch_temporal_similarity(patches, timestamps, args.output_dir,
+                                   num_patches_to_analyze=args.num_patches_analyze)
+
+    # Analysis 3: Token-level analysis for selected frames
     if args.sample_frames is not None:
         sample_indices = args.sample_frames
     else:
@@ -287,6 +451,7 @@ def main():
     print(f"\nAnalysis complete! All results saved to: {args.output_dir}")
     print(f"Generated files:")
     print(f"  - frame_similarity_heatmap.png")
+    print(f"  - patch_temporal_similarity_analysis.png")
     for idx in sample_indices:
         if idx < len(frames):
             print(f"  - frame_{idx:04d}_token_analysis.png")

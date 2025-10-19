@@ -164,3 +164,157 @@ Corrupted videos in anet_dvc_train (showing first 10):
 3. 建議根據資料集大小調整 `--processes` 參數
 4. 大型資料集建議使用 `--sample` 進行抽樣檢查
 5. **新功能**: 自動生成按資料集分類的損壞視頻清單，方便後續處理
+
+---
+
+## vision_patch_analyze.py
+
+Vision Patch 語義分析工具，用於分析 VideoLLaMA3 模型的 vision encoder 輸出的語義特徵。
+
+### 功能概述
+
+#### 1. Frame-to-Frame 語義相似度分析
+- **輸出**: `frame_similarity_heatmap.png`
+- 對每個 frame 的所有 patches 進行 average pooling
+- 計算所有 frame pairs 的 cosine similarity
+- 生成熱力圖顯示時間維度的語義相似性
+- **用途**: 檢測場景變化、重複內容、視頻結構分析
+
+#### 2. Patch 時間相似度分析 (NEW!)
+- **輸出**: `patch_temporal_similarity_analysis.png`
+- 分析同一 patch 位置在不同 frames 之間的語義相似度變化
+- 對比各個 patch 的時間相似度趨勢與整體 frame 相似度
+- **內容**:
+  - **頂部**: 時間相似度趨勢圖（Frame-level vs 多個 Patch-level）
+  - **中部**: 空間相關性熱力圖（各 patch 與 frame-level 的相關係數）
+  - **底部**: 每個 patch 的完整相似度矩陣（網格排列）
+- **用途**:
+  - 理解不同空間位置的時間穩定性
+  - 識別哪些區域對場景變化更敏感
+  - 評估 patch-level 和 frame-level 語義的一致性
+
+#### 3. Token-level 語義分析
+對每個選定的 frame 生成包含 3 個子圖的分析圖：
+- **左圖**: Token-to-Token 相似度矩陣（熱力圖格式，1024×1024）
+- **中圖**: PCA 3D 可視化（顯示解釋方差比例）
+- **右圖**: 原始視頻幀作為參考
+
+### 快速開始
+
+```bash
+# 方法 1: 使用快速腳本（推薦）
+./run_vision_analysis.sh
+
+# 方法 2: 指定視頻和輸出目錄
+./run_vision_analysis.sh path/to/video.mp4 output_directory
+
+# 方法 3: 使用環境變量控制參數
+FPS=2 MAX_FRAMES=50 NUM_SAMPLE_FRAMES=8 NUM_PATCHES_ANALYZE=25 ./run_vision_analysis.sh video.mp4
+
+# 方法 4: 直接使用 Python
+export PYTHONPATH=.
+/miniconda/envs/onlinellama3/bin/python dataset_util/vision_patch_analyze.py \
+    --video_path v__7a80bvsbk8.mp4 \
+    --output_dir vision_patch_analysis \
+    --max_frames 100 \
+    --num_sample_frames 8
+```
+
+### 參數說明
+
+| 參數 | 默認值 | 說明 |
+|------|--------|------|
+| `--video_path` | `v__7a80bvsbk8.mp4` | 輸入視頻文件路徑 |
+| `--model_path` | `pretrained_models/videollama3_7b_local` | 預訓練模型路徑 |
+| `--output_dir` | `vision_patch_analysis` | 輸出目錄 |
+| `--fps` | `1` | 視頻採樣率（每秒幀數） |
+| `--max_frames` | `200` | 最大處理幀數 |
+| `--device` | `cuda:0` | 使用的設備 |
+| `--num_sample_frames` | `5` | 均勻採樣分析的幀數 |
+| `--sample_frames` | `None` | 指定特定幀索引（例: `0 10 20`） |
+| `--num_patches_analyze` | `16` | Patch 時間分析的 patch 數量（例: 16 為 4×4 網格） |
+
+### 輸出文件
+
+```
+vision_patch_analysis/
+├── frame_similarity_heatmap.png              # Frame-to-frame 相似度矩陣
+├── patch_temporal_similarity_analysis.png    # Patch 時間相似度分析 (NEW!)
+├── frame_0000_token_analysis.png             # Frame 0 的 token 分析
+├── frame_0012_token_analysis.png             # Frame 12 的 token 分析
+└── ...
+```
+
+### 使用範例
+
+```bash
+# 範例 1: 快速測試（10 幀，3 個樣本）
+/miniconda/envs/onlinellama3/bin/python dataset_util/vision_patch_analyze.py \
+    --video_path v__7a80bvsbk8.mp4 \
+    --output_dir quick_test \
+    --max_frames 10 \
+    --num_sample_frames 3
+
+# 範例 2: 分析特定幀
+/miniconda/envs/onlinellama3/bin/python dataset_util/vision_patch_analyze.py \
+    --video_path video.mp4 \
+    --sample_frames 0 10 20 30 40
+
+# 範例 3: 高時間解析度（2 FPS，100 幀）
+/miniconda/envs/onlinellama3/bin/python dataset_util/vision_patch_analyze.py \
+    --fps 2 \
+    --max_frames 100 \
+    --num_sample_frames 10
+
+# 範例 4: 分析更多 patch 位置（9×9 = 81 個 patches）
+/miniconda/envs/onlinellama3/bin/python dataset_util/vision_patch_analyze.py \
+    --video_path video.mp4 \
+    --num_patches_analyze 81 \
+    --max_frames 50
+
+# 範例 5: 批量處理多個視頻
+for video in *.mp4; do
+    /miniconda/envs/onlinellama3/bin/python dataset_util/vision_patch_analyze.py \
+        --video_path "$video" \
+        --output_dir "analysis_${video%.mp4}" \
+        --max_frames 50
+done
+```
+
+### 性能建議
+
+**記憶體使用**:
+- 10 frames, 3 samples: ~2GB GPU
+- 50 frames, 8 samples: ~4GB GPU
+- 100 frames, 10 samples: ~6GB GPU
+
+**執行時間**:
+- 10 frames: ~30 秒
+- 50 frames: ~90 秒
+- 100 frames: ~3 分鐘
+
+### 技術細節
+
+- **Cosine Similarity**: `similarity = (A · B) / (||A|| × ||B||)`，範圍 [0, 1]
+- **PCA 降維**: 降維到 3 個主成分用於 3D 可視化
+- **Vision Token**: 默認 448×448 圖像 → 32×32 = 1024 patches，每個 patch 1152-dim
+- **圖像格式**: 自動處理 PIL Image、PyTorch Tensor、NumPy Array
+
+### 使用場景
+
+1. **視頻內容分析**: 檢測場景切換、找出重複內容
+2. **模型行為研究**: 理解 vision encoder 的語義表徵
+   - **NEW**: 分析不同空間位置的時間穩定性
+   - **NEW**: 評估 patch-level 和 frame-level 語義一致性
+3. **數據集質量評估**: 檢查視頻多樣性、識別異常幀
+4. **Ablation Study**: 比較不同模型配置、評估 token compression 影響
+   - **NEW**: 研究不同 patch 位置對時間變化的敏感度
+
+### 依賴需求
+
+- `torch` - PyTorch 深度學習框架
+- `numpy` - 數值計算
+- `matplotlib` - 繪圖庫
+- `seaborn` - 統計數據可視化
+- `scikit-learn` - PCA 降維
+- VideoLLaMA3（本專案）
