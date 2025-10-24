@@ -49,7 +49,7 @@ sys.path.append('./')
 from videollama3.constants import (IGNORE_INDEX,
     NUM_FRAMES, DEFAULT_IMAGE_TOKEN, STREAM_MAX_FRAMES,
     STREAM_START_TOKEN, STREAM_END_TOKEN)
-from videollama3.mm_utils import (load_images, load_video, process_qa, preprocess_videollama3)
+from videollama3.mm_utils import (load_images, load_video, read_frames_decord, process_qa, preprocess_videollama3)
 from videollama3.model import *
 from videollama3.train.videollama3_trainer import (
     VideoLLaMA3Trainer, find_all_linear_names, get_peft_state_maybe_zero_3,
@@ -192,47 +192,64 @@ class LoggingCallback(TrainerCallback):
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, data_path: str, vlprocessor, data_args: DataArguments, dataset_name=None, dataset_root=None, online_mode=False):
+    def __init__(self, data_path: str, vlprocessor, data_args: DataArguments, dataset_name=None, dataset_root=None, online_mode=False, prefix_captioning=False):
         super(LazySupervisedDataset, self).__init__()
         data_objs = []
         self.dataset_name = dataset_name
         self.dataset_root = dataset_root
         self.online_mode = online_mode
+        self.prefix_captioning = prefix_captioning
         if dataset_root is not None:
             assert os.path.exists(dataset_root), f"Dataset root {dataset_root} not exists!"
         print(f"Loading data from {data_path}, dataset name: {self.dataset_name}, dataset root: {self.dataset_root}")
-        try:
-            #use transformers dataset loading
-            print("Use transformers data loading")
+        if self.prefix_captioning:
+            data = data_path[0]
+            with open(data, 'r') as f:
+                data_json = json.load(f)
+            new_json = []
+            for idx in range(len(data_json)):
+                data = data_json[idx]
+                ori_conversations = data['conversations']
+                video = data['video']
+                #spliting captions
+                if len(ori_conversations) > 2:
+                    prefix = "There is a long video provided. Below are some captions describing the events in the video at different timestamps in ascending order.\n"
+                    suffix = "Below are video frames followed up.\n"
+                    events = ""
+                    for i in range(0, len(ori_conversations), 2):
+                        new_obj = {}
+                        new_obj["video"] = video
+                        if i == 0:
+                            new_obj["conversations"] = ori_conversations[:2]
+                            events += new_obj["conversations"][1]["value"] + "\n"
+                        else:
+                            new_obj["conversations"] = [
+                                {
+                                    "from": "human",
+                                    "start_time": ori_conversations[i-2]["timestamps"],
+                                    "timestamps": ori_conversations[i]["timestamps"],
+                                    "value": prefix + events + suffix
+                                },
+                                ori_conversations[i+1]
+                            ]
+                            if "<video>" not in ori_conversations[i]["value"]:
+                                new_obj["conversations"][0]["value"] += "<video>\n" + ori_conversations[i]["value"]
+                            else:
+                                new_obj["conversations"][0]["value"] += ori_conversations[i]["value"]
+                            events += ori_conversations[i+1]["value"] + "\n"
+                        new_json.append(new_obj)
+                else:
+                    new_json.append(data)
+            list_data_dict = new_json
+        else:      
             for data in data_path:
-                # NOTE: load_dataset can process both json or jsonl files
-                if data.endswith(".json") or data.endswith(".jsonl"):
+                if data.endswith(".json") or data.endswith(".jsonl") and self.prefix_captioning == False:
                     print(f"Loading {data} via `load_dataset`")
                     data_objs.append(load_dataset("json", data_files=data, cache_dir=data_args.dataset_cache_dir)["train"])
                 else:
                     raise Exception(f"Unsupported file format (<{data}>)!")
             list_data_dict = concatenate_datasets(data_objs)
-        except:
-            #use custom loading
-            traceback.print_exc()
-            # NOTE: compatible with the old version
-            list_data_dict = []
-            print("Use custom data loading")
-            for data in data_path:
-                if data.endswith(".json"):
-                    data = json.load(open(data, "r"))
-                    for i in data:
-                        i['id'] = len(list_data_dict)
-                        list_data_dict.append(i)
-                elif data.endswith(".jsonl"):
-                    with open(data, "r", encoding="utf-8") as fp:
-                        for line in fp:
-                            line = line.strip()
-                            obj = json.loads(line)
-                            obj["id"] = len(list_data_dict)
-                            list_data_dict.append(obj)
-                else:
-                    raise Exception(f"Unsupported file format (<{data}>)!!!")
+        
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.vlprocessor = vlprocessor
         self.list_data_dict = list_data_dict
@@ -388,10 +405,14 @@ class LazySupervisedDataset(Dataset):
                         video_path = f"{video_path}{fmt}"
                         break
             clip = data_dict.get("clip", None)
-            image_list, timestamps = load_video(
+            image_list, timestamps = read_frames_decord(
                 video_path,
-                fps=self.data_args.fps,
-                max_frames=self.data_args.max_frames)
+                sample="fps"+str(self.data_args.fps),
+                num_frames=self.data_args.max_frames,
+                min_num_frames=4,
+                clip=clip,
+                return_timestamps=True,
+            )
         else:
             #for object tracking tasks
             fps = data_dict.get("fps", 1)  # Default to 1 fps if not specified
@@ -492,9 +513,18 @@ class LazySupervisedDataset(Dataset):
             else:
                 end_index = len(timestamps)
             start_index = end_index
-        #把影片截止到最後一個query的時間點)
-        image_list = image_list[:end_index]
-        timestamps = np.array([round(t, 1) for t in timestamps[:end_index]])
+    
+        #把影片截止到最後一個query的時間點
+        start_index = 0
+        if "start_time" in data_dict:
+            assert len(data_dict["conversations"]) == 2, "start time only support one query."
+            start_time = data_dict["conversations"][0]["start_time"]
+            for start_index in range(len(timestamps)):
+                if timestamps[start_index] >= start_time:
+                    break
+        image_list = image_list[start_index:end_index]
+        timestamps = np.array([round(t, 1) for t in timestamps[start_index:end_index]])
+        
         num_frames = len(image_list)
         assert num_frames == len(timestamps), f"{num_frames} != {len(timestamps)}"
         message = preprocess_videollama3(
@@ -640,8 +670,10 @@ def make_flattening_supervised_data_module(vlprocessor: transformers.ProcessorMi
                 data_path=[v['annotation']],
                 data_args=data_args,
                 dataset_name=k,
-                dataset_root=v.get('data_root', None),
-                online_mode=v.get('online_mode', False)
+                dataset_root=v['data_root'],
+                online_mode=v['online_mode'],
+                #captioning task only need previous captions as prefix, previous frames are not needed.
+                prefix_captioning=v.get('prefix_captioning', False)
             ))
         train_dataset = ConcatDataset(collected_datasets)
     else:
