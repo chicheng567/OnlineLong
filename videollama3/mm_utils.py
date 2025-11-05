@@ -594,11 +594,15 @@ def read_frames_decord(
     else:
         video_reader = VideoReader(video_path, num_threads=1)
     vlen = len(video_reader)
+    if vlen == 0:
+        raise ValueError(f"Video has no decodable frames: {video_path}")
+    last_timestamp = video_reader.get_frame_timestamp(vlen - 1)[-1]
+    end = min(last_timestamp, end)
     fps = video_reader.get_avg_fps()
     duration = vlen / float(fps)
     if clip:
         start, end = clip
-        end = min(video_reader.get_frame_timestamp(len(video_reader)-1)[-1], end)
+        end = min(video_reader.get_frame_timestamp(len(video_reader)-1)[0], end)
         duration = end - start
         vlen = int(duration * fps)
         start_index = int(start * fps)
