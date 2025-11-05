@@ -404,7 +404,13 @@ class LazySupervisedDataset(Dataset):
                     if os.path.exists(f"{video_path}{fmt}"):
                         video_path = f"{video_path}{fmt}"
                         break
-            clip = data_dict.get("clip", None)
+            if "start_time" in data_dict:
+                assert len(data_dict["conversations"]) == 2, "start time only support one query."
+                start_time = data_dict["conversations"][0]["start_time"]
+                end_time = data_dict["conversations"][0]["timestamps"]
+                clip = (start_time, end_time)
+            else:
+                clip = None
             image_list, timestamps = read_frames_decord(
                 video_path,
                 sample="fps"+str(self.data_args.fps),
@@ -514,16 +520,8 @@ class LazySupervisedDataset(Dataset):
                 end_index = len(timestamps)
             start_index = end_index
     
-        #把影片截止到最後一個query的時間點
-        start_index = 0
-        if "start_time" in data_dict:
-            assert len(data_dict["conversations"]) == 2, "start time only support one query."
-            start_time = data_dict["conversations"][0]["start_time"]
-            for start_index in range(len(timestamps)):
-                if timestamps[start_index] >= start_time:
-                    break
-        image_list = image_list[start_index:end_index]
-        timestamps = np.array([round(t, 1) for t in timestamps[start_index:end_index]])
+        image_list = image_list[:end_index]
+        timestamps = np.array([round(t, 1) for t in timestamps[:end_index]])
         
         num_frames = len(image_list)
         assert num_frames == len(timestamps), f"{num_frames} != {len(timestamps)}"
