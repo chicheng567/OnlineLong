@@ -404,7 +404,7 @@ class LazySupervisedDataset(Dataset):
                     if os.path.exists(f"{video_path}{fmt}"):
                         video_path = f"{video_path}{fmt}"
                         break
-            if "start_time" in data_dict:
+            if "start_time" in data_dict["conversations"][0]:
                 assert len(data_dict["conversations"]) == 2, "start time only support one query."
                 start_time = data_dict["conversations"][0]["start_time"]
                 end_time = data_dict["conversations"][0]["timestamps"]
