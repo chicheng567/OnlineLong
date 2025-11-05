@@ -568,6 +568,11 @@ def get_frame_indices(
             ]  # uniform_sample(frame_indices, max_num_frames)
             # frame_indices = frame_indices[:max_num_frames]
             # frame_indices = np.linspace(0 + delta / 2, duration + delta / 2, endpoint=False, num=max_num_frames)
+        elif num_frames > 0 and len(frame_indices) > num_frames:
+            ids = np.linspace(
+                0, len(frame_indices) - 1, num=num_frames, endpoint=True
+            ).astype(np.int32)
+            frame_indices = [frame_indices[i] for i in ids]
     else:
         raise ValueError
 
