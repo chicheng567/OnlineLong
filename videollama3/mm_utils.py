@@ -593,6 +593,7 @@ def read_frames_decord(
     duration = vlen / float(fps)
     if clip:
         start, end = clip
+        end = min(video_reader.get_frame_timestamp(len(video_reader)-1)[-1], end)
         duration = end - start
         vlen = int(duration * fps)
         start_index = int(start * fps)
