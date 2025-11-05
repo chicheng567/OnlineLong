@@ -221,12 +221,26 @@ class Videollama3Processor(ProcessorMixin):
                     targets[indices[random_selector]] = IGNORE_INDEX
                     sample_types[indices[random_selector]] = -1
 
+        input_ids = torch.cat(input_ids_list)
+        sequence_length = input_ids.size(0)
+        max_length = getattr(self.tokenizer, "model_max_length", None)
+        if max_length and max_length > 0 and sequence_length > max_length:
+            # Surface detailed counts to help authors trim overlong sequences.
+            image_token_count = (input_ids == self.image_token_id).sum().item()
+            text_token_count = sequence_length - image_token_count
+            target_token_count = (targets != IGNORE_INDEX).sum().item()
+            raise ValueError(
+                f"Combined token sequence length {sequence_length} exceeds tokenizer.model_max_length {max_length}. "
+                f"Image tokens: {image_token_count}, text tokens: {text_token_count}, "
+                f"target tokens (non-IGNORE_INDEX): {target_token_count}.\n"
+                f"messages: {text}"
+            )
+
         text_inputs = {
-            "input_ids": torch.cat(input_ids_list),
+            "input_ids": input_ids,
             "labels": targets,
         }
         return text_inputs
-
     def _process_text_without_label(
         self,
         text: Union[List[str], List[Dict]],
