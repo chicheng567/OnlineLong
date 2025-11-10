@@ -21,8 +21,9 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Any, Dict, List, Optional
 
 try:
     from decord import VideoReader, cpu
@@ -32,6 +33,18 @@ except ImportError:  # pragma: no cover - optional dependency
     DECORDError = Exception  # type: ignore
 
 COMMON_EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv']
+
+
+@dataclass
+class RepackageOptions:
+    output_root: Path
+    codec: str
+    pix_fmt: str
+    crf: int
+    preset: str
+    audio_codec: str
+    suffix: str
+    replace_original: bool
 
 
 def load_dataset_config(config_path: str) -> Dict[str, Any]:
@@ -178,6 +191,86 @@ def decode_with_decord(video_path: Path) -> Dict[str, Any]:
     return {"ok": True, "frames": vlen}
 
 
+def repackage_video(
+    video_path: Path,
+    dataset_name: str,
+    relative_video: str,
+    options: RepackageOptions,
+) -> Dict[str, Any]:
+    if not shutil.which("ffmpeg"):
+        return {"performed": False, "error": "ffmpeg_not_found"}
+
+    if not video_path.exists():
+        return {"performed": False, "error": "source_missing"}
+
+    rel_path = Path(relative_video)
+    rel_parent = rel_path.parent
+    base_stem = rel_path.stem or video_path.stem or video_path.name
+    # Keep dataset separation under the output root to avoid collisions.
+    dataset_root = options.output_root / dataset_name / rel_parent
+    dataset_root.mkdir(parents=True, exist_ok=True)
+
+    target_name = f"{base_stem}{options.suffix}.mp4"
+    target_path = dataset_root / target_name
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-c:v",
+        options.codec,
+        "-pix_fmt",
+        options.pix_fmt,
+        "-preset",
+        options.preset,
+        "-crf",
+        str(options.crf),
+        "-movflags",
+        "+faststart",
+        "-c:a",
+        options.audio_codec,
+        str(target_path),
+    ]
+
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if proc.returncode != 0:
+        return {
+            "performed": False,
+            "error": proc.stderr.strip() or proc.stdout.strip() or "ffmpeg_failed",
+            "command": cmd,
+        }
+
+    backup_path: Optional[Path] = None
+    replaced = False
+    final_path = target_path
+    if options.replace_original:
+        backup_path = video_path.with_name(video_path.name + ".backup")
+        if not backup_path.exists():
+            shutil.copy2(video_path, backup_path)
+        shutil.copy2(target_path, video_path)
+        final_path = video_path
+        replaced = True
+
+    return {
+        "performed": True,
+        "output_path": str(target_path),
+        "final_path": str(final_path),
+        "replaced_original": replaced,
+        "backup_path": str(backup_path) if backup_path else None,
+        "command": cmd,
+        "ffmpeg_stdout": proc.stdout.strip(),
+        "ffmpeg_stderr": proc.stderr.strip(),
+    }
+
+
 def analyze_video(video_path: Path) -> Dict[str, Any]:
     if not video_path.exists():
         return {
@@ -212,7 +305,12 @@ def analyze_video(video_path: Path) -> Dict[str, Any]:
     }
 
 
-def analyze_dataset(dataset_name: str, dataset_config: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
+def analyze_dataset(
+    dataset_name: str,
+    dataset_config: Dict[str, Any],
+    verbose: bool = False,
+    repackage_options: Optional[RepackageOptions] = None,
+) -> Dict[str, Any]:
     annotation_path = dataset_config["annotation"]
     data_root = dataset_config["data_root"]
 
@@ -246,20 +344,41 @@ def analyze_dataset(dataset_name: str, dataset_config: Dict[str, Any], verbose: 
         print(f"  Samples detected: {len(video_files)}")
 
     flagged = 0
+    repackaged = 0
     for video_file in video_files:
         video_path = resolve_video_path(video_file, data_root)
         analysis = analyze_video(video_path)
+        repair_info: Optional[Dict[str, Any]] = None
         if analysis["status"] != "healthy":
             flagged += 1
+
+        if (
+            repackage_options
+            and analysis["status"] not in ("healthy", "missing")
+        ):
+            repair_info = repackage_video(video_path, dataset_name, video_file, repackage_options)
+            if repair_info.get("performed"):
+                repackaged += 1
+                target_path = video_path if repackage_options.replace_original else Path(repair_info["output_path"])
+                recheck = analyze_video(target_path)
+                repair_info["post_check"] = recheck
+                if repackage_options.replace_original and recheck["status"] == "healthy":
+                    analysis = recheck
+                    flagged -= 1
+                    flagged = max(flagged, 0)
+
         if verbose:
             reasons = analysis["reasons"] or ["OK"]
             print(f"  - {video_file}: {analysis['status']} | {', '.join(reasons)}")
 
-        results.append({
+        entry = {
             "video": video_file,
             "resolved_path": str(video_path),
             **analysis,
-        })
+        }
+        if repair_info:
+            entry["repair"] = repair_info
+        results.append(entry)
 
     overall_status = "complete" if flagged == 0 else "needs_attention"
 
@@ -268,6 +387,7 @@ def analyze_dataset(dataset_name: str, dataset_config: Dict[str, Any], verbose: 
         "status": overall_status,
         "videos_checked": len(video_files),
         "videos_flagged": flagged,
+        "videos_repackaged": repackaged,
         "details": results,
     }
 
@@ -298,6 +418,52 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip videos that are missing on disk instead of flagging them.",
     )
+    parser.add_argument(
+        "--auto-repackage",
+        action="store_true",
+        help="Automatically attempt to re-encode flagged videos with ffmpeg.",
+    )
+    parser.add_argument(
+        "--repackage-dir",
+        default="work_dirs/repackaged_videos",
+        help="Directory where repaired videos (and logs) are stored.",
+    )
+    parser.add_argument(
+        "--repackage-codec",
+        default="libx264",
+        help="Video codec to use when auto-repackaging.",
+    )
+    parser.add_argument(
+        "--repackage-pix-fmt",
+        default="yuv420p",
+        help="Pixel format to enforce during re-encoding.",
+    )
+    parser.add_argument(
+        "--repackage-crf",
+        type=int,
+        default=18,
+        help="CRF quality value for ffmpeg when auto-repackaging.",
+    )
+    parser.add_argument(
+        "--repackage-preset",
+        default="medium",
+        help="ffmpeg preset to use for the video encoder.",
+    )
+    parser.add_argument(
+        "--repackage-audio-codec",
+        default="aac",
+        help="Audio codec to use for the repaired file (use 'copy' to keep original).",
+    )
+    parser.add_argument(
+        "--repackage-suffix",
+        default="_fixed",
+        help="Suffix appended to repaired filenames before the extension.",
+    )
+    parser.add_argument(
+        "--replace-original",
+        action="store_true",
+        help="After a successful repair, copy the new file over the original (backup is kept).",
+    )
     return parser.parse_args()
 
 
@@ -315,6 +481,22 @@ def main() -> None:
     summary: List[Dict[str, Any]] = []
     total_flagged = 0
     total_checked = 0
+    total_repackaged = 0
+
+    repackage_options: Optional[RepackageOptions] = None
+    if args.auto_repackage:
+        output_root = Path(args.repackage_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+        repackage_options = RepackageOptions(
+            output_root=output_root,
+            codec=args.repackage_codec,
+            pix_fmt=args.repackage_pix_fmt,
+            crf=args.repackage_crf,
+            preset=args.repackage_preset,
+            audio_codec=args.repackage_audio_codec,
+            suffix=args.repackage_suffix,
+            replace_original=args.replace_original,
+        )
 
     for dataset_name in selected_datasets:
         dataset_cfg = config.get(dataset_name)
@@ -322,11 +504,17 @@ def main() -> None:
             print(f"Dataset '{dataset_name}' not found in config, skipping.")
             continue
 
-        result = analyze_dataset(dataset_name, dataset_cfg, verbose=args.verbose)
+        result = analyze_dataset(
+            dataset_name,
+            dataset_cfg,
+            verbose=args.verbose,
+            repackage_options=repackage_options,
+        )
         summary.append(result)
 
         total_checked += result["videos_checked"]
         total_flagged += result["videos_flagged"]
+        total_repackaged += result.get("videos_repackaged", 0)
 
         flagged = result["videos_flagged"]
         status_icon = "✅" if flagged == 0 else "⚠️"
@@ -341,6 +529,8 @@ def main() -> None:
     print(f"  Datasets processed: {len(summary)}")
     print(f"  Videos checked:    {total_checked}")
     print(f"  Videos flagged:    {max(total_flagged, 0)}")
+    if args.auto_repackage:
+        print(f"  Videos repaired:   {total_repackaged}")
 
     if args.output:
         output_path = Path(args.output)
