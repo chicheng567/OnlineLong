@@ -207,7 +207,7 @@ class LazySupervisedDataset(Dataset):
             with open(data, 'r') as f:
                 data_json = json.load(f)
             new_json = []
-            context_length = self.max_frames / self.data_args.fps # in seconds
+            context_length = data_args.max_frames / data_args.fps # in seconds
             for idx in range(len(data_json)):
                 data = data_json[idx]
                 ori_conversations = data['conversations']
