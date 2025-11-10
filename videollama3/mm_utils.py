@@ -587,6 +587,7 @@ def read_frames_decord(
     min_num_frames=4,
     max_num_frames=-1,
     return_timestamps=False,
+    force_context_length=False,
 ):
     if "s3://" in video_path:
         video_bytes = client.get(video_path)
@@ -603,6 +604,8 @@ def read_frames_decord(
         last_timestamp = video_reader.get_frame_timestamp(vlen - 1)[-1]
         end = min(last_timestamp, end)
         end = min(video_reader.get_frame_timestamp(len(video_reader)-1)[0], end)
+        if force_context_length:
+            start = max(0, round(end - (num_frames / float(sample.replace("fps", ""))), 1))
         duration = end - start
         vlen = int(duration * fps)
         start_index = int(start * fps)

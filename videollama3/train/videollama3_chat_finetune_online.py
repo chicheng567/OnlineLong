@@ -207,7 +207,6 @@ class LazySupervisedDataset(Dataset):
             with open(data, 'r') as f:
                 data_json = json.load(f)
             new_json = []
-            context_length = data_args.max_frames / data_args.fps # in seconds
             for idx in range(len(data_json)):
                 data = data_json[idx]
                 ori_conversations = data['conversations']
@@ -224,11 +223,10 @@ class LazySupervisedDataset(Dataset):
                             new_obj["conversations"] = ori_conversations[:2]
                             events += new_obj["conversations"][1]["value"] + "\n"
                         else:
-                            start_time = max(0, ori_conversations[i]["timestamps"] - context_length)
                             new_obj["conversations"] = [
                                 {
                                     "from": "human",
-                                    "start_time": start_time,
+                                    "start_time": ori_conversations[i - 2]["timestamps"],
                                     "timestamps": ori_conversations[i]["timestamps"],
                                     "value": prefix + events + suffix
                                 },
@@ -420,6 +418,7 @@ class LazySupervisedDataset(Dataset):
                 min_num_frames=1,
                 clip=clip,
                 return_timestamps=True,
+                force_context_length=self.prefix_captioning
             )
             assert len(timestamps) == len(image_list), f"{len(timestamps)} != {len(image_list)}"
             assert len(timestamps) > 0, f"Empty video frames! {video_path}, {clip}"
