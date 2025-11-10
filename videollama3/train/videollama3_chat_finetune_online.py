@@ -207,14 +207,15 @@ class LazySupervisedDataset(Dataset):
             with open(data, 'r') as f:
                 data_json = json.load(f)
             new_json = []
+            context_length = self.max_frames / self.data_args.fps # in seconds
             for idx in range(len(data_json)):
                 data = data_json[idx]
                 ori_conversations = data['conversations']
                 video = data['video']
                 #spliting captions
                 if len(ori_conversations) > 2:
-                    prefix = "There is a long video provided. Below are some captions describing the events in the video at different timestamps in ascending order.\n"
-                    suffix = "Below are video frames followed up.\n"
+                    prefix = "There is a streaming video provided. Below are some captions describing the events in the video at different timestamps in ascending order.\n"
+                    suffix = "The following clip contains only the last few seconds of the ongoing stream.\n"
                     events = ""
                     for i in range(0, len(ori_conversations), 2):
                         new_obj = {}
@@ -223,10 +224,11 @@ class LazySupervisedDataset(Dataset):
                             new_obj["conversations"] = ori_conversations[:2]
                             events += new_obj["conversations"][1]["value"] + "\n"
                         else:
+                            start_time = max(0, ori_conversations[i]["timestamps"] - context_length)
                             new_obj["conversations"] = [
                                 {
                                     "from": "human",
-                                    "start_time": ori_conversations[i-2]["timestamps"],
+                                    "start_time": start_time,
                                     "timestamps": ori_conversations[i]["timestamps"],
                                     "value": prefix + events + suffix
                                 },
@@ -415,10 +417,12 @@ class LazySupervisedDataset(Dataset):
                 video_path,
                 sample="fps"+str(self.data_args.fps),
                 num_frames=self.data_args.max_frames,
-                min_num_frames=4,
+                min_num_frames=1,
                 clip=clip,
                 return_timestamps=True,
             )
+            assert len(timestamps) == len(image_list), f"{len(timestamps)} != {len(image_list)}"
+            assert len(timestamps) > 0, f"Empty video frames! {video_path}, {clip}"
         else:
             #for object tracking tasks
             fps = data_dict.get("fps", 1)  # Default to 1 fps if not specified
@@ -485,7 +489,6 @@ class LazySupervisedDataset(Dataset):
                 }
                 conversations.extend([human_query_after, gpt_response_after])
             data_dict.update({"conversations": conversations})
-        assert len(image_list) > 1, f"Invalid image data: {image_list}"
         if "QA" in data_dict:
             data_dict["conversations"] = process_qa(data_dict["QA"])
         # Ensure the first conversation contains a video placeholder
