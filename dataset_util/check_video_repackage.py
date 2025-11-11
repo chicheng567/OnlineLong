@@ -23,7 +23,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 try:
     from decord import VideoReader, cpu
@@ -75,6 +75,18 @@ def extract_video_files(annotation_data: List[Dict[str, Any]]) -> List[str]:
             if any(lower_path.endswith(ext) for ext in COMMON_EXTENSIONS):
                 video_files.append(item['image'])
     return video_files
+
+
+def get_video_identifier(item: Dict[str, Any]) -> Optional[str]:
+    value = item.get('video')
+    if isinstance(value, str):
+        return value
+    image = item.get('image')
+    if isinstance(image, str):
+        lower_path = image.lower()
+        if any(lower_path.endswith(ext) for ext in COMMON_EXTENSIONS):
+            return image
+    return None
 
 
 def resolve_video_path(video_file: str, data_root: str) -> Path:
@@ -392,6 +404,104 @@ def analyze_dataset(
     }
 
 
+def collect_problematic_videos(details: List[Dict[str, Any]]) -> Set[str]:
+    problematic: Set[str] = set()
+    for detail in details:
+        video = detail.get("video")
+        status = detail.get("status")
+        if not video or status == "healthy":
+            continue
+        problematic.add(video)
+    return problematic
+
+
+def remove_entries_from_annotation(annotation_path: str, bad_videos: Set[str]) -> Dict[str, Any]:
+    try:
+        with open(annotation_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"removed": 0, "error": f"load_error: {exc}"}
+
+    if isinstance(data, list):
+        entries = data
+        container_type = "list"
+    elif isinstance(data, dict) and isinstance(data.get("annotations"), list):
+        entries = data["annotations"]
+        container_type = "dict"
+    else:
+        return {"removed": 0, "error": "unsupported_annotation_format"}
+
+    filtered: List[Dict[str, Any]] = []
+    removed = 0
+    for item in entries:
+        identifier = get_video_identifier(item)
+        if identifier and identifier in bad_videos:
+            removed += 1
+            continue
+        filtered.append(item)
+
+    if removed == 0:
+        return {"removed": 0, "error": None}
+
+    backup_path = annotation_path + ".backup"
+    with open(backup_path, "w", encoding="utf-8") as backup_file:
+        json.dump(data, backup_file, indent=2, ensure_ascii=False)
+
+    if container_type == "list":
+        new_payload: Any = filtered
+    else:
+        data["annotations"] = filtered
+        new_payload = data
+
+    with open(annotation_path, "w", encoding="utf-8") as dest:
+        json.dump(new_payload, dest, indent=2, ensure_ascii=False)
+
+    return {
+        "removed": removed,
+        "remaining": len(filtered),
+        "backup_path": backup_path,
+    }
+
+
+def fix_problematic_entries(config: Dict[str, Any], summary: List[Dict[str, Any]]) -> None:
+    print("\n" + "=" * 60)
+    print("Fixing annotations with --fix-missing")
+    print("=" * 60)
+
+    total_removed = 0
+    for dataset_result in summary:
+        dataset_name = dataset_result.get("dataset")
+        details = dataset_result.get("details", [])
+        bad_videos = collect_problematic_videos(details)
+        if not bad_videos:
+            continue
+
+        dataset_cfg = config.get(dataset_name, {})
+        annotation_path = dataset_cfg.get("annotation")
+        if not annotation_path or not os.path.exists(annotation_path):
+            print(f"Skipping {dataset_name}: annotation file missing")
+            continue
+
+        result = remove_entries_from_annotation(annotation_path, bad_videos)
+        removed = result.get("removed", 0)
+        total_removed += removed
+        if removed == 0:
+            print(f"{dataset_name}: no entries removed (already clean)")
+            continue
+
+        backup_path = result.get("backup_path")
+        remaining = result.get("remaining")
+        print(
+            f"{dataset_name}: removed {removed} entries (remaining {remaining}). "
+            f"Backup -> {backup_path}"
+        )
+
+    if total_removed == 0:
+        print("No problematic entries were removed. All datasets already clean.")
+    else:
+        print(f"Total entries removed: {total_removed}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Detect videos that likely need repackaging or re-encoding.")
     parser.add_argument(
@@ -463,6 +573,11 @@ def parse_args() -> argparse.Namespace:
         "--replace-original",
         action="store_true",
         help="After a successful repair, copy the new file over the original (backup is kept).",
+    )
+    parser.add_argument(
+        "--fix-missing",
+        action="store_true",
+        help="Remove annotation entries referencing videos that remain missing or damaged.",
     )
     return parser.parse_args()
 
@@ -538,6 +653,9 @@ def main() -> None:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
         print(f"\nDetailed report written to: {output_path}")
+
+    if args.fix_missing:
+        fix_problematic_entries(config, summary)
 
 
 if __name__ == "__main__":
