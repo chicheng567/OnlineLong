@@ -24,7 +24,6 @@ import random
 import re
 import sys
 import warnings
-import traceback
 from packaging import version
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
@@ -60,6 +59,7 @@ from videollama3.model.processor import Videollama3Processor
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 local_rank = None
+logger = logging.getLogger(__name__)
 
 
 def rank0_print(*args):
@@ -562,10 +562,16 @@ class LazySupervisedDataset(Dataset):
                 assert len(data_dict['pixel_values']) > 0 and len(data_dict['grid_sizes']) > 0, f"Invalid image data: {data_dict['images']}, {data_dict['grid_thws']}"
             data_dict['modals'] = [modal] * len(images)
 
-        except Exception as e:
-            traceback.print_exc()
+        except Exception:
             backup_idx = random.randint(0, len(self.list_data_dict) - 1)
-            print(f"Encounted error when process {i}-th example: {data_dict}, use {backup_idx}-th example instead!!!")
+            logger.exception(
+                "Failed to process sample %s (dataset=%s, root=%s). Fallback index: %s. Entry: %s",
+                i,
+                self.dataset_name or "unknown",
+                self.dataset_root or self.data_args.data_folder,
+                backup_idx,
+                data_dict,
+            )
             return self.__getitem__(backup_idx)
 
         return data_dict
@@ -697,17 +703,30 @@ def train(attn_implementation=None):
 
     # Setup logging
     log_file = os.path.join(training_args.output_dir, "training.log")
+    error_log_file = os.path.join(training_args.output_dir, "training_errors.log")
     os.makedirs(training_args.output_dir, exist_ok=True)
 
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    log_formatter = logging.Formatter(
+        fmt="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_file, mode='a')
-        ],
-        level=logging.INFO,
     )
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(log_formatter)
+    file_handler = logging.FileHandler(log_file, mode='a')
+    file_handler.setFormatter(log_formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+    root_logger.addHandler(console_handler)
+    root_logger.addHandler(file_handler)
+
+    error_handler = logging.FileHandler(error_log_file, mode='a')
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(log_formatter)
+    root_logger.addHandler(error_handler)
+
+    logging.captureWarnings(True)
     local_rank = training_args.local_rank
 
     if local_rank == 0:

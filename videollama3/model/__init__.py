@@ -54,9 +54,15 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
     # Load config directly using Videollama3Qwen2Config
     config = Videollama3Qwen2Config.from_pretrained(model_path)
-    config._attn_implementation = kwargs.pop('attn_implementation', "flash_attention_2") # default to flash_attention_2
+    attn_impl = kwargs.pop('attn_implementation', "flash_attention_2")  # default to flash_attention_2
+    config._attn_implementation = attn_impl
+    config.mm_attn_implementation = attn_impl
 
-    torch_dtype = config.torch_dtype if hasattr(config, "torch_dtype") else kwargs.pop('torch_dtype', torch.float16)
+    requested_dtype = kwargs.pop('torch_dtype', None)
+    config_dtype = getattr(config, "torch_dtype", None)
+    torch_dtype = requested_dtype or config_dtype or torch.float16
+    if hasattr(config, "torch_dtype"):
+        config.torch_dtype = torch_dtype
 
     if load_8bit:
         kwargs['load_in_8bit'] = True

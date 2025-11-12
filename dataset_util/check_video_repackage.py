@@ -415,6 +415,39 @@ def collect_problematic_videos(details: List[Dict[str, Any]]) -> Set[str]:
     return problematic
 
 
+def build_repackage_report(summary: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Reduce the verbose dataset summary to only the entries that actually need
+    repackaging so the JSON report stays focused on actionable failures.
+    """
+    report: List[Dict[str, Any]] = []
+    for dataset_result in summary:
+        dataset_name = dataset_result.get("dataset")
+        flagged_details: List[Dict[str, Any]] = []
+        for detail in dataset_result.get("details", []):
+            if detail.get("status") != "needs_repackage":
+                continue
+            minimal_detail = {
+                "video": detail.get("video"),
+                "resolved_path": detail.get("resolved_path"),
+                "status": detail.get("status"),
+                "reasons": detail.get("reasons"),
+                "metadata": detail.get("metadata"),
+            }
+            if "repair" in detail:
+                minimal_detail["repair"] = detail["repair"]
+            flagged_details.append(minimal_detail)
+        if flagged_details:
+            report.append(
+                {
+                    "dataset": dataset_name,
+                    "videos_flagged": len(flagged_details),
+                    "details": flagged_details,
+                }
+            )
+    return report
+
+
 def remove_entries_from_annotation(annotation_path: str, bad_videos: Set[str]) -> Dict[str, Any]:
     try:
         with open(annotation_path, "r", encoding="utf-8") as f:
@@ -650,9 +683,10 @@ def main() -> None:
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        filtered_summary = build_repackage_report(summary)
         with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(summary, f, ensure_ascii=False, indent=2)
-        print(f"\nDetailed report written to: {output_path}")
+            json.dump(filtered_summary, f, ensure_ascii=False, indent=2)
+        print(f"\nDetailed report written to: {output_path} (flagged videos only)")
 
     if args.fix_missing:
         fix_problematic_entries(config, summary)
