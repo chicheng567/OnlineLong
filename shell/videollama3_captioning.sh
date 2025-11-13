@@ -13,9 +13,10 @@ OUTPUT_FILE="${OUTPUT_DIR}/captions.jsonl"
 mkdir -p "${OUTPUT_DIR}"
 
 PYTHONPATH=. /miniconda/envs/onlinellama3/bin/python videollama3/inference/captionoing.py \
-  --model_name_or_path "pretrained_models/videollama3_7b_local" \
+  --model_name_or_path "pretrained_models/stage1" \
   --meta_data_path "${META_PATH}" \
   --output_file "${OUTPUT_FILE}" \
+  --do_sample True \
   --max_new_tokens 512 \
   --temperature 0.2 \
   --top_k 50 \
@@ -24,4 +25,5 @@ PYTHONPATH=. /miniconda/envs/onlinellama3/bin/python videollama3/inference/capti
   --repetition_penalty 1.05 \
   --bf16 True \
   --seed 42 \
+  --clip_length 50 \
   "$@"

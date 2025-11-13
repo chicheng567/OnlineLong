@@ -169,16 +169,13 @@ def Captioning():
             raise ValueError(f"Dataset '{dataset_name}' is missing the 'annotation' key.")
         if not osp.exists(annotation_path):
             raise FileNotFoundError(f"Annotation file {annotation_path} not found for dataset '{dataset_name}'.")
-        dataset_clip_length = dataset_cfg.get("clip_length", inference_args.clip_length)
-        if not use_cuda and dataset_clip_length > inference_args.clip_length:
-            dataset_clip_length = inference_args.clip_length
         collected_dataset.append(
             LazySupervisedDatasetForCaptioning(
                 annotation_path=annotation_path,
                 data_root=dataset_cfg.get("data_root"),
                 use_prefix_caption=dataset_cfg.get("prefix_captioning", False),
                 fps=dataset_cfg.get("sampling_fps", inference_args.sampling_fps),
-                max_video_length=dataset_clip_length,
+                max_video_length=inference_args.clip_length,
             )
         )
     if not collected_dataset:
