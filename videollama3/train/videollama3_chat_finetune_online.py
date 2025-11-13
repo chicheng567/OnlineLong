@@ -169,6 +169,34 @@ class TrainingArguments(transformers.TrainingArguments):
 from torch.utils.data import ConcatDataset
 
 
+class ConcatDatasetWithLengths(ConcatDataset):
+    """
+    Thin wrapper around torch.utils.data.ConcatDataset that preserves the
+    length/ modality metadata expected by VideoLLaMA3Trainer when grouping.
+    """
+
+    def __init__(self, datasets):
+        super().__init__(datasets)
+        self._lengths = []
+        self._modality_lengths = []
+        for dataset in self.datasets:
+            if not hasattr(dataset, "lengths") or not hasattr(dataset, "modality_lengths"):
+                raise AttributeError(
+                    f"{dataset} does not expose `lengths`/`modality_lengths`, "
+                    "but they are required for grouped sampling."
+                )
+            self._lengths.extend(dataset.lengths)
+            self._modality_lengths.extend(dataset.modality_lengths)
+
+    @property
+    def lengths(self):
+        return self._lengths
+
+    @property
+    def modality_lengths(self):
+        return self._modality_lengths
+
+
 class LoggingCallback(TrainerCallback):
     """Custom callback to log training metrics to file."""
 
@@ -681,7 +709,7 @@ def make_flattening_supervised_data_module(vlprocessor: transformers.ProcessorMi
                 #captioning task only need previous captions as prefix, previous frames are not needed.
                 prefix_captioning=v.get('prefix_captioning', False)
             ))
-        train_dataset = ConcatDataset(collected_datasets)
+        train_dataset = ConcatDatasetWithLengths(collected_datasets)
     else:
         train_dataset = LazySupervisedDataset(
             vlprocessor=vlprocessor,
