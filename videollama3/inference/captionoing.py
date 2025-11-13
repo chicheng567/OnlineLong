@@ -1,566 +1,283 @@
-#!/usr/bin/env python3
-
-from __future__ import annotations
-
-import argparse
 import json
-import logging
 import os
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+import os.path as osp
+from dataclasses import dataclass, field
+from typing import Dict, Optional
 
-import numpy as np
 import torch
-from decord import VideoReader, cpu
+import transformers
+from torch.utils.data import ConcatDataset, Dataset
+from transformers import AutoProcessor
 from tqdm import tqdm
 
-from videollama3.mm_utils import (
-    get_model_name_from_path,
-    preprocess_videollama3,
-    read_frames_decord,
-)
-from videollama3.model import load_pretrained_model
-from videollama3.model.processor import Videollama3Processor
+from videollama3.mm_utils import LoadVideoWithClips
+from videollama3.model import Videollama3Qwen2Config, Videollama3Qwen2ForCausalLM
+from videollama3.train.videollama3_chat_finetune_online import set_seed
+@dataclass
+class ModelArguments:
+    # LLM Arguments
+    model_name_or_path: Optional[str] = field(default="pretrained_models/videollama3_7b_local")
+    tokenizer_name_or_path: Optional[str] = field(default=None)
+    # Connector Arguments
+    mm_projector_type: Optional[str] = field(default='linear')
+    # Vision tower Arguments
+    vision_encoder: Optional[str] = field(default=None)
+    mm_vision_select_layer: Optional[int] = field(default=-1)
+    mm_vision_select_feature: Optional[str] = field(default="patch")
+    mm_attn_implementation: Optional[str] = field(default="flash_attention_2") #always use flash_attention_2
+    # Token downsampling Arguments
+    use_token_compression: Optional[bool] = field(default=False)
+    
+@dataclass
+class InferenceArguments:
+    #Data arguments
+    meta_data_path: Optional[str] = field(default="anno_data/finetune_online.json")
+    #ouptut file
+    output_file: Optional[str] = field(default="captioning_results.jsonl")
+    # Generation size controls
+    max_new_tokens: int = field(default=128)  # preferred over max_length for HF generate
+    max_length: Optional[int] = field(default=None)  # legacy; if set, may be used instead of max_new_tokens
+    min_length: int = field(default=0)
+    # Sampling / search strategy
+    do_sample: bool = field(default=False)
+    temperature: float = field(default=1.0)
+    top_k: int = field(default=50)
+    top_p: float = field(default=1.0)
+    num_beams: int = field(default=1)
+    num_return_sequences: int = field(default=1)
+    no_repeat_ngram_size: int = field(default=0)
 
+    # Penalties & length handling
+    repetition_penalty: float = field(default=1.0)
+    length_penalty: float = field(default=1.0)
+    early_stopping: bool = field(default=False)
 
-logger = logging.getLogger(__name__)
+    # Tokens & caching
+    pad_token_id: Optional[int] = field(default=None)
+    bos_token_id: Optional[int] = field(default=None)
+    eos_token_id: Optional[int] = field(default=None)
+    use_cache: bool = field(default=True)
 
-TRAINING_PREFIX = (
-    "There is a streaming video provided. Below are some captions describing the events in the video "
-    "at different timestamps in ascending order.\n"
-)
-TRAINING_SUFFIX = "The following clip contains only the last few seconds of the ongoing stream.\n"
-BASE_INSTRUCTION = "Describe the events that took place within this video clip as a detailed chronicle."
+    # Return options from generate()
+    return_dict_in_generate: bool = field(default=False)
+    output_scores: bool = field(default=False)
+    # Misc
+    device: Optional[str] = field(default=None)  # e.g., "cuda" or "cpu"; if None, infer from model
+    bf16: bool = field(default=True)  # whether to use half precision for generation
+    fp16: bool = field(default=False)
+    seed: Optional[int] = field(default=None)  # if set, will be used to call set_seed(seed)
+    clip_length: int = field(default=300)
+    sampling_fps: int = field(default=1)
+    max_videos: Optional[int] = field(default=None)
+    
+    # Extra passthrough dict for any non-explicit HuggingFace generate kwargs
+    generation_kwargs: Optional[Dict[str, object]] = field(default=None)
 
+class LazySupervisedDatasetForCaptioning(Dataset):
+    def __init__(
+        self,
+        annotation_path: str,
+        data_root: Optional[str],
+        use_prefix_caption: bool,
+        fps: int,
+        max_video_length: int = 300,
+    ):
+        self.annotation_path = annotation_path
+        self.data_root = data_root
+        self.use_prefix_caption = use_prefix_caption
+        self.max_video_length = max_video_length
+        self.fps = fps
+        if data_root is not None:
+            if not os.path.exists(data_root):
+                raise FileNotFoundError(f"Dataset root {data_root} not exists!")
+        with open(annotation_path, 'r') as f:
+            datas = json.load(f)
+        self.video_list = []  # keep relative paths to avoid double-joining
+        for data in datas:
+            video_id = data.get("video")
+            if not video_id:
+                continue
+            self.video_list.append(video_id)
+        if not self.video_list:
+            raise ValueError(f"No videos found in {annotation_path}")
+        print(f"Loaded {len(self.video_list)} videos from {annotation_path} (root={self.data_root or 'cwd'})")
+    
+    def __len__(self):
+        return len(self.video_list)
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sliding window captioning with VideoLLaMA3.")
-    parser.add_argument("--model-path", required=True, help="Path or HF repo id of the pretrained checkpoint.")
-    parser.add_argument(
-        "--model-base",
-        default=None,
-        help="Optional base model path when loading LoRA/QLoRA checkpoints.",
-    )
-    parser.add_argument(
-        "--manifest",
-        default=None,
-        help="JSON/JSONL file that lists samples. Each item must contain a 'video' field.",
-    )
-    parser.add_argument(
-        "--video-root",
-        default=None,
-        help="Directory that stores the raw videos. Relative manifest paths resolve against this directory.",
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Destination JSON file that will store generated captions.",
-    )
-    parser.add_argument(
-        "--dataset-meta",
-        default=None,
-        help="Meta JSON that lists multiple datasets (see training data_path meta format).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        help="Directory used to store per-dataset outputs when --dataset-meta is provided.",
-    )
-    parser.add_argument(
-        "--num-frames",
-        type=int,
-        default=128,
-        help="Number of frames to feed the model per window.",
-    )
-    parser.add_argument(
-        "--fps",
-        type=float,
-        default=2.0,
-        help="Temporal sampling rate used by decord when extracting windows.",
-    )
-    parser.add_argument(
-        "--stride",
-        type=int,
-        default=None,
-        help="Frame stride between windows. Defaults to num_frames (no overlap).",
-    )
-    parser.add_argument(
-        "--video-merge-size",
-        type=int,
-        default=1,
-        help="Spatial merge size used by the VideoLLaMA3 image processor.",
-    )
-    parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=512,
-        help="Maximum tokens to generate per window.",
-    )
-    parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--num-beams", type=int, default=1)
-    parser.add_argument("--repetition-penalty", type=float, default=1.05)
-    parser.add_argument("--device-map", default="auto", help="Device map passed to load_pretrained_model.")
-    parser.add_argument(
-        "--dtype",
-        default="auto",
-        choices=["auto", "float16", "bfloat16", "float32"],
-        help="Computation dtype override.",
-    )
-    parser.add_argument(
-        "--attn-impl",
-        default="flash_attention_2",
-        choices=["flash_attention_2", "eager"],
-        help="Attention backend to request when loading the model.",
-    )
-    parser.add_argument("--limit", type=int, default=None, help="Optionally limit how many videos are processed.")
-    parser.add_argument("--log-every", type=int, default=1, help="Log progress every N videos.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for frame sampling.")
-    return parser.parse_args()
+    def __getitem__(self, index):
+        rel_path = self.video_list[index]
+        full_path = osp.join(self.data_root, rel_path) if self.data_root else rel_path
+        return {
+            "video": full_path,
+            "video_context_window": self.max_video_length,
+            "use_prefix_caption": self.use_prefix_caption,
+            "sampling_fps": self.fps,
+        }
 
-
-def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
-
-
-def load_manifest(manifest_path: str) -> List[Dict]:
-    path = Path(manifest_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
-
-    if path.suffix == ".jsonl":
-        with path.open("r", encoding="utf-8") as f:
-            records = [json.loads(line) for line in f if line.strip()]
+def Captioning():
+    parser = transformers.HfArgumentParser((ModelArguments, InferenceArguments))
+    model_args, inference_args = parser.parse_args_into_dataclasses()
+    seed = inference_args.seed or 42
+    set_seed(seed)
+    use_cuda = torch.cuda.is_available()
+    if not use_cuda and (inference_args.bf16 or inference_args.fp16):
+        print("Requested half precision on CPU; falling back to float32 for compatibility.")
+        inference_args.bf16 = False
+        inference_args.fp16 = False
+    if not use_cuda and inference_args.clip_length > 32:
+        print("Large clip length is memory intensive on CPU; capping clip_length to 32 frames.")
+        inference_args.clip_length = 32
+    if inference_args.bf16:
+        compute_dtype = torch.bfloat16
+    elif inference_args.fp16:
+        compute_dtype = torch.float16
     else:
-        with path.open("r", encoding="utf-8") as f:
-            records = json.load(f)
-
-    if isinstance(records, dict):
-        # Accept common wrappers while keeping the script simple.
-        for key in ("data", "videos", "samples"):
-            if key in records and isinstance(records[key], list):
-                records = records[key]
-                break
-        else:
-            raise ValueError(
-                "Manifest JSON must be a list or contain a top-level 'data'/'videos'/'samples' list."
-            )
-
-    if not isinstance(records, list):
-        raise ValueError("Manifest file must encode a list of samples.")
-
-    return records
-
-
-def load_dataset_meta(meta_path: str) -> Dict[str, Dict]:
-    path = Path(meta_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Dataset meta not found: {meta_path}")
-    with path.open("r", encoding="utf-8") as f:
-        content = json.load(f)
-    if not isinstance(content, dict):
-        raise ValueError("Dataset meta JSON must be a dictionary keyed by dataset name.")
-    return content
-
-
-def build_dataset_specs_from_meta(meta_path: str, output_dir: str) -> List[Dict]:
-    meta = load_dataset_meta(meta_path)
-    specs: List[Dict] = []
-    for name, cfg in meta.items():
-        annotation = cfg.get("annotation")
-        data_root = cfg.get("data_root")
-        if annotation is None:
-            raise ValueError(f"Dataset '{name}' is missing 'annotation' field.")
-        if data_root is None:
-            raise ValueError(f"Dataset '{name}' is missing 'data_root' field.")
-        annotation_path = annotation if os.path.isabs(annotation) else str(Path(annotation).resolve())
-        data_root_path = data_root if os.path.isabs(data_root) else str(Path(data_root).resolve())
-        output_path = os.path.join(output_dir, f"{name}_captions.json")
-        specs.append(
-            {
-                "name": name,
-                "manifest": annotation_path,
-                "video_root": data_root_path,
-                "output": output_path,
-            }
-        )
-    return specs
-
-
-def build_single_dataset_spec(manifest: str, video_root: Optional[str], output: str) -> List[Dict]:
-    dataset_name = Path(output).stem
-    return [
-        {
-            "name": dataset_name,
-            "manifest": manifest,
-            "video_root": video_root,
-            "output": output,
-        }
-    ]
-
-
-def resolve_video_path(
-    raw_path: str,
-    video_root: Optional[str],
-    manifest_dir: Path,
-) -> str:
-    if os.path.isabs(raw_path):
-        return raw_path
-    candidate_roots = [video_root, manifest_dir]
-    for root in candidate_roots:
-        if root is None:
-            continue
-        candidate = os.path.join(root, raw_path)
-        if os.path.exists(candidate):
-            return candidate
-    return raw_path
-
-
-def probe_duration(video_path: str) -> Tuple[float, float]:
-    reader = VideoReader(video_path, ctx=cpu(0), num_threads=1)
-    fps = float(reader.get_avg_fps())
-    if fps <= 0:
-        fps = 1.0
-    frame_count = len(reader)
-    last_ts = reader.get_frame_timestamp(frame_count - 1)[-1] if frame_count > 0 else 0.0
-    duration = max(last_ts, frame_count / fps)
-    del reader
-    return fps, duration
-
-
-def build_windows(duration: float, window_sec: float, stride_sec: float) -> List[Tuple[float, float]]:
-    if duration <= 0:
-        return []
-    eps = 1e-6
-    if duration <= window_sec + eps:
-        return [(0.0, duration)]
-
-    windows: List[Tuple[float, float]] = []
-    start = 0.0
-    while True:
-        end = start + window_sec
-        if end >= duration - eps:
-            windows.append((max(0.0, duration - window_sec), duration))
-            break
-        windows.append((start, end))
-        start += stride_sec
-        if start >= duration:
-            break
-    # Remove duplicates that can appear when duration aligns with window boundaries.
-    deduped = []
-    for win in windows:
-        if not deduped or abs(deduped[-1][0] - win[0]) > eps:
-            deduped.append((round(win[0], 3), round(win[1], 3)))
-    return deduped
-
-
-def prepare_messages(
-    message_value: str,
-    timestamps: Sequence[float],
-) -> List[Dict]:
-    rounded = np.array([round(t, 1) for t in timestamps], dtype=np.float32)
-    query_time = (rounded[-1] if len(rounded) else 0.0) + 0.1
-    conversations = [
-        {
-            "from": "human",
-            "timestamps": float(query_time),
-            "value": message_value,
-        }
-    ]
-    return preprocess_videollama3(conversations, rounded)
-
-
-def build_prompt_with_history(events: Sequence[str], base_instruction: str) -> str:
-    if not events:
-        return f"<video>\n{base_instruction}"
-    history = "".join(f"{evt}\n" for evt in events if evt)
-    return f"{TRAINING_PREFIX}{history}{TRAINING_SUFFIX}<video>\n{base_instruction}"
-
-
-def caption_window(
-    frames: List,
-    timestamps: Sequence[float],
-    message_value: str,
-    processor: Videollama3Processor,
-    model,
-    tokenizer,
-    merge_size: int,
-    generation_kwargs: Dict,
-) -> str:
-    if len(frames) == 0 or len(timestamps) == 0:
-        raise ValueError("Window has no decodable frames.")
-
-    messages = prepare_messages(message_value, timestamps)
-    batch = processor(
-        images=frames,
-        text=messages,
-        merge_size=merge_size,
-        return_tensors="pt",
+        compute_dtype = torch.float32
+    model_args.torch_dtype = compute_dtype
+    print("Loading model...")
+    config = Videollama3Qwen2Config.from_pretrained(model_args.model_name_or_path)
+    attn_impl = model_args.mm_attn_implementation or "flash_attention_2"
+    if attn_impl == "flash_attention_2" and not torch.cuda.is_available():
+        print("FlashAttention2 requested but CUDA is unavailable; falling back to SDPA attention.")
+        attn_impl = "sdpa"
+    config._attn_implementation = attn_impl
+    config.mm_attn_implementation = attn_impl
+    config.use_token_compression = model_args.use_token_compression
+    if model_args.vision_encoder is not None:
+        config.vision_encoder = model_args.vision_encoder
+    model = Videollama3Qwen2ForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        config=config,
+        torch_dtype=compute_dtype,
+        do_sample=True,
     )
-    # Align processor outputs with the model device/dtype for flash-attention compatibility.
-    try:
-        model_device = getattr(model, "device", next(model.parameters()).device)
-    except StopIteration:
-        model_device = torch.device("cpu")
-    try:
-        model_dtype = getattr(model, "dtype", next(model.parameters()).dtype)
-    except StopIteration:
-        model_dtype = torch.float16
-    batch = batch.to(model_device)
-    for key, value in batch.items():
-        if torch.is_tensor(value) and torch.is_floating_point(value) and value.dtype != model_dtype:
-            batch[key] = value.to(dtype=model_dtype)
-    batch["modals"] = ["video"] * len(frames)
-
-    input_len = batch["input_ids"].shape[-1]
-    with torch.inference_mode():
-        output_ids = model.generate(
-            **batch,
-            **generation_kwargs,
+    model.config.use_cache = False
+    device = inference_args.device or ("cuda" if use_cuda else "cpu")
+    model.to(device)
+    vl3_processor = AutoProcessor.from_pretrained("DAMO-NLP-SG/VideoLLaMA3-7B", trust_remote_code=True)
+    model.eval()
+    #Create dataset
+    with open(inference_args.meta_data_path, 'r') as f:
+        meta_data = json.load(f)
+    if not isinstance(meta_data, dict):
+        raise ValueError("Metadata file must describe a dict of dataset configs.")
+    collected_dataset = []
+    for dataset_name, dataset_cfg in meta_data.items():
+        annotation_path = dataset_cfg.get("annotation")
+        if annotation_path is None:
+            raise ValueError(f"Dataset '{dataset_name}' is missing the 'annotation' key.")
+        if not osp.exists(annotation_path):
+            raise FileNotFoundError(f"Annotation file {annotation_path} not found for dataset '{dataset_name}'.")
+        dataset_clip_length = dataset_cfg.get("clip_length", inference_args.clip_length)
+        if not use_cuda and dataset_clip_length > inference_args.clip_length:
+            dataset_clip_length = inference_args.clip_length
+        collected_dataset.append(
+            LazySupervisedDatasetForCaptioning(
+                annotation_path=annotation_path,
+                data_root=dataset_cfg.get("data_root"),
+                use_prefix_caption=dataset_cfg.get("prefix_captioning", False),
+                fps=dataset_cfg.get("sampling_fps", inference_args.sampling_fps),
+                max_video_length=dataset_clip_length,
+            )
         )
-    response_ids = output_ids[:, input_len:]
-    text = tokenizer.batch_decode(response_ids, skip_special_tokens=True)[0]
-    return text.strip()
-
-
-def process_dataset(
-    dataset_name: str,
-    manifest_path: str,
-    video_root: Optional[str],
-    output_path: str,
-    processor: Videollama3Processor,
-    model,
-    tokenizer,
-    base_instruction: str,
-    num_frames: int,
-    fps: float,
-    stride_sec: float,
-    window_sec: float,
-    generation_kwargs: Dict,
-    video_merge_size: int,
-    limit: Optional[int],
-    log_every: int,
-) -> None:
-    records = load_manifest(manifest_path)
-    manifest_dir = Path(manifest_path).parent
-    iterator = records if limit is None else records[:limit]
-
-    results = []
-    dataset_desc = f"Captioning {dataset_name}"
-
-    for idx, sample in enumerate(tqdm(iterator, desc=dataset_desc)):
-        video_field = sample.get("video") or sample.get("video_path")
-        if video_field is None:
-            logger.warning("Skipping sample without 'video' field: %s", sample)
-            continue
-        video_path = resolve_video_path(video_field, video_root, manifest_dir)
-        if not os.path.exists(video_path):
-            logger.warning("Video not found, skip: %s", video_path)
-            continue
-
-        try:
-            _, duration = probe_duration(video_path)
-        except Exception as exc:
-            logger.exception("Failed to probe %s: %s", video_path, exc)
-            continue
-
-        windows = build_windows(duration, window_sec, stride_sec)
-        if not windows:
-            logger.warning("No valid window computed for %s", video_path)
-            continue
-
-        segments = []
-        events_history: List[str] = []
-        for window_idx, (start_sec, end_sec) in enumerate(windows):
-            prompt_value = build_prompt_with_history(events_history, base_instruction)
-            try:
-                frames, timestamps = read_frames_decord(
-                    video_path,
-                    num_frames=num_frames,
-                    sample=f"fps{fps}",
-                    clip=(start_sec, end_sec),
-                    min_num_frames=1,
-                    return_timestamps=True,
-                    force_context_length=True,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Failed to decode window %s (%.2f-%.2f)s: %s",
-                    video_path,
-                    start_sec,
-                    end_sec,
-                    exc,
-                )
-                continue
-
-            rounded_timestamps = [float(round(float(t), 1)) for t in timestamps]
-            try:
-                caption = caption_window(
-                    frames,
-                    rounded_timestamps,
-                    prompt_value,
-                    processor,
-                    model,
-                    tokenizer,
-                    video_merge_size,
-                    generation_kwargs,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Generation failed for %s (%.2f-%.2f)s: %s",
-                    video_path,
-                    start_sec,
-                    end_sec,
-                    exc,
-                )
-                continue
-
-            events_history.append(caption)
-
-            segments.append(
+    if not collected_dataset:
+        raise ValueError("No datasets were created from the provided metadata.")
+    captioning_dataset = ConcatDataset(collected_dataset)
+    total_videos = len(captioning_dataset)
+    target_videos = min(total_videos, inference_args.max_videos) if inference_args.max_videos else total_videos
+    print(f"Prepared {total_videos} videos from {len(collected_dataset)} datasets")
+    base_prompt = "<video>\nIdentify all new events that occurred and ended up to the current frame, which have not been reported before. Provide their start times, durations, and descriptions in the format: <start time> - <end time> (duration: <x> seconds), <description>."
+    # INFERENCE LOOP
+    output_json = []
+    processed_videos = 0
+    progress_bar = tqdm(total=target_videos, desc="Captioning videos", unit="video") if target_videos > 0 else None
+    try:
+        for idx, video_obj in enumerate(captioning_dataset):
+            if inference_args.max_videos is not None and idx >= inference_args.max_videos:
+                print(f"Reached max_videos={inference_args.max_videos}. Stopping early.")
+                break
+            video_path = video_obj["video"]
+            use_prefix_caption = video_obj["use_prefix_caption"]
+            video_context_window = video_obj["video_context_window"]
+            print(f"Processing video: {video_path}")
+            video_clips, timestamps = LoadVideoWithClips(
+                video_path,
+                sampling_fps=video_obj["sampling_fps"],
+                clip_length=video_context_window,
+            )
+            captions_before = []
+            Prefix_prompt = "There is a streaming video provided. Below are some captions describing the events in the video at different timestamps in ascending order.\n"
+            with torch.no_grad():
+                for clip_idx, (video_clip, ts_clip) in enumerate(zip(video_clips, timestamps)):
+                    if clip_idx == 0 or not use_prefix_caption:
+                        prompt = base_prompt
+                    else:
+                        prompt = Prefix_prompt + "\n".join(captions_before) + "\n" + base_prompt
+                    processor = getattr(vl3_processor, "videollama3_processor", vl3_processor)
+                    num_frames = video_clip.shape[0]
+                    conversation = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "video",
+                                    "video": video_clip,
+                                    "num_frames": int(num_frames),
+                                    "timestamps": ts_clip,
+                                },
+                                {"type": "text", "text": prompt},
+                            ],
+                        }
+                    ]
+                    inputs = processor(
+                        conversation=conversation,
+                        return_tensors="pt",
+                    ).to(model.device)
+                    if "pixel_values" in inputs:
+                        inputs["pixel_values"] = inputs["pixel_values"].to(dtype=model.dtype)
+                    generated_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=inference_args.max_new_tokens,
+                        do_sample=inference_args.do_sample,
+                        temperature=inference_args.temperature,
+                        top_k=inference_args.top_k,
+                        top_p=inference_args.top_p,
+                        num_beams=inference_args.num_beams,
+                        num_return_sequences=inference_args.num_return_sequences,
+                        no_repeat_ngram_size=inference_args.no_repeat_ngram_size,
+                        repetition_penalty=inference_args.repetition_penalty,
+                        length_penalty=inference_args.length_penalty,
+                        early_stopping=inference_args.early_stopping,
+                        pad_token_id=inference_args.pad_token_id or vl3_processor.tokenizer.pad_token_id,
+                        bos_token_id=inference_args.bos_token_id or vl3_processor.tokenizer.bos_token_id,
+                        eos_token_id=inference_args.eos_token_id or vl3_processor.tokenizer.eos_token_id,
+                    )
+                    generated_text = vl3_processor.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                    if generated_text.startswith(prompt):
+                        new_caption = generated_text[len(prompt):].strip()
+                    else:
+                        new_caption = generated_text.replace(prompt, "", 1).strip()
+                    captions_before.append(new_caption)
+            output_json.append(
                 {
-                    "window_index": window_idx,
-                    "start": float(round(float(start_sec), 2)),
-                    "end": float(round(float(end_sec), 2)),
-                    "num_frames": len(frames),
-                    "timestamps": rounded_timestamps,
-                    "prompt": prompt_value,
-                    "caption": caption,
+                    "video_path": video_path,
+                    "captions": "\n".join(captions_before),
                 }
             )
-
-        results.append(
-            {
-                "video": video_field,
-                "video_path": video_path,
-                "segments": segments,
-            }
-        )
-
-        if (idx + 1) % log_every == 0:
-            logger.info(
-                "[%s] Processed %d/%d videos",
-                dataset_name,
-                idx + 1,
-                len(iterator),
-            )
-
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-    logger.info("[%s] Saved %d video captions to %s", dataset_name, len(results), output_path)
-
-
-def main():
-    args = parse_args()
-    setup_logging()
-    torch.manual_seed(args.seed)
-
-    stride = args.stride if args.stride is not None else args.num_frames
-    if stride <= 0:
-        raise ValueError("--stride / --num-frames must be positive.")
-    if args.fps <= 0:
-        raise ValueError("--fps must be positive.")
-
-    dtype_map = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-    torch_dtype = dtype_map.get(args.dtype, None)
-
-    cuda_available = torch.cuda.is_available()
-    requested_attn = args.attn_impl
-    if (
-        requested_attn == "flash_attention_2"
-        and torch_dtype is not None
-        and torch_dtype not in (torch.float16, torch.bfloat16)
-    ):
-        logger.warning(
-            "flash_attention_2 requires float16/bfloat16 tensors but dtype %s was requested; "
-            "falling back to eager attention.",
-            args.dtype,
-        )
-        requested_attn = "eager"
-
-    if not cuda_available and requested_attn == "flash_attention_2":
-        logger.warning("CUDA is unavailable; falling back from flash_attention_2 to eager attention.")
-        requested_attn = "eager"
-
-    device_map = args.device_map
-    if device_map == "auto" and not cuda_available:
-        device_map = "cpu"
-
-    model_name = get_model_name_from_path(args.model_path)
-    tokenizer, model, image_processor, _ = load_pretrained_model(
-        args.model_path,
-        args.model_base,
-        model_name,
-        device_map=device_map,
-        attn_implementation=requested_attn,
-        torch_dtype=torch_dtype,
-    )
-    tokenizer.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-    model.eval()
-
-    processor = Videollama3Processor(image_processor, tokenizer)
-
-    stride_sec = stride / args.fps
-    window_sec = args.num_frames / args.fps
-
-    generation_kwargs = dict(
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        num_beams=args.num_beams,
-        repetition_penalty=args.repetition_penalty,
-        do_sample=args.num_beams == 1 and args.temperature > 0,
-        use_cache=True,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-
-    if args.dataset_meta:
-        if args.output_dir is None:
-            raise ValueError("--output-dir must be provided when using --dataset-meta.")
-        dataset_specs = build_dataset_specs_from_meta(args.dataset_meta, args.output_dir)
-    else:
-        if args.manifest is None or args.output is None:
-            raise ValueError("Provide --manifest/--output for single dataset or --dataset-meta/--output-dir for multiple datasets.")
-        dataset_specs = build_single_dataset_spec(args.manifest, args.video_root, args.output)
-
-    for spec in dataset_specs:
-        logger.info(
-            "Processing dataset '%s' (manifest=%s, video_root=%s) -> %s",
-            spec["name"],
-            spec["manifest"],
-            spec["video_root"],
-            spec["output"],
-        )
-        process_dataset(
-            dataset_name=spec["name"],
-            manifest_path=spec["manifest"],
-            video_root=spec["video_root"],
-            output_path=spec["output"],
-            processor=processor,
-            model=model,
-            tokenizer=tokenizer,
-            base_instruction=BASE_INSTRUCTION,
-            num_frames=args.num_frames,
-            fps=args.fps,
-            stride_sec=stride_sec,
-            window_sec=window_sec,
-            generation_kwargs=generation_kwargs,
-            video_merge_size=args.video_merge_size,
-            limit=args.limit,
-            log_every=args.log_every,
-        )
+            processed_videos += 1
+            if progress_bar:
+                progress_bar.update(1)
+    finally:
+        if progress_bar:
+            progress_bar.close()
+    if processed_videos == 0:
+        raise RuntimeError("No videos were processed. Check meta_data_path or max_videos setting.")
+    with open(inference_args.output_file, 'w') as f:
+        for item in output_json:
+            f.write(json.dumps(item) + "\n")
+    print(f"Captioning results saved to {inference_args.output_file} ({processed_videos} videos)")
 
 
 if __name__ == "__main__":
-    main()
+    Captioning()
