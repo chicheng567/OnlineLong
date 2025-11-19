@@ -25,5 +25,5 @@ PYTHONPATH=. /miniconda/envs/onlinellama3/bin/python videollama3/inference/capti
   --repetition_penalty 1.05 \
   --bf16 True \
   --seed 42 \
-  --clip_length 50 \
+  --clip_length 30 \
   "$@"

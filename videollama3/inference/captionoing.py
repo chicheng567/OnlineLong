@@ -78,13 +78,11 @@ class LazySupervisedDatasetForCaptioning(Dataset):
         self,
         annotation_path: str,
         data_root: Optional[str],
-        use_prefix_caption: bool,
         fps: int,
         max_video_length: int = 300,
     ):
         self.annotation_path = annotation_path
         self.data_root = data_root
-        self.use_prefix_caption = use_prefix_caption
         self.max_video_length = max_video_length
         self.fps = fps
         if data_root is not None:
@@ -92,12 +90,13 @@ class LazySupervisedDatasetForCaptioning(Dataset):
                 raise FileNotFoundError(f"Dataset root {data_root} not exists!")
         with open(annotation_path, 'r') as f:
             datas = json.load(f)
-        self.video_list = []  # keep relative paths to avoid double-joining
+        self.video_list = set()
         for data in datas:
             video_id = data.get("video")
             if not video_id:
                 continue
-            self.video_list.append(video_id)
+            self.video_list.add(video_id)
+        self.video_list = list(self.video_list)
         if not self.video_list:
             raise ValueError(f"No videos found in {annotation_path}")
         print(f"Loaded {len(self.video_list)} videos from {annotation_path} (root={self.data_root or 'cwd'})")
@@ -111,7 +110,6 @@ class LazySupervisedDatasetForCaptioning(Dataset):
         return {
             "video": full_path,
             "video_context_window": self.max_video_length,
-            "use_prefix_caption": self.use_prefix_caption,
             "sampling_fps": self.fps,
         }
 
@@ -173,7 +171,6 @@ def Captioning():
             LazySupervisedDatasetForCaptioning(
                 annotation_path=annotation_path,
                 data_root=dataset_cfg.get("data_root"),
-                use_prefix_caption=dataset_cfg.get("prefix_captioning", False),
                 fps=dataset_cfg.get("sampling_fps", inference_args.sampling_fps),
                 max_video_length=inference_args.clip_length,
             )
@@ -195,7 +192,6 @@ def Captioning():
                 print(f"Reached max_videos={inference_args.max_videos}. Stopping early.")
                 break
             video_path = video_obj["video"]
-            use_prefix_caption = video_obj["use_prefix_caption"]
             video_context_window = video_obj["video_context_window"]
             print(f"Processing video: {video_path}")
             video_clips, timestamps = LoadVideoWithClips(
@@ -207,7 +203,7 @@ def Captioning():
             Prefix_prompt = "There is a streaming video provided. Below are some captions describing the events in the video at different timestamps in ascending order.\n"
             with torch.no_grad():
                 for clip_idx, (video_clip, ts_clip) in enumerate(zip(video_clips, timestamps)):
-                    if clip_idx == 0 or not use_prefix_caption:
+                    if clip_idx == 0:
                         prompt = base_prompt
                     else:
                         prompt = Prefix_prompt + "\n".join(captions_before) + "\n" + base_prompt

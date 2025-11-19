@@ -582,7 +582,6 @@ def LoadVideoWithClips(
     video_path,
     clip_length,
     sampling_fps=1,
-    min_num_frames=4,
 ):
     video_reader = VideoReader(video_path, num_threads=1)
     total_frames = len(video_reader)
@@ -599,44 +598,14 @@ def LoadVideoWithClips(
     # Ensure frames as numpy array (T, H, W, C) and timestamps as list of floats
     num_frames = frames.shape[0]
     ts_list = list(timestamps)
-
     clips_frames = []
     clips_timestamps = []
-
-    delta_t = 1.0 / float(sampling_fps) if sampling_fps > 0 else 0.0
-
     for start in range(0, num_frames, clip_length):
         end = min(start + clip_length, num_frames)
-        clip_frames = frames[start:end]
+        clip = frames[start:end]
         clip_ts = ts_list[start:end]
-
-        # If clip is shorter than clip_length, pad by repeating last frame/timestamp
-        if end - start < clip_length:
-            pad_len = clip_length - (end - start)
-            if pad_len > 0:
-                last_frame = clip_frames[-1:]
-                # repeat last frame
-                pad_frames = np.repeat(last_frame, pad_len, axis=0)
-                clip_frames = np.concatenate([clip_frames, pad_frames], axis=0)
-
-                last_ts = float(clip_ts[-1]) if len(clip_ts) > 0 else (ts_list[-1] if len(ts_list) > 0 else 0.0)
-                pad_ts = [round(last_ts + (i + 1) * delta_t, 3) for i in range(pad_len)]
-                clip_ts = clip_ts + pad_ts
-
-        # Enforce minimum number of frames per clip
-        if len(clip_frames) < min_num_frames:
-            pad_len = min_num_frames - len(clip_frames)
-            last_frame = clip_frames[-1:]
-            pad_frames = np.repeat(last_frame, pad_len, axis=0)
-            clip_frames = np.concatenate([clip_frames, pad_frames], axis=0)
-
-            last_ts = float(clip_ts[-1]) if len(clip_ts) > 0 else (ts_list[-1] if len(ts_list) > 0 else 0.0)
-            pad_ts = [round(last_ts + (i + 1) * delta_t, 3) for i in range(pad_len)]
-            clip_ts = clip_ts + pad_ts
-
-        clips_frames.append(clip_frames)
+        clips_frames.append(clip)
         clips_timestamps.append(clip_ts)
-
     return clips_frames, clips_timestamps
     
     
