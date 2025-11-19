@@ -983,8 +983,11 @@ def train(attn_implementation=None):
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
+            vlprocessor.save_pretrained(training_args.output_dir)
     else:
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+        if trainer.args.should_save:
+            vlprocessor.save_pretrained(training_args.output_dir)
 
 
 if __name__ == "__main__":

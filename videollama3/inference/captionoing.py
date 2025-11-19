@@ -7,7 +7,7 @@ from typing import Dict, Optional
 import torch
 import transformers
 from torch.utils.data import ConcatDataset, Dataset
-from transformers import AutoProcessor
+from videollama3.model.processor import Videollama3Processor
 from tqdm import tqdm
 
 from videollama3.mm_utils import LoadVideoWithClips
@@ -153,7 +153,7 @@ def Captioning():
     model.config.use_cache = False
     device = inference_args.device or ("cuda" if use_cuda else "cpu")
     model.to(device)
-    vl3_processor = AutoProcessor.from_pretrained("DAMO-NLP-SG/VideoLLaMA3-7B", trust_remote_code=True)
+    vl3_processor = Videollama3Processor.from_pretrained(model_args.model_name_or_path, trust_remote_code=False)
     model.eval()
     #Create dataset
     with open(inference_args.meta_data_path, 'r') as f:
