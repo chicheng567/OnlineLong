@@ -137,6 +137,8 @@ class Videollama3MetaForCausalLM(ABC):
         modals: List[str],
     ):
         valid_masks = []
+        assert batched_num_patches is not None, "batched_num_patches is required to filter valid visual tokens."
+        assert modals is not None, "modals is required to filter valid visual tokens."
         for num_patches, modal in zip(batched_num_patches, modals):
             valid_mask = torch.full((num_patches, ), modal != "text", dtype=torch.bool, device=mm_features.device)
             valid_masks.append(valid_mask)

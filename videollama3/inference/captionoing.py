@@ -72,7 +72,15 @@ class InferenceArguments:
     
     # Extra passthrough dict for any non-explicit HuggingFace generate kwargs
     generation_kwargs: Optional[Dict[str, object]] = field(default=None)
-
+from transformers import AutoProcessor
+def build_preprocessor(model_name_or_path: str, image_processor=None):
+    vl3_processor = Videollama3Processor.from_pretrained(model_name_or_path, trust_remote_code=False)
+    image_processor.force_size = [448, 448]
+    vl3_processor.image_processor = image_processor
+    print("Build processor from huggingface API.")
+    return vl3_processor
+        
+    
 class LazySupervisedDatasetForCaptioning(Dataset):
     def __init__(
         self,
@@ -153,7 +161,7 @@ def Captioning():
     model.config.use_cache = False
     device = inference_args.device or ("cuda" if use_cuda else "cpu")
     model.to(device)
-    vl3_processor = Videollama3Processor.from_pretrained(model_args.model_name_or_path, trust_remote_code=False)
+    vl3_processor = build_preprocessor(model_args.model_name_or_path, model.get_vision_encoder().image_processor)
     model.eval()
     #Create dataset
     with open(inference_args.meta_data_path, 'r') as f:
@@ -181,7 +189,7 @@ def Captioning():
     total_videos = len(captioning_dataset)
     target_videos = min(total_videos, inference_args.max_videos) if inference_args.max_videos else total_videos
     print(f"Prepared {total_videos} videos from {len(collected_dataset)} datasets")
-    base_prompt = "<video>\nIdentify all new events that occurred and ended up to the current frame, which have not been reported before. Provide their start times, durations, and descriptions in the format: <start time> - <end time> (duration: <x> seconds), <description>."
+    base_prompt = "Identify all new events that occurred and ended up to the current frame, which have not been reported before. Provide their start times, durations, and descriptions in the format: <start time> - <end time> (duration: <x> seconds), <description>."
     # INFERENCE LOOP
     output_json = []
     processed_videos = 0
@@ -201,12 +209,13 @@ def Captioning():
             )
             captions_before = []
             Prefix_prompt = "There is a streaming video provided. Below are some captions describing the events in the video at different timestamps in ascending order.\n"
+            suffix_prompt = "The following clip contains only the last few seconds of the ongoing stream.\n"
             with torch.no_grad():
                 for clip_idx, (video_clip, ts_clip) in enumerate(zip(video_clips, timestamps)):
                     if clip_idx == 0:
                         prompt = base_prompt
                     else:
-                        prompt = Prefix_prompt + "\n".join(captions_before) + "\n" + base_prompt
+                        prompt = Prefix_prompt + "\n".join(captions_before) + "\n" + suffix_prompt + base_prompt
                     processor = getattr(vl3_processor, "videollama3_processor", vl3_processor)
                     num_frames = video_clip.shape[0]
                     conversation = [
@@ -215,7 +224,6 @@ def Captioning():
                             "content": [
                                 {
                                     "type": "video",
-                                    "video": video_clip,
                                     "num_frames": int(num_frames),
                                     "timestamps": ts_clip,
                                 },
@@ -224,13 +232,17 @@ def Captioning():
                         }
                     ]
                     inputs = processor(
-                        conversation=conversation,
+                        images=video_clip,
+                        text=conversation,
+                        merge_size=2,
+                        return_labels=False,
                         return_tensors="pt",
                     ).to(model.device)
                     if "pixel_values" in inputs:
                         inputs["pixel_values"] = inputs["pixel_values"].to(dtype=model.dtype)
                     generated_ids = model.generate(
                         **inputs,
+                        modals=["video"] * inputs["input_ids"].shape[0],
                         max_new_tokens=inference_args.max_new_tokens,
                         do_sample=inference_args.do_sample,
                         temperature=inference_args.temperature,

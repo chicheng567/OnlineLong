@@ -827,7 +827,7 @@ def preprocess_videollama3(
                     if modal == '<image>':
                         messages[-1]["content"].append({"type": "image"})
                     elif modal == '<video>':
-                        messages[-1]["content"].append({"type": "video", "num_frames": len(timestamps_clip), "timestamp": timestamps_clip})
+                        messages[-1]["content"].append({"type": "video", "num_frames": len(timestamps_clip), "timestamps": timestamps_clip})
         else:
             messages.append({
                 "role": "assistant",

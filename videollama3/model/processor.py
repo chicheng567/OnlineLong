@@ -249,7 +249,9 @@ class Videollama3Processor(ProcessorMixin):
     ):
         if isinstance(text[0], dict):
             warnings.warn("Input text is a list of messages. Automatically convert it to a string with 'apply_chat_template' with generation prompt.")
-            text = [self.tokenizer.apply_chat_template(text, tokenize=False, add_generation_prompt=True)]
+            text = [self.tokenizer.apply_chat_template(text, tokenize=False, add_generation_prompt=True, add_system_prompt=True)]
+            with open("debug_processor.txt", "a") as f:
+                f.write(text[0])
 
         image_idx = 0
         for i in range(len(text)):
