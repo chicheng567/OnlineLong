@@ -21,7 +21,7 @@
 """Image processor class for VideoLLaMA3."""
 
 import math
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
 
@@ -39,7 +39,6 @@ from transformers.image_utils import (
     ChannelDimension,
     ImageInput,
     PILImageResampling,
-    VideoInput,
     get_image_size,
     infer_channel_dimension_format,
     is_scaled_image,
@@ -236,7 +235,7 @@ class Videollama3ImageProcessor(BaseImageProcessor):
 
     def _preprocess(
         self,
-        images: Union[ImageInput, VideoInput],
+        images: Union[ImageInput, Sequence[ImageInput]],
         target_size: List[int],
         merge_size: int = 1,
         do_resize: bool = None,
