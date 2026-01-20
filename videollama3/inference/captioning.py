@@ -189,7 +189,7 @@ def Captioning():
     total_videos = len(captioning_dataset)
     target_videos = min(total_videos, inference_args.max_videos) if inference_args.max_videos else total_videos
     print(f"Prepared {total_videos} videos from {len(collected_dataset)} datasets")
-    base_prompt = "Identify all new events that occurred and ended up to the current frame, which have not been reported before. Provide their start times, durations, and descriptions in the format: <start time> - <end time> (duration: <x> seconds), <description>."
+    base_prompt = "Identify all new events that occurred and ended up to the current frame, especially actions made by main characters, which have not been reported before. Provide their start times, durations, and descriptions in the format: <start time> - <end time> (duration: <x> seconds), <description>."
     # INFERENCE LOOP
     output_json = []
     processed_videos = 0
@@ -212,25 +212,30 @@ def Captioning():
             suffix_prompt = "The following clip contains only the last few seconds of the ongoing stream.\n"
             with torch.no_grad():
                 for clip_idx, (video_clip, ts_clip) in enumerate(zip(video_clips, timestamps)):
-                    if clip_idx == 0:
-                        prompt = base_prompt
-                    else:
-                        prompt = Prefix_prompt + "\n".join(captions_before) + "\n" + suffix_prompt + base_prompt
                     processor = getattr(vl3_processor, "videollama3_processor", vl3_processor)
                     num_frames = video_clip.shape[0]
                     conversation = [
                         {
                             "role": "user",
-                            "content": [
-                                {
-                                    "type": "video",
-                                    "num_frames": int(num_frames),
-                                    "timestamps": ts_clip,
-                                },
-                                {"type": "text", "text": prompt},
-                            ],
+                            "content": [],
                         }
                     ]
+                    if clip_idx > 0 and len(captions_before) > 0:
+                        conversation[0]["content"].append(
+                            {
+                                "type": "text",
+                                "text": Prefix_prompt + "\n".join(captions_before) + suffix_prompt,
+                            }
+                        )
+                        print(Prefix_prompt + "\n".join(captions_before) + suffix_prompt)
+                    conversation[0]["content"].extend([
+                        {
+                            "type": "video",
+                            "num_frames": int(num_frames),
+                            "timestamps": ts_clip,
+                        },
+                        {"type": "text", "text": base_prompt}
+                    ])
                     inputs = processor(
                         images=video_clip,
                         text=conversation,
@@ -259,11 +264,8 @@ def Captioning():
                         eos_token_id=inference_args.eos_token_id or vl3_processor.tokenizer.eos_token_id,
                     )
                     generated_text = vl3_processor.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-                    if generated_text.startswith(prompt):
-                        new_caption = generated_text[len(prompt):].strip()
-                    else:
-                        new_caption = generated_text.replace(prompt, "", 1).strip()
-                    captions_before.append(new_caption)
+                    print(generated_text)
+                    captions_before.append(generated_text.strip())
             output_json.append(
                 {
                     "video_path": video_path,

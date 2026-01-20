@@ -819,7 +819,7 @@ def preprocess_videollama3(
             timestamps_clip = timestamps_clip[start_idx:]  # only use the timestamps after the last query
             start_idx += len(timestamps_clip)
             assert len(timestamps_clip) > 0, f"No frames between {start_idx} and {query_time}s. {timestamps}, {query_time}, {conv}"
-            for chunk_idx in range(1, 4):
+            for chunk_idx in range(1, 4): # Current only support one <video> or <image> in each query
                 if chunk_idx % 2 == 1:
                     chunk = chunks[chunk_idx // 2].strip()
                     messages[-1]["content"].append({"type": "text",  "text": chunk}) if chunk else None
