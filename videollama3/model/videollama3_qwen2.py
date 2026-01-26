@@ -215,6 +215,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         hidden_states = outputs[0]
 
         loss, logits = None, None
+        # Loss computation
         if labels is not None:
             shift_hidden_states = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

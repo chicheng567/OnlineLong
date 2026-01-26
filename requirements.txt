@@ -1,8 +1,8 @@
-# PyTorch CUDA wheels (CUDA 12.4)
---extra-index-url https://download.pytorch.org/whl/cu124
+# PyTorch CUDA wheels (CUDA 13.0)
+--extra-index-url https://download.pytorch.org/whl/cu130
 # basic dependencies
-torch==2.6.0
-torchvision==0.21.0
+torch==2.9.1
+torchvision==0.24.1
 datasets==2.21.0
 transformers==4.57.3
 tokenizers>=0.22.0,<0.24

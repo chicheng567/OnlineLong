@@ -17,7 +17,7 @@ import os
 import math
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Union
-
+import warnings
 import einops
 import torch
 import torch.distributed as dist
@@ -115,7 +115,8 @@ class Videollama3MetaForCausalLM(ABC):
 
     def get_mm_projector(self):
         return self.get_model().get_mm_projector()
-
+    def compress_visual_tokens(self, vision_tokens: torch.FloatTensor):
+        pass
     def encode_images(
         self,
         pixel_values: torch.FloatTensor,
@@ -156,7 +157,7 @@ class Videollama3MetaForCausalLM(ABC):
     ):
         if position_ids is None or mm_features.shape[0] == input_ids.eq(self.config.image_token_index).sum():
             return mm_features, compression_mask
-
+        warnings.warn("mm_features are truncated according to position_ids. Make sure this is intended.")
         truncation_mask = []
         for num_patches, modal in zip(batched_num_patches, modals):
             if modal == "text":
@@ -287,11 +288,14 @@ class Videollama3MetaForCausalLM(ABC):
 
         # 3. compress visual tokens
         if self.config.use_token_compression:
+            raise NotImplementedError("Original token compression method is expected to be replaced.")
             assert B == 1, "Token compression is only supported for batch_size=1"
             mm_features, input_ids, attention_mask, position_ids, labels = self._compress_visual_tokens(
                 compression_mask, mm_features, input_ids, attention_mask, position_ids, labels
             )
-
+        # TODO: Adding new compression method here
+        # 3. compress visual tokens with trainable compressor
+        
         # 4. embed text tokens
         inputs_embeds = self.get_model().embed_tokens(input_ids).clone()
 
