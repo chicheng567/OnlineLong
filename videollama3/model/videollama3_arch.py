@@ -58,7 +58,9 @@ class Videollama3MetaModel:
         if hasattr(config, "vision_encoder") or hasattr(config, "mm_vision_encoder"):
             self.vision_encoder = build_vision_encoder(config, delay_load=False)
             self.mm_projector = build_vision_projector(config, self.vision_encoder.hidden_size)
-
+        if hasattr(config, "trainable_mm_compressor") and config.trainable_mm_compressor:
+            self.token_compressor = build_token_compressor(config)
+            
     def get_vision_encoder(self):
         vision_encoder = getattr(self, 'vision_encoder', None)
         if type(vision_encoder) is list:
@@ -115,8 +117,53 @@ class Videollama3MetaForCausalLM(ABC):
 
     def get_mm_projector(self):
         return self.get_model().get_mm_projector()
-    def compress_visual_tokens(self, vision_tokens: torch.FloatTensor):
-        pass
+    def compress_visual_tokens(self, vision_tokens: torch.FloatTensor, compression_mask: torch.BoolTensor, position_ids: torch.LongTensor) -> torch.FloatTensor:
+        # compression_mask: [1, num_tokens]
+        # vision_tokens: [1, num_tokens, dim]
+        # position_ids: [1, num_tokens]
+        Bsz = position_ids.eq(0).sum().item()
+        assert compression_mask.sum().item() % Bsz == 0, "Number of compressed tokens must be divisible by batch size."
+        need_compress_parts = vision_tokens[compression_mask] # [num_compress_tokens, dim]
+        need_compress_parts = need_compress_parts.view(Bsz, -1, vision_tokens.size(-1))  # [Bsz, num_compress_tokens_per_sample, dim]
+        # compressed should be at size (B, S, D)
+        compressed = self.get_model().get_token_compressor()(
+            need_compress_parts
+        )
+
+        vision_tokens_flat = vision_tokens.view(-1, vision_tokens.size(-1)) # shape: [num_tokens, dim]
+        compression_mask_flat = compression_mask.view(-1)
+        position_ids_flat = position_ids.view(-1)
+        # start and end indices of each batch in the sample.
+        pos_start = torch.nonzero(position_ids_flat == 0, as_tuple=False).squeeze(-1).tolist()
+        pos_end = pos_start[1:] + [position_ids_flat.numel()]
+
+        rebuilt_tokens = []
+        for idx, (start, end) in enumerate(zip(pos_start, pos_end)):
+            tokens = vision_tokens_flat[start:end]
+            mask = compression_mask_flat[start:end]
+            # If there is no token to be compressed, skip
+            if not mask.any():
+                rebuilt_tokens.append(tokens)
+                continue
+
+            mask_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1) # indices of tokens to be compressed
+            comp = compressed[idx] # shape: [S, dim]
+            if comp.numel() == 0:
+                keep_mask = ~mask
+                rebuilt_tokens.append(tokens[keep_mask])
+                continue
+
+            k = comp.size(0) # K = number of compressed tokens in a sample
+            keep_mask = ~mask # Token not been modified in this sample
+            keep_mask[mask_idx[:k]] = True  # The first k places of compressed tokens should be replaced by compressed tokens.
+            replace_mask = torch.zeros_like(keep_mask)
+            replace_mask[mask_idx[:k]] = True
+            tokens[replace_mask] = comp
+            rebuilt_tokens.append(tokens[keep_mask])
+        vision_tokens = torch.cat(rebuilt_tokens, dim=0)
+        if vision_tokens.dim() == 2 and vision_tokens.size(-1) == vision_tokens_flat.size(-1):
+            vision_tokens = vision_tokens.unsqueeze(0)
+        return vision_tokens
     def encode_images(
         self,
         pixel_values: torch.FloatTensor,
@@ -179,7 +226,7 @@ class Videollama3MetaForCausalLM(ABC):
         truncation_mask = torch.cat(truncation_mask)
 
         return mm_features[truncation_mask], compression_mask[truncation_mask]
-
+    # for old version of token compression
     def _get_compression_mask(
         self,
         pixel_values: torch.FloatTensor,
@@ -218,7 +265,7 @@ class Videollama3MetaForCausalLM(ABC):
                 compression_masks.append(torch.ones((0,), dtype=torch.bool, device=images.device))
 
         return torch.cat(compression_masks)
-
+    # old version of token compression
     def _compress_visual_tokens(
         self,
         compression_mask: torch.BoolTensor,
