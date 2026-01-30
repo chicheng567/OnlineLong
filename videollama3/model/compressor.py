@@ -137,3 +137,8 @@ class TransformerDecoderCompressor(nn.Module):
             query = layer(query, kv, cu_seqlens_q, cu_seqlens_kv, rotary_pos_emb)
         query = query.view(B, self.compress_image_wh, -1)
         return query
+    
+def build_token_compressor(config):
+    compressor = getattr(config, 'token_compressor', None)
+    if 'trasformer_decoder' in compressor.type:
+        return TransformerDecoderCompressor(config=compressor)

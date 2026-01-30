@@ -170,6 +170,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         grid_sizes: Optional[torch.LongTensor] = None,
         merge_sizes: Optional[torch.LongTensor] = None,
         modals: Optional[List[str]] = None,
+        compression_mask: Optional[torch.BoolTensor] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if inputs_embeds is None:
@@ -190,6 +191,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 grid_sizes=grid_sizes,
                 merge_sizes=merge_sizes,
                 modals=modals,
+                compression_mask=compression_mask,
             )
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions

@@ -26,6 +26,7 @@ import torch.nn as nn
 from ..constants import IGNORE_INDEX, MODAL_INDEX_MAP, NUM_FRAMES
 from .encoder import build_vision_encoder
 from .projector import build_vision_projector, load_mm_projector
+from .compressor import build_token_compressor
 
 
 def spatial_downsampling(features, grid_thws, stride=2):
@@ -70,6 +71,10 @@ class Videollama3MetaModel:
     def get_mm_projector(self):
         return self.mm_projector
 
+    def get_token_compressor(self):
+        compressor = getattr(self, 'token_compressor', None)
+        return compressor
+    
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_encoder = model_args.vision_encoder
         mm_vision_select_layer = model_args.mm_vision_select_layer
@@ -117,7 +122,9 @@ class Videollama3MetaForCausalLM(ABC):
 
     def get_mm_projector(self):
         return self.get_model().get_mm_projector()
-    def compress_visual_tokens(self, vision_tokens: torch.FloatTensor, compression_mask: torch.BoolTensor, position_ids: torch.LongTensor) -> torch.FloatTensor:
+    def get_token_compressor(self):
+        return self.get_model().get_token_compressor()
+    def compress_visual_tokens_with_compressor(self, vision_tokens: torch.FloatTensor, compression_mask: torch.BoolTensor, position_ids: torch.LongTensor) -> torch.FloatTensor:
         # compression_mask: [1, num_tokens]
         # vision_tokens: [1, num_tokens, dim]
         # position_ids: [1, num_tokens]
@@ -136,7 +143,7 @@ class Videollama3MetaForCausalLM(ABC):
         # start and end indices of each batch in the sample.
         pos_start = torch.nonzero(position_ids_flat == 0, as_tuple=False).squeeze(-1).tolist()
         pos_end = pos_start[1:] + [position_ids_flat.numel()]
-
+        new_pos_ids = []
         rebuilt_tokens = []
         for idx, (start, end) in enumerate(zip(pos_start, pos_end)):
             tokens = vision_tokens_flat[start:end]
@@ -144,6 +151,7 @@ class Videollama3MetaForCausalLM(ABC):
             # If there is no token to be compressed, skip
             if not mask.any():
                 rebuilt_tokens.append(tokens)
+                new_pos_ids.append(position_ids_flat[start:end])
                 continue
 
             mask_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1) # indices of tokens to be compressed
@@ -151,6 +159,7 @@ class Videollama3MetaForCausalLM(ABC):
             if comp.numel() == 0:
                 keep_mask = ~mask
                 rebuilt_tokens.append(tokens[keep_mask])
+                new_pos_ids.append(torch.arange(0, keep_mask.sum().item(), device=vision_tokens.device))
                 continue
 
             k = comp.size(0) # K = number of compressed tokens in a sample
@@ -160,21 +169,32 @@ class Videollama3MetaForCausalLM(ABC):
             replace_mask[mask_idx[:k]] = True
             tokens[replace_mask] = comp
             rebuilt_tokens.append(tokens[keep_mask])
+            new_pos_ids.append(torch.arange(0, keep_mask.sum().item(), device=vision_tokens.device))
         vision_tokens = torch.cat(rebuilt_tokens, dim=0)
+        new_pos_ids = torch.cat(new_pos_ids, dim=0)
+        assert vision_tokens.size(0) == new_pos_ids.size(0), "Rebuilt vision tokens and position_ids must have the same length."
         if vision_tokens.dim() == 2 and vision_tokens.size(-1) == vision_tokens_flat.size(-1):
             vision_tokens = vision_tokens.unsqueeze(0)
-        return vision_tokens
+        return vision_tokens, new_pos_ids
     def encode_images(
         self,
         pixel_values: torch.FloatTensor,
         grid_sizes: torch.LongTensor,
         merge_sizes: torch.LongTensor,
+        compression_mask: Optional[torch.BoolTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
     ) -> torch.FloatTensor:
         mm_features = self.get_model().get_vision_encoder()(
             pixel_values=pixel_values,
             grid_sizes=grid_sizes,
             merge_sizes=merge_sizes,
         )
+        if self.config.trainable_mm_compressor:
+            mm_features = self.compress_visual_tokens_with_compressor(
+                mm_features,
+                compression_mask,
+                position_ids
+            )
         mm_features = self.get_model().mm_projector(mm_features)
         return mm_features
 
@@ -305,6 +325,7 @@ class Videollama3MetaForCausalLM(ABC):
         grid_sizes: Optional[torch.LongTensor] = None,
         merge_sizes: Optional[torch.LongTensor] = None,
         modals: Optional[List[str]] = None,
+        compression_mask: Optional[torch.BoolTensor] = None,
     ):
         vision_encoder = self.get_vision_encoder()
         # NOTE: text-only situation
@@ -334,15 +355,21 @@ class Videollama3MetaForCausalLM(ABC):
         )
 
         # 3. compress visual tokens
-        if self.config.use_token_compression:
-            raise NotImplementedError("Original token compression method is expected to be replaced.")
-            assert B == 1, "Token compression is only supported for batch_size=1"
-            mm_features, input_ids, attention_mask, position_ids, labels = self._compress_visual_tokens(
-                compression_mask, mm_features, input_ids, attention_mask, position_ids, labels
-            )
+        # if self.config.use_token_compression:
+        #     assert B == 1, "Token compression is only supported for batch_size=1"
+            # mm_features, input_ids, attention_mask, position_ids, labels = self._compress_visual_tokens(
+            #     compression_mask, mm_features, input_ids, attention_mask, position_ids, labels
+            # )
         # TODO: Adding new compression method here
         # 3. compress visual tokens with trainable compressor
-        
+        if self.config.trainable_mm_compressor:
+            assert compression_mask is not None, "compression_mask is required for trainable token compressor."
+            assert B == 1, "Trainable token compression is only supported for batch_size=1"
+            mm_features, position_ids = self.compress_visual_tokens_with_compressor(
+                mm_features,
+                compression_mask,
+                position_ids
+            )
         # 4. embed text tokens
         inputs_embeds = self.get_model().embed_tokens(input_ids).clone()
 
