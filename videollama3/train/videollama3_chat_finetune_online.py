@@ -318,7 +318,7 @@ class LazySupervisedDataset(Dataset):
         return length_list
 
     def _convert_normal(self, data_dict):
-        data_folder = self.data_args.data_folder
+        data_folder = self.data_args.data_folder if hasattr(self.data_args, 'data_folder') else self.dataset_root
         conversation = copy.deepcopy(data_dict["conversations"])
 
         # data sanity check and repair
@@ -434,8 +434,6 @@ class LazySupervisedDataset(Dataset):
         image_files = data_dict.get("all_image_files", None)
         if image_files is None:
             video_file = data_dict["video"]
-            if self.dataset_root is None:
-                self.dataset_root = self.data_args.data_folder
             video_path = os.path.join(self.dataset_root, video_file)
 
             if len(video_path.split(".")) == 1:
@@ -594,6 +592,7 @@ class LazySupervisedDataset(Dataset):
             )
 
             if modal == 'text':
+                raise NotImplementedError("Text-only data is not supported so far.")
                 unit_size = self.vlprocessor.image_processor.patch_size**2 * 3
                 data_dict['pixel_values'] = torch.zeros(self.data_args.image_merge_size**2, unit_size)
                 data_dict['grid_sizes'] = torch.as_tensor([[1, self.data_args.image_merge_size, self.data_args.image_merge_size]])
@@ -908,6 +907,14 @@ def train(attn_implementation=None):
         _set_module_trainable(model.get_mm_projector(), projector_trainable)
         _set_module_trainable(getattr(model.get_model(), "token_compressor", None), compressor_trainable)
 
+        # Fail fast if all params are frozen by LR settings.
+        trainable_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if trainable_param_count == 0:
+            raise RuntimeError(
+                "No trainable parameters found. "
+                "Please set at least one of llm_lr / vision_encoder_lr / mm_projector_lr / compressor_lr > 0."
+            )
+
         model.config.max_frames = getattr(data_args, 'max_frames', NUM_FRAMES)
         model.config.image_aspect_ratio = data_args.image_aspect_ratio if 'avt' not in model_args.vision_encoder else 'avt'
 
@@ -925,7 +932,6 @@ def train(attn_implementation=None):
         )
         # 4. set spatial merge size as default
         new_tokens = tokenizer.add_tokens([DEFAULT_IMAGE_TOKEN, STREAM_START_TOKEN, STREAM_END_TOKEN], special_tokens=True)
-        assert new_tokens == 0, "Tokenizer already has the special tokens!"
         model.config.image_token_index = tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
         if data_args.force_image_size is not None:
             vision_encoder.image_processor.force_size = [data_args.force_image_size] * 2

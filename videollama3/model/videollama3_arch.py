@@ -128,101 +128,88 @@ class Videollama3MetaForCausalLM(ABC):
         self, 
         vision_tokens: torch.FloatTensor, 
         compression_mask: torch.BoolTensor,
-        position_ids: torch.LongTensor,
-    ) -> Tuple[torch.FloatTensor, torch.LongTensor]:
-        # compression_mask: [1, num_tokens]
+    ) -> Tuple[torch.FloatTensor, torch.LongTensor, torch.LongTensor, torch.LongTensor]:
+        # compression_mask: [num_visual_tokens] or [1, num_visual_tokens]
         # vision_tokens: [1, num_tokens, dim]
-        # position_ids: [1, num_tokens]
         device = vision_tokens.device
+        if compression_mask.dim() == 2:
+            compression_mask = compression_mask.view(-1)
+        compression_mask = compression_mask.to(device=device, dtype=torch.bool)
         if not compression_mask.any():
-            keep_mask = torch.ones_like(compression_mask.view(-1), dtype=torch.bool, device=device)
-            return vision_tokens, keep_mask
+            keep_mask = torch.ones_like(compression_mask, dtype=torch.bool, device=device)
+            empty = torch.empty(0, dtype=torch.long, device=device)
+            return vision_tokens, keep_mask, empty, empty
 
-        need_compress_parts = vision_tokens[compression_mask] # [num_compress_tokens, dim]
+        vision_tokens_flat = vision_tokens.view(-1, vision_tokens.size(-1))
+        need_compress_parts = vision_tokens_flat[compression_mask] # [num_compress_tokens, dim]
         #
         compression_mask_tmp = torch.cat([
             torch.tensor([0], device=device), 
-            compression_mask.view(-1).int(), 
+            compression_mask.int(), 
             torch.tensor([0], device=device)], dim=0)
         diff = compression_mask_tmp[1:] - compression_mask_tmp[:-1]
         starts = (diff == 1).nonzero(as_tuple=False).squeeze(-1)
         ends = (diff == -1).nonzero(as_tuple=False).squeeze(-1)
         parts = ends - starts
+        compressor = self.get_model().get_token_compressor()
+        required_tokens = getattr(compressor, "compress_image_wh", None)
+        if required_tokens is not None:
+            required_tokens = int(required_tokens)
+            too_short = torch.nonzero(parts < required_tokens, as_tuple=False).squeeze(-1)
+            if too_short.numel() > 0:
+                bad_lengths = parts[too_short].detach().cpu().tolist()
+                bad_segments = too_short.detach().cpu().tolist()
+                raise ValueError(
+                    "Found compression segment shorter than compress_image_wh: "
+                    f"compress_image_wh={required_tokens}, "
+                    f"segment_ids={bad_segments}, segment_lengths={bad_lengths}."
+                )
         compression_cu_seqlens = torch.cat([torch.tensor([0], device=device), parts.cumsum(dim=0)], dim=0)
         # compressed vision tokens should have shape: [n, dim]
-        compressed = self.get_model().get_token_compressor()(
+        compressed = compressor(
             need_compress_parts,
             compression_cu_seqlens
         )
-        vision_tokens_flat = vision_tokens.view(-1, vision_tokens.size(-1)) # shape: [num_tokens, dim]
-        compression_mask_flat = compression_mask.view(-1)
-        # start and end indices of each batch in the sample.
-        position_ids_flat = position_ids.view(-1) # shape: [num_tokens]
-        pos_start = torch.nonzero(position_ids_flat == 0, as_tuple=False).squeeze(-1).tolist()
-        pos_end = pos_start[1:] + [position_ids_flat.numel()]
-        rebuilt_tokens = []
-        keeping_masks = []
-        part_idx = 0
-        for idx, (start, end) in enumerate(zip(pos_start, pos_end)):
-            tokens = vision_tokens_flat[start:end]
-            mask = compression_mask_flat[start:end]
-            # If there is no token to be compressed, skip
-            if not mask.any():
-                rebuilt_tokens.append(tokens)
-                keeping_masks.append(~mask)
-                continue
-
-            mask_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1) # indices of tokens to be compressed
-            sample_part_start = part_idx
-            while part_idx < starts.numel() and ends[part_idx].item() <= end:
-                part_idx += 1
-            sample_part_end = part_idx
-            comp = compressed[sample_part_start:sample_part_end].reshape(-1, compressed.size(-1))
+        keeping_masks = ~compression_mask
+        write_ptr = 0
+        for seg_start, seg_end in zip(starts.tolist(), ends.tolist()):
+            comp = compressed[write_ptr].reshape(-1, compressed.size(-1))
+            write_ptr += 1
+            seg_len = seg_end - seg_start
             if comp.numel() == 0:
-                keep_mask = ~mask
-                rebuilt_tokens.append(tokens[keep_mask])
-                keeping_masks.append(keep_mask)
                 continue
-
-            k = min(comp.size(0), mask_idx.numel())  # compressed tokens kept for this sample
-            keep_mask = ~mask # Token not been modified in this sample
-            keep_mask[mask_idx[:k]] = True  # The first k places of compressed tokens should be replaced by compressed tokens.
-            replace_mask = torch.zeros_like(keep_mask)
-            replace_mask[mask_idx[:k]] = True
-            tokens[replace_mask] = comp[:k]
-            keeping_masks.append(keep_mask)
-            rebuilt_tokens.append(tokens[keep_mask])     
-        vision_tokens = torch.cat(rebuilt_tokens, dim=0)
-        keeping_masks = torch.cat(keeping_masks, dim=0)
-        vision_tokens = vision_tokens.to(device)
+            k = min(comp.size(0), seg_len)
+            keep_positions = torch.arange(seg_start, seg_start + k, device=device, dtype=torch.long)
+            keeping_masks[keep_positions] = True
+            vision_tokens_flat[keep_positions] = comp[:k]
+        vision_tokens = vision_tokens_flat[keeping_masks]
+        vision_tokens = vision_tokens.to(device).unsqueeze(0)
         keeping_masks = keeping_masks.to(device)
         if vision_tokens.dim() == 2 and vision_tokens.size(-1) == vision_tokens_flat.size(-1):
             vision_tokens = vision_tokens.unsqueeze(0)
-        return vision_tokens, keeping_masks
+        return vision_tokens, keeping_masks, starts, ends
     def encode_images(
         self,
         pixel_values: torch.FloatTensor,
         grid_sizes: torch.LongTensor,
         merge_sizes: torch.LongTensor,
         compression_mask: Optional[torch.BoolTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-    ) -> Tuple[torch.FloatTensor, torch.LongTensor]:
+    ) -> Tuple[torch.FloatTensor, Optional[torch.BoolTensor], Optional[torch.LongTensor], Optional[torch.LongTensor]]:
         mm_features = self.get_model().get_vision_encoder()(
             pixel_values=pixel_values,
             grid_sizes=grid_sizes,
             merge_sizes=merge_sizes,
         )
         keepmask = None
+        starts, ends = None, None
         if self.config.trainable_mm_compressor:
             assert compression_mask is not None, "compression_mask is required for trainable token compression."
-            assert position_ids is not None, "position_ids is required for trainable token compression."
-            mm_features, keepmask = self.compress_visual_tokens_with_compressor(
+            mm_features, keepmask, starts, ends = self.compress_visual_tokens_with_compressor(
                 mm_features,
                 compression_mask,
-                position_ids
             )
         mm_features = self.get_model().mm_projector(mm_features)
-        return mm_features, keepmask
+        return mm_features, keepmask, starts, ends
     
     def prepare_inputs_labels_for_multimodal(
         self,
@@ -257,12 +244,36 @@ class Videollama3MetaForCausalLM(ABC):
             labels = labels.view(B * N)
 
         # 2. embed visual tokens and compress if needed
-        batched_num_patches = grid_sizes.prod(dim=1).div(merge_sizes ** 2).long()
-        mm_features, keepmask = self.encode_images(
-            pixel_values, grid_sizes, merge_sizes, compression_mask, position_ids
+        image_selected = (input_ids == self.config.image_token_index)
+        image_positions = torch.nonzero(image_selected, as_tuple=False).squeeze(-1)
+        compression_mask_visual = None
+        if compression_mask is not None:
+            compression_mask = compression_mask.view(-1).to(dtype=torch.bool, device=input_ids.device)
+            assert compression_mask.numel() == input_ids.numel(), "compression_mask must have same length as input_ids."
+            compression_mask_visual = compression_mask[image_selected]
+        mm_features, keepmask_visual, seg_starts, seg_ends = self.encode_images(
+            pixel_values, grid_sizes, merge_sizes, compression_mask_visual
         )
         # modify input_ids, position_ids, attention_mask, labels accordingly
-        if keepmask is not None:
+        if keepmask_visual is not None:
+            keepmask = torch.ones_like(input_ids, dtype=torch.bool)
+            keep_image_positions = image_positions[keepmask_visual]
+            keep_image_mask = torch.zeros_like(image_selected)
+            keep_image_mask[keep_image_positions] = True
+            keepmask[image_selected] = keep_image_mask[image_selected]
+
+            # Drop all text tokens between compressed frame blocks to keep compact windows.
+            if seg_starts is not None and seg_ends is not None:
+                for s, e in zip(seg_starts.tolist(), seg_ends.tolist()):
+                    if e - s <= 0:
+                        continue
+                    left = int(image_positions[s].item())
+                    right = int(image_positions[e - 1].item())
+                    if right <= left:
+                        continue
+                    interval = torch.arange(left + 1, right, device=input_ids.device)
+                    if interval.numel() > 0:
+                        keepmask[interval] = keepmask[interval] & image_selected[interval]
             if position_ids is not None:
                 position_ids = position_ids[keepmask]
             if attention_mask is not None:
