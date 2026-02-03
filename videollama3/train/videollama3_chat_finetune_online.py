@@ -90,15 +90,26 @@ def int_with_none(value):
     return int(value)
 
 
+def _is_trainable_lr(lr: Optional[float]) -> bool:
+    return lr is not None and lr > 0
+
+
+def _set_module_trainable(module: Optional[torch.nn.Module], trainable: bool):
+    if module is None:
+        return
+    for p in module.parameters():
+        p.requires_grad = trainable
+
+
 @dataclass
 class ModelArguments:
     # LLM Arguments
     model_name_or_path: Optional[str] = field(default="pretrained_models/videollama3_7b_local")
     tokenizer_name_or_path: Optional[str] = field(default=None)
     version: Optional[str] = field(default="v1", metadata={"help": "Version of the conversation template."})
-    freeze_llm: bool = field(default=False, metadata={"help": "Whether to freeze the LLM backbone."})
-    freeze_vision_encoder: bool = field(default=True, metadata={"help": "Whether to freeze the vision encoder."})
-    freeze_mlp: bool = field(default=False, metadata={"help": "Whether to freeze the multi-modal projector."})
+    freeze_llm: bool = field(default=False, metadata={"help": "Deprecated. Use llm_lr=0 to freeze the LLM backbone."})
+    freeze_vision_encoder: bool = field(default=False, metadata={"help": "Deprecated. Use vision_encoder_lr=0 to freeze the vision encoder."})
+    freeze_mlp: bool = field(default=False, metadata={"help": "Deprecated. Use mm_projector_lr=0 to freeze the multi-modal projector."})
     # Connector Arguments
     mm_projector_type: Optional[str] = field(default='linear')
     # Vision tower Arguments
@@ -136,6 +147,7 @@ class TrainingArguments(transformers.TrainingArguments):
     # Training learning rate Arguments
     vision_encoder_lr: Optional[float] = None
     mm_projector_lr: Optional[float] = None
+    compressor_lr: Optional[float] = None
     llm_lr: Optional[float] = None
     # Training Data Arguments
     group_by_modality_length: bool = field(default=False)
@@ -883,22 +895,18 @@ def train(attn_implementation=None):
         model.config.llm_lr = training_args.llm_lr
         model.config.vision_encoder_lr = training_args.vision_encoder_lr
         model.config.mm_projector_lr = training_args.mm_projector_lr
+        model.config.compressor_lr = training_args.compressor_lr
 
-        if model.config.llm_lr is None:
-            for p in model.get_model().parameters():
-                p.requires_grad = False
-            for p in model.get_model().vision_encoder.parameters():
-                p.requires_grad = True
-            for p in model.get_model().mm_projector.parameters():
-                p.requires_grad = True
+        llm_trainable = _is_trainable_lr(model.config.llm_lr)
+        vision_trainable = _is_trainable_lr(model.config.vision_encoder_lr)
+        projector_trainable = _is_trainable_lr(model.config.mm_projector_lr)
+        compressor_trainable = _is_trainable_lr(model.config.compressor_lr)
 
-        if model.config.vision_encoder_lr is None:
-            for p in model.get_model().vision_encoder.parameters():
-                p.requires_grad = False
-
-        if model.config.mm_projector_lr is None:
-            for p in model.get_model().mm_projector.parameters():
-                p.requires_grad = False
+        # Unified control: module with lr == 0 (or lr is not set) will be frozen.
+        _set_module_trainable(model.get_model(), llm_trainable)
+        _set_module_trainable(model.get_vision_encoder(), vision_trainable)
+        _set_module_trainable(model.get_mm_projector(), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "token_compressor", None), compressor_trainable)
 
         model.config.max_frames = getattr(data_args, 'max_frames', NUM_FRAMES)
         model.config.image_aspect_ratio = data_args.image_aspect_ratio if 'avt' not in model_args.vision_encoder else 'avt'
@@ -910,9 +918,10 @@ def train(attn_implementation=None):
         model.config.image_token_length = data_args.image_token_length = mm_projector.cal_proj_size(vision_encoder.num_patches_per_side)
         # 3. check if alignment
         model.config.is_alignment = training_args.is_alignment = data_args.is_alignment = (
-            model.config.mm_projector_lr is not None and
-            model.config.llm_lr is None and
-            model.config.vision_encoder_lr is None
+            _is_trainable_lr(model.config.mm_projector_lr) and
+            not _is_trainable_lr(model.config.llm_lr) and
+            not _is_trainable_lr(model.config.vision_encoder_lr) and
+            not _is_trainable_lr(model.config.compressor_lr)
         )
         # 4. set spatial merge size as default
         new_tokens = tokenizer.add_tokens([DEFAULT_IMAGE_TOKEN, STREAM_START_TOKEN, STREAM_END_TOKEN], special_tokens=True)
@@ -922,18 +931,8 @@ def train(attn_implementation=None):
             vision_encoder.image_processor.force_size = [data_args.force_image_size] * 2
             rank0_print(f"Force set image size to be {data_args.force_image_size}")
         vlprocessor = Videollama3Processor(vision_encoder.image_processor, tokenizer)
-    def _freeze_params(module):
-        for param in module.parameters():
-            param.requires_grad = False
-    if model_args.freeze_vision_encoder and model_args.vision_encoder is not None:
-        _freeze_params(model.get_vision_encoder())
-    if model_args.freeze_mlp and model_args.vision_encoder is not None:
-        _freeze_params(model.get_mm_projector())
-    if model_args.freeze_llm:
-        _freeze_params(model.model.layers)
-        _freeze_params(model.model.embed_tokens)
-        _freeze_params(model.model.norm)
-        _freeze_params(model.lm_head)
+    if model_args.freeze_llm or model_args.freeze_vision_encoder or model_args.freeze_mlp:
+        rank0_print("Warning: freeze_* arguments are deprecated. Please use module lr == 0 to freeze.")
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
         for name, module in model.named_modules():

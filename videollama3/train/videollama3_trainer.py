@@ -252,15 +252,24 @@ class VideoLLaMA3Trainer(Trainer):
         opt_model = self.model
 
         if self.optimizer is None:
+            compressor_lr = getattr(self.args, "compressor_lr", None)
+            llm_lr = getattr(self.args, "llm_lr", None)
+            mm_projector_lr = getattr(self.args, "mm_projector_lr", None)
+            vision_encoder_lr = getattr(self.args, "vision_encoder_lr", None)
             optimized_parameters = [(n, p) for n, p in opt_model.named_parameters() if p.requires_grad]
             optimizer_grouped_parameters = []
 
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
 
-            if self.args.llm_lr is not None:
+            if llm_lr is not None and llm_lr > 0:
+                compressor_name = "token_compressor"
                 lm_parameters = [
-                    name for name, _ in optimized_parameters if "vision_encoder" not in name and "mm_projector" not in name
+                    name
+                    for name, _ in optimized_parameters
+                    if "vision_encoder" not in name
+                    and "mm_projector" not in name
+                    and (compressor_lr is None or compressor_lr <= 0 or compressor_name not in name)
                 ]
                 decay_lm_parameters = [name for name in lm_parameters if name in decay_parameters]
                 nodecay_lm_parameters = [name for name in lm_parameters if name not in decay_parameters]
@@ -268,16 +277,33 @@ class VideoLLaMA3Trainer(Trainer):
                     {
                         "params": [p for n, p in optimized_parameters if n in decay_lm_parameters],
                         "weight_decay": self.args.weight_decay,
-                        "lr": self.args.llm_lr,
+                        "lr": llm_lr,
                     },
                     {
                         "params": [p for n, p in optimized_parameters if n in nodecay_lm_parameters],
                         "weight_decay": 0.0,
-                        "lr": self.args.llm_lr,
+                        "lr": llm_lr,
                     }
                 ])
 
-            if self.args.mm_projector_lr is not None:
+            if compressor_lr is not None and compressor_lr > 0:
+                compressor_parameters = [name for name, _ in optimized_parameters if "token_compressor" in name]
+                decay_compressor_parameters = [name for name in compressor_parameters if name in decay_parameters]
+                nodecay_compressor_parameters = [name for name in compressor_parameters if name not in decay_parameters]
+                optimizer_grouped_parameters.extend([
+                    {
+                        "params": [p for n, p in optimized_parameters if n in decay_compressor_parameters],
+                        "weight_decay": self.args.weight_decay,
+                        "lr": compressor_lr,
+                    },
+                    {
+                        "params": [p for n, p in optimized_parameters if n in nodecay_compressor_parameters],
+                        "weight_decay": 0.0,
+                        "lr": compressor_lr,
+                    }
+                ])
+
+            if mm_projector_lr is not None and mm_projector_lr > 0:
                 projector_parameters = [name for name, _ in optimized_parameters if "mm_projector" in name]
                 decay_projector_parameters = [name for name in projector_parameters if name in decay_parameters]
                 nodecay_projector_parameters = [name for name in projector_parameters if name not in decay_parameters]
@@ -285,16 +311,16 @@ class VideoLLaMA3Trainer(Trainer):
                     {
                         "params": [p for n, p in optimized_parameters if n in decay_projector_parameters], 
                         "weight_decay": self.args.weight_decay,
-                        "lr": self.args.mm_projector_lr,
+                        "lr": mm_projector_lr,
                     },
                     {
                         "params": [p for n, p in optimized_parameters if n in nodecay_projector_parameters],
                         "weight_decay": 0.0,
-                        "lr": self.args.mm_projector_lr,
+                        "lr": mm_projector_lr,
                     }
                 ])
 
-            if self.args.vision_encoder_lr is not None:
+            if vision_encoder_lr is not None and vision_encoder_lr > 0:
                 vision_encoder_parameters = [name for name, _ in optimized_parameters if "vision_encoder" in name]
                 decay_vision_encoder_parameters = [name for name in vision_encoder_parameters if name in decay_parameters]
                 nodecay_vision_encoder_parameters = [name for name in vision_encoder_parameters if name not in decay_parameters]
@@ -302,12 +328,12 @@ class VideoLLaMA3Trainer(Trainer):
                     {
                         "params": [p for n, p in optimized_parameters if n in decay_vision_encoder_parameters], 
                         "weight_decay": self.args.weight_decay,
-                        "lr": self.args.vision_encoder_lr,
+                        "lr": vision_encoder_lr,
                     },
                     {
                         "params": [p for n, p in optimized_parameters if n in nodecay_vision_encoder_parameters],
                         "weight_decay": 0.0,
-                        "lr": self.args.vision_encoder_lr,
+                        "lr": vision_encoder_lr,
                     }
                 ])
 
