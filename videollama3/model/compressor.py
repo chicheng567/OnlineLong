@@ -78,9 +78,9 @@ class selfFlashAttention(Attention):
     ) -> torch.Tensor:
         q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        query_states = self.w_q(hidden_states)
+        key_states = self.w_k(hidden_states)
+        value_states = self.w_v(hidden_states)
 
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
@@ -95,7 +95,7 @@ class selfFlashAttention(Attention):
         attn_output = flash_attn_varlen_func(query_states, key_states, value_states, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
             q_len, -1
         )
-        attn_output = self.out_proj(attn_output)
+        attn_output = self.w_o(attn_output)
         
         return attn_output
 
@@ -124,21 +124,65 @@ class TransformerDecoderCompressor(nn.Module):
         self.layers = nn.ModuleList([TransformerDecoderLayer(config) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.compress_image_wh = config.compress_image_wh
-        self.query = nn.Parameter(torch.randn(1, self.compress_image_wh, config.hidden_size))
-    def forward(self, kv):
-    # kv: (n, seq_len_kv, hidden_size)
-        B = kv.size(0)
-        kv = kv.view(-1, kv.size(-1))  # (B * seq_len_kv, hidden_size)
-        cu_seqlens_kv = torch.arange(0, (B + 1) * kv.size(1), step=kv.size(1), device=kv.device, dtype=torch.long)
-        query = self.query.expand(B, -1, -1).contiguous().view(-1, self.query.size(-1))  # (B * compress_image_wh, hidden_size)
+        self.query = nn.Parameter(torch.randn(1,self.compress_image_wh, config.hidden_size))
+    def forward(self, kv, compression_cu_seqlens):
+        # kv: (1, total_tokens, hidden_size)
+        compression_parts = compression_cu_seqlens.size(0) - 1
+        if kv.dim() == 3:
+            kv = kv.squeeze(0) # (total_tokens, hidden_size)
+        B = compression_parts
+        query = self.query.expand(B, -1, -1).contiguous().view(-1, kv.size(-1))  # (B * compress_image_wh, hidden_size)
         cu_seqlens_q = torch.arange(0, (B + 1) * self.compress_image_wh, step=self.compress_image_wh, device=kv.device, dtype=torch.long)
         rotary_pos_emb = self.rotary_pos_emb(self.compress_image_wh)
         for layer in self.layers:
-            query = layer(query, kv, cu_seqlens_q, cu_seqlens_kv, rotary_pos_emb)
+            query = layer(query, kv, cu_seqlens_q, compression_cu_seqlens, rotary_pos_emb)
         query = query.view(B, self.compress_image_wh, -1)
         return query
     
+from transformers import PretrainedConfig
+
+class Videollama3TokenCompressorConfig(PretrainedConfig):
+    model_type = "videollama3_token_compressor"
+
+    def __init__(
+        self,
+        compressor_type="transformer_decoder",
+        hidden_size=1152,
+        intermediate_size=4304,
+        num_layers=8,
+        num_attention_heads=4,
+        attention_probs_dropout_prob=0.0,
+        layer_norm_eps=1e-6,
+        compress_image_wh=256,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.compressor_type = compressor_type
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_layers = num_layers
+        self.num_attention_heads = num_attention_heads
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        self.layer_norm_eps = layer_norm_eps
+        self.compress_image_wh = compress_image_wh
+
 def build_token_compressor(config):
-    compressor = getattr(config, 'token_compressor', None)
-    if 'trasformer_decoder' in compressor.type:
+    compressor = getattr(config, 'token_compressor_config', None)
+    if compressor is None:
+        compressor = getattr(config, 'token_compressor', None)
+    if compressor is None:
+        return None
+    if isinstance(compressor, Videollama3TokenCompressorConfig):
+        pass
+    elif hasattr(compressor, "to_dict"):
+        compressor = Videollama3TokenCompressorConfig(**compressor.to_dict())
+    elif isinstance(compressor, dict):
+        compressor = dict(compressor)
+        if "hidden_size" not in compressor:
+            compressor["hidden_size"] = config.hidden_size
+        if "num_attention_heads" not in compressor:
+            compressor["num_attention_heads"] = config.num_attention_heads
+        compressor = Videollama3TokenCompressorConfig(**compressor)
+    if isinstance(compressor, Videollama3TokenCompressorConfig) and "transformer_decoder" in compressor.compressor_type:
         return TransformerDecoderCompressor(config=compressor)
+    raise ValueError(f"Unknown token compressor type: {getattr(compressor, 'compressor_type', None)}")
