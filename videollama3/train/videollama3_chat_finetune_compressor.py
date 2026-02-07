@@ -106,7 +106,7 @@ def count_video_frames_in_messages(messages: List[Dict]) -> int:
                 total_frames += int(content.get("num_frames", 0))
     return total_frames
 
-
+#TODO: rewrite this function to directly take frame idx to compress instead of compression mask. Avoiding cross sample compression and making it more efficient. This requires change in model forward and encode_images to take frame idx instead of compression mask.
 def build_compression_mask_from_frame_selection(
     input_ids_1d: torch.LongTensor,
     image_token_id: int,
@@ -232,7 +232,6 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
         super().__init__(*args, **kwargs)
         self.compression_ratio = compression_ratio
         self.compression_window_size = compression_window_size
-
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sample = self.list_data_dict[i]
         try:
@@ -269,6 +268,7 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
             data_dict["modals"] = [modal] * len(images)
 
             if modal == "video":
+                #TODO: Change compression mask -> list with compression idx.
                 compression_mask = build_compression_mask_from_frame_selection(
                     input_ids_1d=data_dict["input_ids"],
                     image_token_id=self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN),
@@ -298,6 +298,7 @@ class DataCollatorWithCompressorMask:
         new_input_ids = []
         new_labels = []
         position_ids = []
+        #TODO: Implement collator for compress index packing.
         new_compression_masks: List[torch.BoolTensor] = []
         for idx in range(0, len(input_ids)):
             capped_ids = input_ids[idx][: self.vlprocessor.tokenizer.model_max_length]

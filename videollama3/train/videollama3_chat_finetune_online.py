@@ -783,11 +783,6 @@ def train(attn_implementation=None):
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
         bnb_model_from_pretrained_args.update(dict(
-            # device_map={"": training_args.device},
-            # BUG: High version transformers report error:
-            # ValueError: You can't pass `load_in_4bit`or `load_in_8bit` as a kwarg when passing `quantization_config` argument at the same time
-            # load_in_4bit=training_args.bits == 4,
-            # load_in_8bit=training_args.bits == 8,
             quantization_config=BitsAndBytesConfig(
                 load_in_4bit=training_args.bits == 4,
                 load_in_8bit=training_args.bits == 8,

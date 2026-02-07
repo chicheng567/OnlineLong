@@ -128,6 +128,7 @@ class Videollama3MetaForCausalLM(ABC):
         self, 
         vision_tokens: torch.FloatTensor, 
         compression_mask: torch.BoolTensor,
+        visual_segment_boundaries: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.FloatTensor, torch.LongTensor, torch.LongTensor, torch.LongTensor]:
         # compression_mask: [num_visual_tokens] or [1, num_visual_tokens]
         # vision_tokens: [1, num_tokens, dim]
@@ -150,6 +151,23 @@ class Videollama3MetaForCausalLM(ABC):
         diff = compression_mask_tmp[1:] - compression_mask_tmp[:-1]
         starts = (diff == 1).nonzero(as_tuple=False).squeeze(-1)
         ends = (diff == -1).nonzero(as_tuple=False).squeeze(-1)
+        if visual_segment_boundaries is not None and visual_segment_boundaries.numel() > 0 and starts.numel() > 0:
+            split_points = set(int(x) for x in visual_segment_boundaries.tolist())
+            split_points.discard(0)
+            split_points.discard(int(compression_mask.numel()))
+            if split_points:
+                new_segments = []
+                for s, e in zip(starts.tolist(), ends.tolist()):
+                    points = [p for p in split_points if s < p < e]
+                    if not points:
+                        new_segments.append((s, e))
+                        continue
+                    points = [s] + sorted(points) + [e]
+                    for p0, p1 in zip(points[:-1], points[1:]):
+                        if p1 > p0:
+                            new_segments.append((p0, p1))
+                starts = torch.tensor([x[0] for x in new_segments], device=device, dtype=torch.long)
+                ends = torch.tensor([x[1] for x in new_segments], device=device, dtype=torch.long)
         parts = ends - starts
         compressor = self.get_model().get_token_compressor()
         required_tokens = getattr(compressor, "compress_image_wh", None)
@@ -194,6 +212,7 @@ class Videollama3MetaForCausalLM(ABC):
         grid_sizes: torch.LongTensor,
         merge_sizes: torch.LongTensor,
         compression_mask: Optional[torch.BoolTensor] = None,
+        visual_segment_boundaries: Optional[torch.LongTensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[torch.BoolTensor], Optional[torch.LongTensor], Optional[torch.LongTensor]]:
         mm_features = self.get_model().get_vision_encoder()(
             pixel_values=pixel_values,
@@ -207,6 +226,7 @@ class Videollama3MetaForCausalLM(ABC):
             mm_features, keepmask, starts, ends = self.compress_visual_tokens_with_compressor(
                 mm_features,
                 compression_mask,
+                visual_segment_boundaries=visual_segment_boundaries,
             )
         mm_features = self.get_model().mm_projector(mm_features)
         return mm_features, keepmask, starts, ends
@@ -222,12 +242,14 @@ class Videollama3MetaForCausalLM(ABC):
         grid_sizes: Optional[torch.LongTensor] = None,
         merge_sizes: Optional[torch.LongTensor] = None,
         modals: Optional[List[str]] = None,
-        compression_mask: Optional[torch.BoolTensor] = None,
+        compression_parts: Optional[torch.BoolTensor] = None,
     ):
+        #TODO: Change compression logic. From compression mask -> list with compression idx. Avoiding cross sample compression and make it more efficient.
         B, N = input_ids.shape
         if self.config.trainable_mm_compressor:
             assert position_ids is not None, "Currently model only supports position_ids and flatten input."
-            assert compression_mask is not None, "compression_mask is required for trainable token compression."
+            # Compression parts should like: [[0, 3], [5, 8], [10, 15]....]
+            assert compression_parts is not None, "compression_parts is required for trainable token compression."
             assert B == 1, "Currently model only supports batch size 1 for trainable token compression."
         vision_encoder = self.get_vision_encoder()
         # NOTE: text-only situation
@@ -247,14 +269,25 @@ class Videollama3MetaForCausalLM(ABC):
         image_selected = (input_ids == self.config.image_token_index)
         image_positions = torch.nonzero(image_selected, as_tuple=False).squeeze(-1)
         compression_mask_visual = None
+        visual_segment_boundaries = None
         if compression_mask is not None:
             compression_mask = compression_mask.view(-1).to(dtype=torch.bool, device=input_ids.device)
             assert compression_mask.numel() == input_ids.numel(), "compression_mask must have same length as input_ids."
             compression_mask_visual = compression_mask[image_selected]
+            if position_ids is not None:
+                sample_starts = torch.nonzero(position_ids == 0, as_tuple=False).squeeze(-1)
+                boundaries = []
+                for token_start in sample_starts.tolist():
+                    if token_start <= 0:
+                        continue
+                    boundaries.append(int(image_selected[:token_start].sum().item()))
+                if boundaries:
+                    visual_segment_boundaries = torch.tensor(boundaries, dtype=torch.long, device=input_ids.device)
         mm_features, keepmask_visual, seg_starts, seg_ends = self.encode_images(
-            pixel_values, grid_sizes, merge_sizes, compression_mask_visual
+            pixel_values, grid_sizes, merge_sizes, compression_mask_visual, visual_segment_boundaries
         )
         # modify input_ids, position_ids, attention_mask, labels accordingly
+        # TODO: Generate keepmask directly from compression idx and avoiding return keepmask_visual from encode_images.
         if keepmask_visual is not None:
             keepmask = torch.ones_like(input_ids, dtype=torch.bool)
             keep_image_positions = image_positions[keepmask_visual]

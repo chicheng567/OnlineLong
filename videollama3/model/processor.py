@@ -199,11 +199,6 @@ class Videollama3Processor(ProcessorMixin):
                 sample_types = targets.clone()
                 sample_types[torch.logical_and(sample_types > 0, sample_types != self.eos_token_id)] = 0
                 targets[-2] = input_ids[-2]    # <|im_end|>
-            
-            # if message_idx > 0 and text[message_idx - 1]["role"] == "stream":
-            #     targets[0] = input_ids[0]
-            #     # TODO: consider non-special tokens
-            #     sample_types[0] = input_ids[0]
 
             targets_list.append(targets)
             sample_types_list.append(sample_types)

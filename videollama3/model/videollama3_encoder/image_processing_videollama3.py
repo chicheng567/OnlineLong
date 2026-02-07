@@ -152,7 +152,6 @@ def batched_resize(
     for (num_frame, height, width), factor in zip(image_sizes, factors):
         total_tokens += num_frame * math.ceil(height / factor) * math.ceil(width / factor)
 
-    # TODO: add min_pixels
     if total_tokens > max_tokens:
         beta = math.sqrt(total_tokens / max_tokens)
         tmp_image_sizes = []
