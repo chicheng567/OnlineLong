@@ -78,9 +78,9 @@ class selfFlashAttention(Attention):
     ) -> torch.Tensor:
         q_len, _ = hidden_states.size()
         drop_rate = self.dropout_rate if self.training else 0.0
-        query_states = self.w_q(hidden_states)
-        key_states = self.w_k(hidden_states)
-        value_states = self.w_v(hidden_states)
+        query_states = self.w_q(hidden_states).view(q_len, self.n_head, self.head_dim)
+        key_states = self.w_k(hidden_states).view(q_len, self.n_head, self.head_dim)
+        value_states = self.w_v(hidden_states).view(q_len, self.n_head, self.head_dim)
 
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
@@ -88,8 +88,14 @@ class selfFlashAttention(Attention):
         query_states = query_states.view(q_len, self.n_head, self.head_dim)
         key_states = key_states.view(q_len, self.n_head, self.head_dim)
         value_states = value_states.view(q_len, self.n_head, self.head_dim)
+        parts_count = cu_seqlens.size(0) - 1
+        query_states = query_states.view(parts_count, -1, self.n_head, self.head_dim)
+        key_states = key_states.view(parts_count, -1, self.n_head, self.head_dim)
+        # Apply rotary positional embeddings
         query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
         key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
+        query_states = query_states.view(-1, self.n_head, self.head_dim)
+        key_states = key_states.view(-1, self.n_head, self.head_dim)
         
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         attn_output = flash_attn_varlen_func(
@@ -127,11 +133,28 @@ class TransformerDecoderCompressor(nn.Module):
         super().__init__()
         num_layers = config.num_layers
         head_dim = config.hidden_size // config.num_attention_heads
-        self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
+        self.head_dim = head_dim
+        self.num_head = config.num_attention_heads
+        self.rotary_pos_emb = VisionRotaryEmbedding(dim=head_dim // 2)
         self.layers = nn.ModuleList([TransformerDecoderLayer(config) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.compress_image_wh = config.compress_image_wh
         self.query = nn.Parameter(torch.randn(1,self.compress_image_wh, config.hidden_size))
+
+    def _build_query_rotary_pos_emb(self, seq_len: int) -> torch.Tensor:
+        # Keep the same indexing style as vision encoder: build (x, y), then flatten.
+        h = int(seq_len ** 0.5)
+        while h > 1 and seq_len % h != 0:
+            h -= 1
+        w = seq_len // h
+        device = self.rotary_pos_emb.inv_freq.device
+        hpos_ids = torch.arange(h, device=device).unsqueeze(1).expand(-1, w).reshape(-1)
+        wpos_ids = torch.arange(w, device=device).unsqueeze(0).expand(h, -1).reshape(-1)
+        pos_ids = torch.stack([hpos_ids, wpos_ids], dim=-1)
+        max_grid_size = max(h, w)
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        return rotary_pos_emb_full[pos_ids].flatten(1)
+
     def forward(self, kv, compression_cu_seqlens):
         # kv: (1, total_tokens, hidden_size)
         compression_parts = compression_cu_seqlens.size(0) - 1
@@ -139,8 +162,9 @@ class TransformerDecoderCompressor(nn.Module):
             kv = kv.squeeze(0) # (total_tokens, hidden_size)
         B = compression_parts
         query = self.query.expand(B, -1, -1).contiguous().view(-1, kv.size(-1))  # (B * compress_image_wh, hidden_size)
-        cu_seqlens_q = torch.arange(0, (B + 1) * self.compress_image_wh, step=self.compress_image_wh, device=kv.device, dtype=torch.long)
-        rotary_pos_emb = self.rotary_pos_emb(self.compress_image_wh)
+        cu_seqlens_q = torch.arange(0, (B + 1) * self.compress_image_wh, step=self.compress_image_wh, device=kv.device, dtype=torch.int32)
+        compression_cu_seqlens = compression_cu_seqlens.to(dtype=torch.int32)
+        rotary_pos_emb = self._build_query_rotary_pos_emb(self.compress_image_wh)
         for layer in self.layers:
             query = layer(query, kv, cu_seqlens_q, compression_cu_seqlens, rotary_pos_emb)
         query = query.view(B, self.compress_image_wh, -1)

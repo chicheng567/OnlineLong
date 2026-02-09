@@ -396,7 +396,7 @@ class Videollama3VisionTransformerEncoder(nn.Module):
         super().__init__()
         self.config = config
         head_dim = config.hidden_size // config.num_attention_heads
-        self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = VisionRotaryEmbedding(dim=head_dim // 2)
         self.layers = nn.ModuleList([Videollama3VisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 

@@ -125,7 +125,7 @@ class ModelArguments:
     # Compressor architecture args
     compressor_type: str = field(default="transformer_decoder")
     compressor_num_layers: int = field(default=8)
-    compressor_num_attention_heads: int = field(default=4)
+    compressor_num_attention_heads: int = field(default=8)
     compressor_intermediate_size: Optional[int] = field(default=None)
     compressor_attention_dropout: float = field(default=0.0)
     compressor_layer_norm_eps: float = field(default=1e-6)
