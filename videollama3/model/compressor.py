@@ -3,7 +3,7 @@ import torch
 from transformers.activations import GELUTanh
 from torch import nn
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
-from videollama3_encoder.modeling_videollama3_encoder import VisionRotaryEmbedding, apply_rotary_pos_emb_vision
+from .videollama3_encoder.modeling_videollama3_encoder import VisionRotaryEmbedding, apply_rotary_pos_emb_vision
 class mlp(nn.Module):
     def __init__(self, hidden_size, intermediate_size):
         super().__init__()
@@ -77,7 +77,7 @@ class selfFlashAttention(Attention):
         rotary_pos_emb: torch.Tensor = None,
     ) -> torch.Tensor:
         q_len, _ = hidden_states.size()
-
+        drop_rate = self.dropout_rate if self.training else 0.0
         query_states = self.w_q(hidden_states)
         key_states = self.w_k(hidden_states)
         value_states = self.w_v(hidden_states)
@@ -92,9 +92,16 @@ class selfFlashAttention(Attention):
         key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
         
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        attn_output = flash_attn_varlen_func(query_states, key_states, value_states, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
-            q_len, -1
-        )
+        attn_output = flash_attn_varlen_func(
+            query_states, 
+            key_states, 
+            value_states, 
+            cu_seqlens_q=cu_seqlens, 
+            cu_seqlens_k=cu_seqlens, 
+            max_seqlen_q=max_seqlen, 
+            max_seqlen_k=max_seqlen,
+            dropout_p=drop_rate,
+            causal=self.causal).reshape(q_len, -1)
         attn_output = self.w_o(attn_output)
         
         return attn_output

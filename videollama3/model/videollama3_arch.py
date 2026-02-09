@@ -127,109 +127,52 @@ class Videollama3MetaForCausalLM(ABC):
     def compress_visual_tokens_with_compressor(
         self, 
         vision_tokens: torch.FloatTensor, 
-        compression_mask: torch.BoolTensor,
-        visual_segment_boundaries: Optional[torch.LongTensor] = None,
+        compression_parts: List[List[int]],
     ) -> Tuple[torch.FloatTensor, torch.LongTensor, torch.LongTensor, torch.LongTensor]:
-        # compression_mask: [num_visual_tokens] or [1, num_visual_tokens]
+        # compression_parts: [[start, end], [start, end], ...]
         # vision_tokens: [1, num_tokens, dim]
         device = vision_tokens.device
-        if compression_mask.dim() == 2:
-            compression_mask = compression_mask.view(-1)
-        compression_mask = compression_mask.to(device=device, dtype=torch.bool)
-        if not compression_mask.any():
-            keep_mask = torch.ones_like(compression_mask, dtype=torch.bool, device=device)
-            empty = torch.empty(0, dtype=torch.long, device=device)
-            return vision_tokens, keep_mask, empty, empty
-
-        vision_tokens_flat = vision_tokens.view(-1, vision_tokens.size(-1))
-        need_compress_parts = vision_tokens_flat[compression_mask] # [num_compress_tokens, dim]
-        #
-        compression_mask_tmp = torch.cat([
-            torch.tensor([0], device=device), 
-            compression_mask.int(), 
-            torch.tensor([0], device=device)], dim=0)
-        diff = compression_mask_tmp[1:] - compression_mask_tmp[:-1]
-        starts = (diff == 1).nonzero(as_tuple=False).squeeze(-1)
-        ends = (diff == -1).nonzero(as_tuple=False).squeeze(-1)
-        if visual_segment_boundaries is not None and visual_segment_boundaries.numel() > 0 and starts.numel() > 0:
-            split_points = set(int(x) for x in visual_segment_boundaries.tolist())
-            split_points.discard(0)
-            split_points.discard(int(compression_mask.numel()))
-            if split_points:
-                new_segments = []
-                for s, e in zip(starts.tolist(), ends.tolist()):
-                    points = [p for p in split_points if s < p < e]
-                    if not points:
-                        new_segments.append((s, e))
-                        continue
-                    points = [s] + sorted(points) + [e]
-                    for p0, p1 in zip(points[:-1], points[1:]):
-                        if p1 > p0:
-                            new_segments.append((p0, p1))
-                starts = torch.tensor([x[0] for x in new_segments], device=device, dtype=torch.long)
-                ends = torch.tensor([x[1] for x in new_segments], device=device, dtype=torch.long)
-        parts = ends - starts
-        compressor = self.get_model().get_token_compressor()
-        required_tokens = getattr(compressor, "compress_image_wh", None)
-        if required_tokens is not None:
-            required_tokens = int(required_tokens)
-            too_short = torch.nonzero(parts < required_tokens, as_tuple=False).squeeze(-1)
-            if too_short.numel() > 0:
-                bad_lengths = parts[too_short].detach().cpu().tolist()
-                bad_segments = too_short.detach().cpu().tolist()
-                raise ValueError(
-                    "Found compression segment shorter than compress_image_wh: "
-                    f"compress_image_wh={required_tokens}, "
-                    f"segment_ids={bad_segments}, segment_lengths={bad_lengths}."
-                )
-        compression_cu_seqlens = torch.cat([torch.tensor([0], device=device), parts.cumsum(dim=0)], dim=0)
+        vision_tokens = vision_tokens.squeeze(0) # [num_tokens, dim]
+        compression_cu_seqlens = [0]
+        need_compress_parts = torch.zeros(vision_tokens.shape[0], device=device, dtype=torch.bool)
+        replace_mask = torch.zeros(vision_tokens.shape[0], device=device, dtype=torch.bool)
+        compressor_output_length = self.get_token_compressor().compress_image_wh
+        for part in compression_parts:
+            part_len = part[1] - part[0]
+            need_compress_parts[part[0]: part[1]] = True
+            replace_mask[part[0]: part[0] + compressor_output_length] = True
+            compression_cu_seqlens.append(compression_cu_seqlens[-1] + part_len)
+        compression_cu_seqlens = torch.tensor(compression_cu_seqlens, device=device, dtype=torch.long)
+        
         # compressed vision tokens should have shape: [n, dim]
-        compressed = compressor(
-            need_compress_parts,
+        compressed = self.get_token_compressor()(
+            vision_tokens[need_compress_parts],
             compression_cu_seqlens
         )
-        keeping_masks = ~compression_mask
-        write_ptr = 0
-        for seg_start, seg_end in zip(starts.tolist(), ends.tolist()):
-            comp = compressed[write_ptr].reshape(-1, compressed.size(-1))
-            write_ptr += 1
-            seg_len = seg_end - seg_start
-            if comp.numel() == 0:
-                continue
-            k = min(comp.size(0), seg_len)
-            keep_positions = torch.arange(seg_start, seg_start + k, device=device, dtype=torch.long)
-            keeping_masks[keep_positions] = True
-            vision_tokens_flat[keep_positions] = comp[:k]
-        vision_tokens = vision_tokens_flat[keeping_masks]
-        vision_tokens = vision_tokens.to(device).unsqueeze(0)
-        keeping_masks = keeping_masks.to(device)
-        if vision_tokens.dim() == 2 and vision_tokens.size(-1) == vision_tokens_flat.size(-1):
-            vision_tokens = vision_tokens.unsqueeze(0)
-        return vision_tokens, keeping_masks, starts, ends
+        keeping_masks = ~need_compress_parts | replace_mask
+        vision_tokens[replace_mask] = compressed.view(-1, vision_tokens.shape[-1])
+        vision_tokens = vision_tokens[keeping_masks]
+        return vision_tokens
     def encode_images(
         self,
         pixel_values: torch.FloatTensor,
         grid_sizes: torch.LongTensor,
         merge_sizes: torch.LongTensor,
-        compression_mask: Optional[torch.BoolTensor] = None,
-        visual_segment_boundaries: Optional[torch.LongTensor] = None,
+        compression_parts: Optional[List[List[int]]] = None,
     ) -> Tuple[torch.FloatTensor, Optional[torch.BoolTensor], Optional[torch.LongTensor], Optional[torch.LongTensor]]:
         mm_features = self.get_model().get_vision_encoder()(
             pixel_values=pixel_values,
             grid_sizes=grid_sizes,
             merge_sizes=merge_sizes,
         )
-        keepmask = None
-        starts, ends = None, None
-        if self.config.trainable_mm_compressor:
-            assert compression_mask is not None, "compression_mask is required for trainable token compression."
-            mm_features, keepmask, starts, ends = self.compress_visual_tokens_with_compressor(
+        if self.config.trainable_mm_compressor and compression_parts is not None and len(compression_parts) > 0:
+            assert compression_parts is not None, "compression_parts is required for trainable token compression."
+            mm_features = self.compress_visual_tokens_with_compressor(
                 mm_features,
-                compression_mask,
-                visual_segment_boundaries=visual_segment_boundaries,
+                compression_parts,
             )
         mm_features = self.get_model().mm_projector(mm_features)
-        return mm_features, keepmask, starts, ends
+        return mm_features
     
     def prepare_inputs_labels_for_multimodal(
         self,
@@ -242,13 +185,13 @@ class Videollama3MetaForCausalLM(ABC):
         grid_sizes: Optional[torch.LongTensor] = None,
         merge_sizes: Optional[torch.LongTensor] = None,
         modals: Optional[List[str]] = None,
-        compression_parts: Optional[torch.BoolTensor] = None,
+        compression_parts: Optional[List[List[int]]] = None,
     ):
-        #TODO: Change compression logic. From compression mask -> list with compression idx. Avoiding cross sample compression and make it more efficient.
         B, N = input_ids.shape
+        device = input_ids.device
         if self.config.trainable_mm_compressor:
             assert position_ids is not None, "Currently model only supports position_ids and flatten input."
-            # Compression parts should like: [[0, 3], [5, 8], [10, 15]....]
+            # Compression parts should like: [[1, 3], [4, 10], [16, 20]],  where each part indicates the start and end position of vision tokens to be compressed.
             assert compression_parts is not None, "compression_parts is required for trainable token compression."
             assert B == 1, "Currently model only supports batch size 1 for trainable token compression."
         vision_encoder = self.get_vision_encoder()
@@ -256,7 +199,6 @@ class Videollama3MetaForCausalLM(ABC):
         if vision_encoder is None or pixel_values is None or input_ids.shape[1] == 1:
             return input_ids, attention_mask, position_ids, past_key_values, None, labels
         # 1. flatten text inputs
-        
         input_ids = input_ids.view(B * N)
         if attention_mask is not None:
             attention_mask = attention_mask.view(B * N)
@@ -267,53 +209,37 @@ class Videollama3MetaForCausalLM(ABC):
 
         # 2. embed visual tokens and compress if needed
         image_selected = (input_ids == self.config.image_token_index)
-        image_positions = torch.nonzero(image_selected, as_tuple=False).squeeze(-1)
-        compression_mask_visual = None
-        visual_segment_boundaries = None
-        if compression_mask is not None:
-            compression_mask = compression_mask.view(-1).to(dtype=torch.bool, device=input_ids.device)
-            assert compression_mask.numel() == input_ids.numel(), "compression_mask must have same length as input_ids."
-            compression_mask_visual = compression_mask[image_selected]
-            if position_ids is not None:
-                sample_starts = torch.nonzero(position_ids == 0, as_tuple=False).squeeze(-1)
-                boundaries = []
-                for token_start in sample_starts.tolist():
-                    if token_start <= 0:
-                        continue
-                    boundaries.append(int(image_selected[:token_start].sum().item()))
-                if boundaries:
-                    visual_segment_boundaries = torch.tensor(boundaries, dtype=torch.long, device=input_ids.device)
-        mm_features, keepmask_visual, seg_starts, seg_ends = self.encode_images(
-            pixel_values, grid_sizes, merge_sizes, compression_mask_visual, visual_segment_boundaries
+        image_positions = torch.nonzero(image_selected, as_tuple=False).squeeze(-1) # vision token's positions among all tokens
+        mm_features = self.encode_images(
+            pixel_values, grid_sizes, merge_sizes, compression_parts
         )
-        # modify input_ids, position_ids, attention_mask, labels accordingly
-        # TODO: Generate keepmask directly from compression idx and avoiding return keepmask_visual from encode_images.
-        if keepmask_visual is not None:
-            keepmask = torch.ones_like(input_ids, dtype=torch.bool)
-            keep_image_positions = image_positions[keepmask_visual]
-            keep_image_mask = torch.zeros_like(image_selected)
-            keep_image_mask[keep_image_positions] = True
-            keepmask[image_selected] = keep_image_mask[image_selected]
-
-            # Drop all text tokens between compressed frame blocks to keep compact windows.
-            if seg_starts is not None and seg_ends is not None:
-                for s, e in zip(seg_starts.tolist(), seg_ends.tolist()):
-                    if e - s <= 0:
-                        continue
-                    left = int(image_positions[s].item())
-                    right = int(image_positions[e - 1].item())
-                    if right <= left:
-                        continue
-                    interval = torch.arange(left + 1, right, device=input_ids.device)
-                    if interval.numel() > 0:
-                        keepmask[interval] = keepmask[interval] & image_selected[interval]
-            if position_ids is not None:
-                position_ids = position_ids[keepmask]
+        
+        if compression_parts is not None and len(compression_parts) > 0:
+            compact_vision_token_size = self.get_token_compressor().compress_image_wh
+            replace_mask = torch.zeros(input_ids.shape[0], device=device, dtype=torch.bool)
+            keep_mask = torch.ones(input_ids.shape[0], device=device, dtype=torch.bool)
+            for part in compression_parts:
+                part_start = image_positions[part[0]]
+                part_end = image_positions[part[1]-1] + 1
+                replace_mask[part_start: part_start + compact_vision_token_size] = True
+                keep_mask[part_start + compact_vision_token_size: part_end] = False
+            
+            input_ids[replace_mask] = self.config.image_token_index
+            input_ids = input_ids[keep_mask]
             if attention_mask is not None:
-                attention_mask = attention_mask[keepmask]
+                attention_mask = attention_mask[keep_mask]
+            if position_ids is not None:
+                start = position_ids == 0
+                #NOTE: First token of sample will never be compressed because of BOS and system prompt, so we can use it to determine the start of each sample.
+                start = start[keep_mask]
+                start = torch.nonzero(start, as_tuple=False).squeeze(-1)
+                ends = torch.cat([start[1:], torch.tensor([position_ids[keep_mask].shape[0]], device=device)])
+                new_position_ids = torch.zeros_like(position_ids[keep_mask], device=device)
+                for i in range(start.shape[0]):
+                    new_position_ids[start[i]:ends[i]] = torch.arange(ends[i] - start[i], device=device)
+                position_ids = new_position_ids
             if labels is not None:
-                labels = labels[keepmask]
-            input_ids = input_ids[keepmask]
+                labels = labels[keep_mask]
             
         # 3. embed text tokens
         inputs_embeds = self.get_model().embed_tokens(input_ids).clone()

@@ -6,7 +6,7 @@ import pathlib
 import random
 import sys
 from typing import Dict, List, Optional, Sequence
-
+import warnings
 import torch
 import transformers
 from packaging import version
@@ -79,21 +79,26 @@ def _select_non_overlapping_windows(
     return selected
 
 
-def sample_frame_mask(
+def select_compression_parts(
     total_frames: int,
+    total_vision_tokens: int,
     ratio: float,
     window_size: int,
     rng: random.Random,
-) -> List[bool]:
+) -> List[List[int]]:
     if total_frames <= 0 or ratio <= 0 or window_size <= 0 or total_frames < window_size:
-        return [False] * max(total_frames, 0)
+        return []
+    assert total_vision_tokens % total_frames == 0, f"Total vision tokens {total_vision_tokens} should be divisible by total frames {total_frames}."
+    tokens_per_frame = total_vision_tokens // total_frames
     target_frames = max(window_size, int(round(total_frames * ratio)))
     starts = _select_non_overlapping_windows(total_frames, window_size, target_frames, rng)
-    selected = [False] * total_frames
+    starts.sort()
+    selected_idx = []
     for start in starts:
-        for frame_idx in range(start, min(start + window_size, total_frames)):
-            selected[frame_idx] = True
-    return selected
+        assert start + window_size <= total_frames, f"Selected window [{start}, {start + window_size}) exceeds total frames {total_frames}."
+        selected_idx.append([start * tokens_per_frame, (start + window_size) * tokens_per_frame])
+    
+    return selected_idx
 
 
 def count_video_frames_in_messages(messages: List[Dict]) -> int:
@@ -105,65 +110,6 @@ def count_video_frames_in_messages(messages: List[Dict]) -> int:
             if isinstance(content, dict) and content.get("type") == "video":
                 total_frames += int(content.get("num_frames", 0))
     return total_frames
-
-#TODO: rewrite this function to directly take frame idx to compress instead of compression mask. Avoiding cross sample compression and making it more efficient. This requires change in model forward and encode_images to take frame idx instead of compression mask.
-def build_compression_mask_from_frame_selection(
-    input_ids_1d: torch.LongTensor,
-    image_token_id: int,
-    grid_sizes: torch.LongTensor,
-    merge_sizes: torch.LongTensor,
-    frame_selected: List[bool],
-) -> torch.BoolTensor:
-    mask = torch.zeros_like(input_ids_1d, dtype=torch.bool)
-
-    image_positions = torch.nonzero(input_ids_1d == image_token_id, as_tuple=False).squeeze(-1)
-    if image_positions.numel() == 0:
-        return mask
-
-    frame_token_counts: List[int] = []
-    for grid_size, merge_size in zip(grid_sizes, merge_sizes):
-        t, h, w = [int(x) for x in grid_size.tolist()]
-        merge = int(merge_size.item())
-        tokens_per_frame = (h // merge) * (w // merge)
-        frame_token_counts.extend([tokens_per_frame] * t)
-
-    total_frames = len(frame_token_counts)
-    if total_frames == 0:
-        return mask
-
-    if len(frame_selected) < total_frames:
-        frame_selected = frame_selected + [False] * (total_frames - len(frame_selected))
-    elif len(frame_selected) > total_frames:
-        frame_selected = frame_selected[:total_frames]
-
-    total_frame_tokens = sum(frame_token_counts)
-    if total_frame_tokens != int(image_positions.numel()):
-        # Fallback: distribute visual tokens evenly per frame.
-        per_frame = int(image_positions.numel() // total_frames)
-        if per_frame <= 0:
-            return mask
-        frame_token_counts = [per_frame] * total_frames
-        usable_tokens = per_frame * total_frames
-        image_positions = image_positions[:usable_tokens]
-
-    if not any(frame_selected):
-        return mask
-
-    frame_offsets = [0]
-    for c in frame_token_counts:
-        frame_offsets.append(frame_offsets[-1] + c)
-
-    for frame_idx, is_selected in enumerate(frame_selected):
-        if not is_selected:
-            continue
-        begin = frame_offsets[frame_idx]
-        end = frame_offsets[frame_idx + 1]
-        if begin >= end:
-            continue
-        token_pos = image_positions[begin:end]
-        mask[token_pos] = True
-    return mask
-
 
 @dataclass
 class ModelArguments:
@@ -239,20 +185,11 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
                 modal, images, messages, merge_size = self._convert_online_video(sample)
             else:
                 if "stream" in sample and sample["stream"]:
+                    raise NotImplementedError("Online stream data is not supported in compressor training yet.")
                     modal, images, messages, merge_size = self._convert_stream(sample)
                 else:
                     modal, images, messages, merge_size = self._convert_normal(sample)
-
-            frame_selected: List[bool] = []
-            if modal == "video":
-                total_frames = count_video_frames_in_messages(messages)
-                frame_selected = sample_frame_mask(
-                    total_frames=total_frames,
-                    ratio=self.compression_ratio,
-                    window_size=self.compression_window_size,
-                    rng=random,
-                )
-
+            assert modal == "video", "Compressor training currently only supports video data."
             data_dict = self.vlprocessor(
                 images=images,
                 text=messages,
@@ -260,26 +197,18 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
                 return_labels=True,
                 return_tensors="pt",
             )
-
-            if modal == "text":
-                raise NotImplementedError("Text-only data is not supported so far.")
-            if modal == "image" or modal == "video":
-                assert len(data_dict["pixel_values"]) > 0 and len(data_dict["grid_sizes"]) > 0
             data_dict["modals"] = [modal] * len(images)
-
             if modal == "video":
-                #TODO: Change compression mask -> list with compression idx.
-                compression_mask = build_compression_mask_from_frame_selection(
-                    input_ids_1d=data_dict["input_ids"],
-                    image_token_id=self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN),
-                    grid_sizes=data_dict["grid_sizes"],
-                    merge_sizes=data_dict["merge_sizes"],
-                    frame_selected=frame_selected,
+                compression_part = select_compression_parts(
+                    total_frames=len(images),
+                    total_vision_tokens=data_dict["pixel_values"].shape[0],
+                    ratio=self.compression_ratio,
+                    window_size=self.compression_window_size,
+                    rng=random,
                 )
             else:
-                compression_mask = torch.zeros_like(data_dict["input_ids"], dtype=torch.bool)
-            assert compression_mask.shape == data_dict["input_ids"].shape
-            data_dict["compression_mask"] = compression_mask
+                compression_part = []
+            data_dict["compression_parts"] = compression_part
         except Exception:
             backup_idx = random.randint(0, len(self.list_data_dict) - 1)
             logger.exception("Failed to process sample %s. Fallback index: %s.", i, backup_idx)
@@ -288,31 +217,39 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
 
 
 @dataclass
-class DataCollatorWithCompressorMask:
+class DataCollatorWithCompressor:
     vlprocessor: transformers.ProcessorMixin
     compression_ratio: float = 0.3
     compression_window_size: int = 3
 
     def __call__(self, instances: Sequence[Dict], separator_id=-100) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        # input_ids: List[torch.Tensor], labels: List[torch.Tensor]
+        input_ids, labels, compression_parts = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels", "compression_parts"))
         new_input_ids = []
         new_labels = []
         position_ids = []
-        #TODO: Implement collator for compress index packing.
-        new_compression_masks: List[torch.BoolTensor] = []
-        for idx in range(0, len(input_ids)):
-            capped_ids = input_ids[idx][: self.vlprocessor.tokenizer.model_max_length]
-            capped_labels = labels[idx][: self.vlprocessor.tokenizer.model_max_length]
+        new_compression_parts: List[List[int]] = []
+        accumulated_length = 0
+        IMAGE_TOKEN_ID = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
+        for sample_idx in range(0, len(input_ids)):
+            if input_ids[sample_idx].shape[0] > self.vlprocessor.tokenizer.model_max_length:
+                warnings.warn(
+                    f"Sample {sample_idx} length {input_ids[sample_idx].shape[0]} exceeds model max length "
+                    f"{self.vlprocessor.tokenizer.model_max_length}. It will be truncated."
+                )
+            capped_ids = input_ids[sample_idx][: self.vlprocessor.tokenizer.model_max_length]
+            capped_labels = labels[sample_idx][: self.vlprocessor.tokenizer.model_max_length]
             capped_labels[0] = separator_id
             new_input_ids.append(capped_ids)
             new_labels.append(capped_labels)
             position_ids.append(torch.arange(len(capped_ids), dtype=torch.long))
-            new_compression_masks.append(instances[idx]["compression_mask"][: self.vlprocessor.tokenizer.model_max_length])
-
+            new_compression_parts.extend([[startend[0] + accumulated_length, startend[1] + accumulated_length] for startend in compression_parts[sample_idx]])
+            image_token_count = (capped_ids == IMAGE_TOKEN_ID).sum().item()
+            accumulated_length += image_token_count
+            
         flat_input_ids = torch.cat(new_input_ids)
         flat_labels = torch.cat(new_labels)
         flat_position_ids = torch.cat(position_ids)
-        flat_compression_mask = torch.cat(new_compression_masks)
 
         batch = dict(
             input_ids=flat_input_ids.unsqueeze(0),
@@ -323,7 +260,7 @@ class DataCollatorWithCompressorMask:
         batch["grid_sizes"] = torch.cat([x["grid_sizes"] for x in instances])
         batch["merge_sizes"] = torch.cat([x["merge_sizes"] for x in instances])
         batch["modals"] = sum([x["modals"] for x in instances], [])
-        batch["compression_mask"] = flat_compression_mask.unsqueeze(0)
+        batch["compression_parts"] = new_compression_parts
         return batch
 
 
@@ -358,7 +295,7 @@ def make_compressor_data_module(vlprocessor: transformers.ProcessorMixin, data_a
             compression_window_size=data_args.compression_window_size,
         )
 
-    data_collator = DataCollatorWithCompressorMask(
+    data_collator = DataCollatorWithCompressor(
         vlprocessor=vlprocessor,
         compression_ratio=data_args.compression_ratio,
         compression_window_size=data_args.compression_window_size,
