@@ -454,7 +454,11 @@ def load_video(
         return load_video_from_ids(video_path, start_time, end_time, fps=fps, max_frames=max_frames)
     if video_path.endswith('.gif'):
         return load_video_from_ids(video_path, start_time, end_time, fps=fps, max_frames=max_frames)
-    probe = ffmpeg.probe(video_path)
+    try:
+        probe = ffmpeg.probe(video_path)
+    except ffmpeg.Error as e:
+        stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else str(e)
+        raise RuntimeError(f"ffmpeg probe failed for `{video_path}`:\n{stderr}") from e
     duration = float(probe['format']['duration'])
     video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
     w, h = int(video_stream['width']), int(video_stream['height'])
@@ -498,7 +502,11 @@ def load_video(
     if new_w != w or new_h != h:
         stream = ffmpeg.filter(stream, 'scale', new_w, new_h)
     stream = ffmpeg.output(stream, "pipe:", format="rawvideo", pix_fmt="rgb24", **output_kwargs)
-    out, _ = ffmpeg.run(stream, capture_stdout=True, quiet=not verbose)
+    try:
+        out, _ = ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, quiet=not verbose)
+    except ffmpeg.Error as e:
+        stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else str(e)
+        raise RuntimeError(f"ffmpeg decode failed for `{video_path}`:\n{stderr}") from e
 
     frames = np.frombuffer(out, np.uint8).reshape([-1, new_h, new_w, 3]).transpose([0, 3, 1, 2])
 

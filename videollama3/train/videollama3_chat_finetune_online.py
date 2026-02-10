@@ -318,7 +318,7 @@ class LazySupervisedDataset(Dataset):
         return length_list
 
     def _convert_normal(self, data_dict):
-        data_folder = self.data_args.data_folder if hasattr(self.data_args, 'data_folder') else self.dataset_root
+        data_folder = self.dataset_root
         conversation = copy.deepcopy(data_dict["conversations"])
 
         # data sanity check and repair
@@ -349,7 +349,11 @@ class LazySupervisedDataset(Dataset):
                 warnings.warn(f"Video tag not found in the conversation, add it automatically at the beginning!")
                 conversation[0]["value"] = "<video>" + conversation[0]["value"]
             video_file = data_dict['video']
-            if isinstance(video_file, list) and len(video_file) == 1:
+            if isinstance(video_file, str):
+                video_file = os.path.join(data_folder, video_file)
+                images, timestamps = load_video(video_file, fps=self.data_args.fps, max_frames=self.data_args.max_frames)
+                images = [images]
+            elif isinstance(video_file, list) and len(video_file) == 1:
                 video_file = os.path.join(data_folder, video_file[0])
                 images, timestamps = load_video(video_file, fps=self.data_args.fps, max_frames=self.data_args.max_frames)
                 images = [images]
