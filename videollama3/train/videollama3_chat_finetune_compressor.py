@@ -199,9 +199,12 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
             )
             data_dict["modals"] = [modal] * len(images)
             if modal == "video":
+                image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
+                # NOTE: data_dict["pixel_values"].shape[0] will be 4 times than total_vision token because of 4x4 merging.
+                total_vision_tokens = int((data_dict["input_ids"] == image_token_id).sum().item())
                 compression_part = select_compression_parts(
                     total_frames=len(images),
-                    total_vision_tokens=data_dict["pixel_values"].shape[0],
+                    total_vision_tokens=total_vision_tokens,
                     ratio=self.compression_ratio,
                     window_size=self.compression_window_size,
                     rng=random,
@@ -230,7 +233,7 @@ class DataCollatorWithCompressor:
         position_ids = []
         new_compression_parts: List[List[int]] = []
         accumulated_length = 0
-        IMAGE_TOKEN_ID = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
+        image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
         for sample_idx in range(0, len(input_ids)):
             if input_ids[sample_idx].shape[0] > self.vlprocessor.tokenizer.model_max_length:
                 warnings.warn(
@@ -244,7 +247,7 @@ class DataCollatorWithCompressor:
             new_labels.append(capped_labels)
             position_ids.append(torch.arange(len(capped_ids), dtype=torch.long))
             new_compression_parts.extend([[startend[0] + accumulated_length, startend[1] + accumulated_length] for startend in compression_parts[sample_idx]])
-            image_token_count = (capped_ids == IMAGE_TOKEN_ID).sum().item()
+            image_token_count = int((capped_ids == image_token_id).sum().item())
             accumulated_length += image_token_count
             
         flat_input_ids = torch.cat(new_input_ids)

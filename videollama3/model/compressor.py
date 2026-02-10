@@ -48,6 +48,9 @@ class CrossFlashAttention2(Attention):
         q = self.w_q(x_q).view(-1, self.n_head, self.head_dim)
         k = self.w_k(x_kv).view(-1, self.n_head, self.head_dim)
         v = self.w_v(x_kv).view(-1, self.n_head, self.head_dim)
+        assert cu_seqlens_q[0].item() == 0 and cu_seqlens_kv[0].item() == 0
+        assert cu_seqlens_q[-1].item() == q.shape[0], (cu_seqlens_q[-1].item(), q.shape[0])
+        assert cu_seqlens_kv[-1].item() == k.shape[0], (cu_seqlens_kv[-1].item(), k.shape[0])
         max_len_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
         max_len_kv = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1]).max().item()
         # output shape: (total_tokens_q, n_head, d_kv)
@@ -96,7 +99,9 @@ class selfFlashAttention(Attention):
         key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
         query_states = query_states.view(-1, self.n_head, self.head_dim)
         key_states = key_states.view(-1, self.n_head, self.head_dim)
-        
+        assert cu_seqlens[0].item() == 0
+        assert cu_seqlens[-1].item() == query_states.shape[0], (cu_seqlens[-1].item(), query_states.shape[0])
+
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         attn_output = flash_attn_varlen_func(
             query_states, 
@@ -162,8 +167,14 @@ class TransformerDecoderCompressor(nn.Module):
             kv = kv.squeeze(0) # (total_tokens, hidden_size)
         B = compression_parts
         query = self.query.expand(B, -1, -1).contiguous().view(-1, kv.size(-1))  # (B * compress_image_wh, hidden_size)
-        cu_seqlens_q = torch.arange(0, (B + 1) * self.compress_image_wh, step=self.compress_image_wh, device=kv.device, dtype=torch.int32)
-        compression_cu_seqlens = compression_cu_seqlens.to(dtype=torch.int32)
+        cu_seqlens_q = torch.arange(
+            0,
+            (B + 1) * self.compress_image_wh,
+            step=self.compress_image_wh,
+            device=kv.device,
+            dtype=torch.int32,
+        ).contiguous()
+        compression_cu_seqlens = compression_cu_seqlens.to(device=kv.device, dtype=torch.int32).contiguous()
         rotary_pos_emb = self._build_query_rotary_pos_emb(self.compress_image_wh)
         for layer in self.layers:
             query = layer(query, kv, cu_seqlens_q, compression_cu_seqlens, rotary_pos_emb)
