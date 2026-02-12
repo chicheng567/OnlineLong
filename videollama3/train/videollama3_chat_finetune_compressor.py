@@ -447,11 +447,18 @@ def train(attn_implementation=None):
     _set_module_trainable(model.get_mm_projector(), projector_trainable)
     _set_module_trainable(getattr(model.get_model(), "token_compressor", None), compressor_trainable)
 
+    total_param_count = sum(p.numel() for p in model.parameters())
     trainable_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if trainable_param_count == 0:
         raise RuntimeError(
             "No trainable parameters found. "
             "Please set at least one of llm_lr / vision_encoder_lr / mm_projector_lr / compressor_lr > 0."
+        )
+    if training_args.local_rank in (0, -1):
+        trainable_ratio = 100.0 * trainable_param_count / total_param_count
+        rank0_print(
+            f"Trainable parameters: {trainable_param_count:,} / {total_param_count:,} "
+            f"({trainable_ratio:.4f}%)"
         )
 
     model.config.max_frames = getattr(data_args, "max_frames", NUM_FRAMES)
