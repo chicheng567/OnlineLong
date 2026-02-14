@@ -131,6 +131,13 @@ class Videollama3Processor(ProcessorMixin):
         self.chat_template = chat_template
         self.image_processor = image_processor
         self.tokenizer = tokenizer
+        # Keep compatibility with newer ProcessorMixin.save_pretrained, which may
+        # expect optional fields such as `audio_tokenizer` to exist.
+        for optional_attribute in getattr(self, "optional_attributes", []):
+            if optional_attribute == "chat_template":
+                continue
+            if not hasattr(self, optional_attribute):
+                setattr(self, optional_attribute, kwargs.pop(optional_attribute, None))
         self.generation_prompt = self._infer_generation_prompt()
         self.generation_prompt_ids = self.tokenizer.encode(self.generation_prompt, return_tensors="pt")
         self.generation_prompt_length = len(self.generation_prompt_ids[0])
