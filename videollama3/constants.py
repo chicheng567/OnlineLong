@@ -24,7 +24,9 @@ NUM_FRAMES_PER_SECOND = 1
 # Audio arguments
 AUDIO_TOKEN_INDEX = -202
 DEFAULT_AUDIO_TOKEN = "<audio>"
-
+# compression tokens
+COMPRESSION_START_TOKEN = "<|compression_start|>"
+COMPRESSION_END_TOKEN = "<|compression_end|>"
 # Stream arguments
 STREAM_START_TOKEN = "<|stream_start|>"
 STREAM_END_TOKEN = "<|stream_end|>"

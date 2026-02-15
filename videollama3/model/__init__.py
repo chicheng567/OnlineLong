@@ -42,6 +42,14 @@ VLLMConfigs = {
 }
 
 
+def _safe_torch_load(path):
+    try:
+        return torch.load(path, map_location='cpu', weights_only=True)
+    except TypeError:
+        # Compat for older PyTorch versions that do not support `weights_only`.
+        return torch.load(path, map_location='cpu')
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", **kwargs):
     if 'token' in kwargs:
         token = kwargs['token']
@@ -107,7 +115,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
         print('Loading additional VideoLLaMA weights...')
         if os.path.exists(os.path.join(model_path, 'non_lora_trainables.bin')):
-            non_lora_trainables = torch.load(os.path.join(model_path, 'non_lora_trainables.bin'), map_location='cpu')
+            non_lora_trainables = _safe_torch_load(os.path.join(model_path, 'non_lora_trainables.bin'))
         else:
             # this is probably from HF Hub
             from huggingface_hub import hf_hub_download
@@ -116,7 +124,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     repo_id=repo_id,
                     filename=filename,
                     subfolder=subfolder)
-                return torch.load(cache_file, map_location='cpu')
+                return _safe_torch_load(cache_file)
             non_lora_trainables = load_from_hf(model_path, 'non_lora_trainables.bin')
         non_lora_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in non_lora_trainables.items()}
         if any(k.startswith('model.model.') for k in non_lora_trainables):

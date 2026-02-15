@@ -218,13 +218,18 @@ class Videollama3MetaForCausalLM(ABC):
             compact_vision_token_size = self.get_token_compressor().compress_image_wh
             replace_mask = torch.zeros(input_ids.shape[0], device=device, dtype=torch.bool)
             keep_mask = torch.ones(input_ids.shape[0], device=device, dtype=torch.bool)
+            compression_starts = torch.zeros(input_ids.shape[0], device=device, dtype=torch.bool)
+            compression_ends = torch.zeros(input_ids.shape[0], device=device, dtype=torch.bool)
             for part in compression_parts:
-                part_start = image_positions[part[0]]
-                part_end = image_positions[part[1]-1] + 1
-                replace_mask[part_start: part_start + compact_vision_token_size] = True
-                keep_mask[part_start + compact_vision_token_size: part_end] = False
-            
-            input_ids[replace_mask] = self.config.image_token_index
+                part_start = image_selected[part[0]]
+                part_end = image_selected[part[1]-1] - 1
+                compression_starts[part_start] = True
+                replace_mask[part_start + 1: part_start + compact_vision_token_size + 1] = True
+                compression_ends[part_start + compact_vision_token_size + 1] = True
+                keeping_masks[part_start + compact_vision_token_size + 2: part_end] = False
+            input_ids[replace_mask] = True
+            input_ids[compression_starts] = config.compression_start_token_id
+            input_ids[compression_ends] = config.compression_end_token_id
             input_ids = input_ids[keep_mask]
             if attention_mask is not None:
                 attention_mask = attention_mask[keep_mask]

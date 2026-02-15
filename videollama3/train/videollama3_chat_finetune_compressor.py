@@ -18,6 +18,8 @@ from videollama3.constants import (  # noqa: E402
     NUM_FRAMES,
     STREAM_END_TOKEN,
     STREAM_START_TOKEN,
+    COMPRESSION_START_TOKEN,
+    COMPRESSION_END_TOKEN
 )
 from videollama3.model import Videollama3Qwen2Config, Videollama3Qwen2ForCausalLM  # noqa: E402
 from videollama3.model.processor import Videollama3Processor  # noqa: E402
@@ -34,10 +36,14 @@ from videollama3.train.videollama3_chat_finetune_online import (  # noqa: E402
     set_seed,
 )
 from videollama3.train.videollama3_trainer import VideoLLaMA3Trainer  # noqa: E402
-
-local_rank = None
-logger = logging.getLogger(__name__)
-
+from functools import partial
+torch.load = partial(torch.load, weights_only=False)
+try:
+    from deepspeed.runtime.fp16.loss_scaler import LossScaler
+    from deepspeed.runtime.zero.config import ZeroStageEnum
+    torch.serialization.add_safe_globals([LossScaler, ZeroStageEnum])
+except ImportError:
+    pass
 
 def rank0_print(*args):
     if local_rank == 0:
@@ -178,6 +184,7 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
         super().__init__(*args, **kwargs)
         self.compression_ratio = compression_ratio
         self.compression_window_size = compression_window_size
+        assert compression_window_size - 2 > 1, "Compression window size cannot be less than 3."
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sample = self.list_data_dict[i]
         try:
@@ -209,6 +216,7 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
                     window_size=self.compression_window_size,
                     rng=random,
                 )
+                
             else:
                 compression_part = []
             data_dict["compression_parts"] = compression_part
@@ -468,10 +476,12 @@ def train(attn_implementation=None):
         vision_encoder.num_patches_per_side
     )
 
-    new_tokens = tokenizer.add_tokens([DEFAULT_IMAGE_TOKEN, STREAM_START_TOKEN, STREAM_END_TOKEN], special_tokens=True)
+    new_tokens = tokenizer.add_tokens([COMPRESSION_START_TOKEN, COMPRESSION_END_TOKEN], special_tokens=True)
     if new_tokens > 0:
         model.resize_token_embeddings(len(tokenizer))
     model.config.image_token_index = tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
+    model.config.compression_start_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_START_TOKEN)
+    model.config.compression_end_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_END_TOKEN)
 
     if data_args.force_image_size is not None:
         vision_encoder.image_processor.force_size = [data_args.force_image_size] * 2

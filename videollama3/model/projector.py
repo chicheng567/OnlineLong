@@ -47,6 +47,14 @@ def parse_snapshot_folder(repo_id, cache_dir=None, repo_type="model"):
     return folder
 
 
+def _safe_torch_load(path):
+    try:
+        return torch.load(path, map_location='cpu', weights_only=True)
+    except TypeError:
+        # Compat for older PyTorch versions that do not support `weights_only`.
+        return torch.load(path, map_location='cpu')
+
+
 def load_mm_projector(model_path, cache_dir=None, token=None):
     if os.path.exists(os.path.join(model_path, 'mm_projector.bin')):
         is_local = True
@@ -59,7 +67,7 @@ def load_mm_projector(model_path, cache_dir=None, token=None):
             from huggingface_hub import snapshot_download
             snapshot_download(repo_id=model_path, cache_dir=cache_dir, token=token)
 
-    mm_projector_weights = torch.load(os.path.join(folder, 'mm_projector.bin'), map_location='cpu')
+    mm_projector_weights = _safe_torch_load(os.path.join(folder, 'mm_projector.bin'))
     mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
     return mm_projector_weights
 
