@@ -135,8 +135,12 @@ class ModelArguments:
     compressor_intermediate_size: Optional[int] = field(default=None)
     compressor_attention_dropout: float = field(default=0.0)
     compressor_layer_norm_eps: float = field(default=1e-6)
-    compress_image_wh: int = field(default=256)
-
+    compress_image_w: int = field(default=16)
+    compress_image_h: int = field(default=16)
+    #compression decoder args
+    compressor_decoder_layers: int = field(default=0)
+    compression_mse_loss_weight: float = field(default=0.0)
+    upsample_factor_per_decoder: int = field(default=3)
 
 @dataclass
 class DataArguments:
@@ -314,7 +318,7 @@ def make_compressor_data_module(vlprocessor: transformers.ProcessorMixin, data_a
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 
-def _build_token_compressor_config(model_config: Videollama3Qwen2Config, model_args: ModelArguments) -> Dict:
+def _build_token_compressor_config(model_config: Videollama3Qwen2Config, model_args: ModelArguments, data_args: Optional[DataArguments]) -> Dict:
     return {
         "compressor_type": model_args.compressor_type,
         "hidden_size": model_config.mm_hidden_size,
@@ -323,7 +327,12 @@ def _build_token_compressor_config(model_config: Videollama3Qwen2Config, model_a
         "num_attention_heads": model_args.compressor_num_attention_heads,
         "attention_probs_dropout_prob": model_args.compressor_attention_dropout,
         "layer_norm_eps": model_args.compressor_layer_norm_eps,
-        "compress_image_wh": model_args.compress_image_wh,
+        "compress_image_w": model_args.compress_image_w,
+        "compress_image_h": model_args.compress_image_h,
+        "window_size": data_args.compression_window_size,
+        #compression decoder
+        "decoder_layers": model_args.compressor_decoder_layers,
+        "upsample_factor_per_decoder": model_args.upsample_factor_per_decoder,
     }
 
 
@@ -430,7 +439,8 @@ def train(attn_implementation=None):
     model.config.tokenizer_padding_side = tokenizer.padding_side
     model.config.tokenizer_model_max_length = tokenizer.model_max_length
     model.config.mm_hidden_size = vision_encoder.hidden_size
-    model.config.token_compressor_config = _build_token_compressor_config(model.config, model_args)
+    model.config.token_compressor_config = _build_token_compressor_config(model.config, model_args, data_args)
+    model.config.compression_mse_loss_weight = model_args.compression_mse_loss_weight
 
     # Rebuild compressor with latest config dict.
     from videollama3.model.compressor import build_token_compressor

@@ -173,6 +173,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         compression_parts: Optional[List[List[int]]] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        reconstruction_mse_loss = None
         if inputs_embeds is None:
             (
                 input_ids,
@@ -181,6 +182,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 past_key_values,
                 inputs_embeds,
                 labels,
+                reconstruction_mse_loss,
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -265,6 +267,9 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
 
             if num_items_in_batch is not None:
                 loss = loss / num_items_in_batch
+            if reconstruction_mse_loss is not None:
+                mse_weight = getattr(self.config, "compression_mse_loss_weight", 1.0)
+                loss = loss + mse_weight * reconstruction_mse_loss
 
         else:
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
@@ -308,6 +313,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 past_key_values,
                 inputs_embeds,
                 labels,
+                _,
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids=input_ids,
                 attention_mask=attention_mask,

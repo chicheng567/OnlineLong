@@ -22,6 +22,7 @@ import einops
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ..constants import IGNORE_INDEX, MODAL_INDEX_MAP, NUM_FRAMES
 from .encoder import build_vision_encoder
@@ -128,7 +129,7 @@ class Videollama3MetaForCausalLM(ABC):
         self, 
         vision_tokens: torch.FloatTensor, 
         compression_parts: List[List[int]],
-    ) -> Tuple[torch.FloatTensor, torch.LongTensor, torch.LongTensor, torch.LongTensor]:
+    ) -> Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]:
         # compression_parts: [[start, end], [start, end], ...]
         # vision_tokens: [1, num_tokens, dim]
         device = vision_tokens.device
@@ -145,21 +146,28 @@ class Videollama3MetaForCausalLM(ABC):
         compression_cu_seqlens = torch.tensor(compression_cu_seqlens, device=device, dtype=torch.long)
         
         # compressed vision tokens should have shape: [n, dim]
+        original_tokens_to_reconstruct = vision_tokens[need_compress_parts]
         compressed = self.get_token_compressor()(
-            vision_tokens[need_compress_parts],
+            original_tokens_to_reconstruct,
             compression_cu_seqlens
         )
+        reconstruction_mse_loss = None
+        if getattr(self.get_token_compressor(), "compression_decoder", None) is not None:
+            reconstructed = self.get_token_compressor().decode_tokens(compressed)
+            reconstruction_mse_loss = F.mse_loss(reconstructed, original_tokens_to_reconstruct, reduce="sum")
+            reconstruction_mse_loss /= compression_cu_seqlens.shape[0] - 1 # average mse loss per sample
         keeping_masks = ~need_compress_parts | replace_mask
         vision_tokens[replace_mask] = compressed.view(-1, vision_tokens.shape[-1])
         vision_tokens = vision_tokens[keeping_masks]
-        return vision_tokens
+        return vision_tokens, reconstruction_mse_loss
     def encode_images(
         self,
         pixel_values: torch.FloatTensor,
         grid_sizes: torch.LongTensor,
         merge_sizes: torch.LongTensor,
         compression_parts: Optional[List[List[int]]] = None,
-    ) -> Tuple[torch.FloatTensor, Optional[torch.BoolTensor], Optional[torch.LongTensor], Optional[torch.LongTensor]]:
+    ) -> Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]:
+        reconstruction_mse_loss = None
         mm_features = self.get_model().get_vision_encoder()(
             pixel_values=pixel_values,
             grid_sizes=grid_sizes,
@@ -167,12 +175,12 @@ class Videollama3MetaForCausalLM(ABC):
         )
         if self.config.trainable_mm_compressor and compression_parts is not None and len(compression_parts) > 0:
             assert compression_parts is not None, "compression_parts is required for trainable token compression."
-            mm_features = self.compress_visual_tokens_with_compressor(
+            mm_features, reconstruction_mse_loss = self.compress_visual_tokens_with_compressor(
                 mm_features,
                 compression_parts,
             )
         mm_features = self.get_model().mm_projector(mm_features)
-        return mm_features
+        return mm_features, reconstruction_mse_loss
     
     def prepare_inputs_labels_for_multimodal(
         self,
@@ -197,7 +205,7 @@ class Videollama3MetaForCausalLM(ABC):
         vision_encoder = self.get_vision_encoder()
         # NOTE: text-only situation
         if vision_encoder is None or pixel_values is None or input_ids.shape[1] == 1:
-            return input_ids, attention_mask, position_ids, past_key_values, None, labels
+            return input_ids, attention_mask, position_ids, past_key_values, None, labels, None
         # 1. flatten text inputs
         input_ids = input_ids.view(B * N)
         if attention_mask is not None:
@@ -210,7 +218,7 @@ class Videollama3MetaForCausalLM(ABC):
         # 2. embed visual tokens and compress if needed
         image_selected = (input_ids == self.config.image_token_index)
         image_positions = torch.nonzero(image_selected, as_tuple=False).squeeze(-1) # vision token's positions among all tokens
-        mm_features = self.encode_images(
+        mm_features, reconstruction_mse_loss = self.encode_images(
             pixel_values, grid_sizes, merge_sizes, compression_parts
         )
         
@@ -221,15 +229,15 @@ class Videollama3MetaForCausalLM(ABC):
             compression_starts = torch.zeros(input_ids.shape[0], device=device, dtype=torch.bool)
             compression_ends = torch.zeros(input_ids.shape[0], device=device, dtype=torch.bool)
             for part in compression_parts:
-                part_start = image_selected[part[0]]
-                part_end = image_selected[part[1]-1] - 1
+                part_start = image_positions[part[0]]
+                part_end = image_positions[part[1] - 1]
                 compression_starts[part_start] = True
                 replace_mask[part_start + 1: part_start + compact_vision_token_size + 1] = True
                 compression_ends[part_start + compact_vision_token_size + 1] = True
-                keeping_masks[part_start + compact_vision_token_size + 2: part_end] = False
-            input_ids[replace_mask] = True
-            input_ids[compression_starts] = config.compression_start_token_id
-            input_ids[compression_ends] = config.compression_end_token_id
+                keep_mask[part_start + compact_vision_token_size + 2: part_end + 1] = False
+            input_ids[replace_mask] = self.config.image_token_index
+            input_ids[compression_starts] = self.config.compression_start_token_id
+            input_ids[compression_ends] = self.config.compression_end_token_id
             input_ids = input_ids[keep_mask]
             if attention_mask is not None:
                 attention_mask = attention_mask[keep_mask]
@@ -263,4 +271,4 @@ class Videollama3MetaForCausalLM(ABC):
         if position_ids is not None:
             position_ids = position_ids.view(B, -1)
 
-        return None, attention_mask, position_ids, past_key_values, inputs_embeds, labels
+        return None, attention_mask, position_ids, past_key_values, inputs_embeds, labels, reconstruction_mse_loss
