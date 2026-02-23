@@ -271,6 +271,22 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 mse_weight = getattr(self.config, "compression_mse_loss_weight", 1.0)
                 loss = loss + mse_weight * reconstruction_mse_loss
 
+            # Lightweight debugging log: print loss components on rank 0 only.
+            if self.training:
+                is_rank0 = True
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    is_rank0 = torch.distributed.get_rank() == 0
+                if is_rank0:
+                    llm_loss_value = loss.detach().float().item()
+                    if reconstruction_mse_loss is not None:
+                        llm_loss_value = (loss - mse_weight * reconstruction_mse_loss).detach().float().item()
+                        reconstruct_loss_value = reconstruction_mse_loss.detach().float().item()
+                        print(
+                            f"llm_loss={llm_loss_value:.6f}, reconstruct_loss={reconstruct_loss_value:.6f}"
+                        )
+                    else:
+                        print(f"llm_loss={llm_loss_value:.6f}, reconstruct_loss=None")
+
         else:
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
             logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
