@@ -154,6 +154,7 @@ class Videollama3MetaForCausalLM(ABC):
         reconstruction_mse_loss = None
         if getattr(self.get_token_compressor(), "compression_decoder", None) is not None:
             reconstructed = self.get_token_compressor().decode_tokens(compressed)
+            assert reconstructed.shape == original_tokens_to_reconstruct.shape, f"Reconstructed tokens shape {reconstructed.shape} does not match original tokens shape {original_tokens_to_reconstruct.shape}"
             reconstruction_mse_loss = F.mse_loss(reconstructed, original_tokens_to_reconstruct, reduce="sum")
             reconstruction_mse_loss /= compression_cu_seqlens.shape[0] - 1 # average mse loss per sample
         keeping_masks = ~need_compress_parts | replace_mask

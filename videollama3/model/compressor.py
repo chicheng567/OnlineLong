@@ -200,19 +200,20 @@ class CNN3DMLP(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.layer = nn.Sequential(
-            nn.Conv3d(hidden_size, hidden_size, kernel_size=(3, 1, 1), padding=1),
+            nn.Conv3d(hidden_size, hidden_size, kernel_size=(3, 1, 1), padding=(1, 0, 0)),
             nn.GELU(),
-            nn.Conv3d(hidden_size, hidden_size * upsample_factor, kernel_size=(3, 3, 3), padding=1),
+            nn.Conv3d(hidden_size, hidden_size, kernel_size=(3, 3, 3), padding=1),
             nn.GELU(),
         )
         self.upsample = nn.Upsample(scale_factor=(upsample_factor, 1, 1), mode='trilinear', align_corners=False)
         self.residual_conv = nn.Sequential(
             nn.Upsample(scale_factor=(upsample_factor, 1, 1), mode='trilinear', align_corners=False),
-            nn.Conv3d(hidden_size, hidden_size, kernel_size=(3, 1, 1), padding=1),
+            nn.Conv3d(hidden_size, hidden_size, kernel_size=(3, 1, 1), padding=(1, 0, 0)),
         )
     def forward(self, x):
         assert x.dim() == 5, "size should be (B, hidden_size, t, w, h)"
         residual = self.residual_conv(x) # (B, hidden_size * upsample_factor, t, w, h)
+        x = self.upsample(x) # (B, hidden_size, t * upsample_factor, w, h)
         x = self.layer(x)
         x = x + residual
         return x
@@ -220,23 +221,28 @@ class CNNBasedCompressorDecoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.window_size = config.window_size
+        self.hidden_size = config.hidden_size
         self.compress_w = config.compress_w
         self.compress_h = config.compress_h
         self.compress_image_wh = self.compress_w * self.compress_h
-        self.decoder_layer_num = config.decoder_layers_num
-        self.upsample_rate = config.decoder_upsample_factor
+        self.decoder_layer_num = config.decoder_layers
+        self.upsample_rate = config.upsample_factor_per_decoder
         self.layers = nn.ModuleList([
-            CNN3DMLP(config.hidden_size, upsample_factor=config.decoder_upsample_factor) for _ in range(self.decoder_layer_num)
+            CNN3DMLP(config.hidden_size, upsample_factor=config.upsample_factor_per_decoder) for _ in range(self.decoder_layer_num)
         ])
-        assert config.decoder_upsample_factor ** self.decoder_layer_num <= self.compress_image_wh, "The total upsample factor should not exceed the compressed image size." 
-        self.output_layer = nn.Linear(self.upsample_rate ** self.decoder_layer_num, self.window_size * self.compress_image_wh)
+        assert config.upsample_factor_per_decoder ** self.decoder_layer_num <= self.window_size, f"The total upsample factor should not exceed the compressed image size. Got {config.upsample_factor_per_decoder ** self.decoder_layer_num} > {self.window_size}."
+        self.output_layer = nn.Linear(self.upsample_rate ** self.decoder_layer_num, self.window_size)
     def forward(self, x):
+        ori_shape = x.shape
         x = x.view(-1, self.hidden_size, 1, self.compress_w, self.compress_h) # (B, hidden_size, T, w, h)
         for layer in self.layers:
             x = layer(x)
         # x's shape is (B, hidden_size, upsample_factor^decoder_layer_num, t, w, h)
-        x = x.permute(0, 2, 3, 4, 1).contiguous() # (B, t, w, h, hidden_size)
-        x = self.output_layer(x) # (B, t, w, h, origin_tokens)
+        #Bugs: somthing wrong with the temperal dimension after upsample, need to be fixed.
+        x = x.permute(0, 1, 3, 4, 2).contiguous()
+        x = self.output_layer(x)
+        x = x.permute(0, 2, 3, 4, 1).contiguous() # (B, origin_tokens, t, w, h)
+        x = x.view(-1, self.hidden_size)
         return x
 from transformers import PretrainedConfig
 

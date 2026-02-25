@@ -214,13 +214,12 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
                 # NOTE: data_dict["pixel_values"].shape[0] will be 4 times than total_vision token because of 4x4 merging.
                 total_vision_tokens = int((data_dict["input_ids"] == image_token_id).sum().item())
                 compression_part = select_compression_parts(
-                    total_frames=len(images),
+                    total_frames=len(images[0]),
                     total_vision_tokens=total_vision_tokens,
                     ratio=self.compression_ratio,
                     window_size=self.compression_window_size,
                     rng=random,
                 )
-                
             else:
                 compression_part = []
             data_dict["compression_parts"] = compression_part
