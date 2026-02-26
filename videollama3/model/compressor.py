@@ -187,12 +187,11 @@ class TransformerDecoderCompressor(nn.Module):
 
     def decode_tokens(self, compressed_tokens: torch.Tensor) -> torch.Tensor:
         assert self.compression_decoder is not None, "compression_decoder is not defined, cannot decode tokens."
-        #TODO: change the dimension to (tokens, hidden, w, h)
         if compressed_tokens.dim() == 2:
             compressed_tokens = compressed_tokens.view(-1, 1, self.compress_w, self.compress_h, self.hidden_size)
             compressed_tokens = compressed_tokens.permute(0, 4, 1, 2, 3).contiguous() # (B, hidden_size, T, w, h)
         decoded_tokens = self.compression_decoder(compressed_tokens)
-        self.decode_tokens = decoded_tokens.view(-1, self.hidden_size)
+        decoded_tokens = decoded_tokens.view(-1, self.hidden_size)
         return decoded_tokens
     
 class CNN3DMLP(nn.Module):
@@ -233,12 +232,9 @@ class CNNBasedCompressorDecoder(nn.Module):
         assert config.upsample_factor_per_decoder ** self.decoder_layer_num <= self.window_size, f"The total upsample factor should not exceed the compressed image size. Got {config.upsample_factor_per_decoder ** self.decoder_layer_num} > {self.window_size}."
         self.output_layer = nn.Linear(self.upsample_rate ** self.decoder_layer_num, self.window_size)
     def forward(self, x):
-        ori_shape = x.shape
         x = x.view(-1, self.hidden_size, 1, self.compress_w, self.compress_h) # (B, hidden_size, T, w, h)
         for layer in self.layers:
             x = layer(x)
-        # x's shape is (B, hidden_size, upsample_factor^decoder_layer_num, t, w, h)
-        #Bugs: somthing wrong with the temperal dimension after upsample, need to be fixed.
         x = x.permute(0, 1, 3, 4, 2).contiguous()
         x = self.output_layer(x)
         x = x.permute(0, 2, 3, 4, 1).contiguous() # (B, origin_tokens, t, w, h)
