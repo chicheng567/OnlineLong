@@ -22,7 +22,6 @@ import einops
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 
 from ..constants import IGNORE_INDEX, MODAL_INDEX_MAP, NUM_FRAMES
 from .encoder import build_vision_encoder
@@ -155,7 +154,18 @@ class Videollama3MetaForCausalLM(ABC):
         if getattr(self.get_token_compressor(), "compression_decoder", None) is not None:
             reconstructed = self.get_token_compressor().decode_tokens(compressed)
             assert reconstructed.shape == original_tokens_to_reconstruct.shape, f"Reconstructed tokens shape {reconstructed.shape} does not match original tokens shape {original_tokens_to_reconstruct.shape}"
-            reconstruction_mse_loss = F.mse_loss(reconstructed, original_tokens_to_reconstruct, reduction="mean")
+            token_mse = ((reconstructed - original_tokens_to_reconstruct) ** 2).mean(dim=-1)
+            reconstruction_mse_loss = token_mse.mean()
+            token_mse_detached = token_mse.detach()
+            self._last_reconstruction_stats = {
+                "token_mse_mean": float(token_mse_detached.mean().item()),
+                "token_mse_std": float(token_mse_detached.std(unbiased=False).item()),
+                "token_mse_p90": float(torch.quantile(token_mse_detached, 0.9).item()),
+                "target_l2_mean": float(original_tokens_to_reconstruct.detach().norm(dim=-1).mean().item()),
+                "pred_l2_mean": float(reconstructed.detach().norm(dim=-1).mean().item()),
+            }
+        else:
+            self._last_reconstruction_stats = None
         keeping_masks = ~need_compress_parts | replace_mask
         vision_tokens[replace_mask] = compressed
         vision_tokens = vision_tokens[keeping_masks]

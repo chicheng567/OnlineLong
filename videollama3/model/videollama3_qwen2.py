@@ -281,8 +281,19 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                     if reconstruction_mse_loss is not None:
                         llm_loss_value = (loss - mse_weight * reconstruction_mse_loss).detach().float().item()
                         reconstruct_loss_value = reconstruction_mse_loss.detach().float().item()
+                        recon_stats = getattr(self, "_last_reconstruction_stats", None)
+                        if recon_stats is None:
+                            recon_stats = {}
                         print(
-                            f"llm_loss={llm_loss_value:.6f}, reconstruct_loss={reconstruct_loss_value:.6f}"
+                            "llm_loss={:.6f}, reconstruct_loss={:.6f}, token_mse_std={:.6f}, token_mse_p90={:.6f}, "
+                            "target_l2_mean={:.6f}, pred_l2_mean={:.6f}".format(
+                                llm_loss_value,
+                                reconstruct_loss_value,
+                                float(recon_stats.get("token_mse_std", float("nan"))),
+                                float(recon_stats.get("token_mse_p90", float("nan"))),
+                                float(recon_stats.get("target_l2_mean", float("nan"))),
+                                float(recon_stats.get("pred_l2_mean", float("nan"))),
+                            )
                         )
                     else:
                         print(f"llm_loss={llm_loss_value:.6f}, reconstruct_loss=None")
