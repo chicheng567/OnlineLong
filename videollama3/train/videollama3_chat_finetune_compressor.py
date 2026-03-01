@@ -10,6 +10,7 @@ import warnings
 import torch
 import transformers
 from packaging import version
+from transformers import TrainerCallback
 
 sys.path.append("./")
 
@@ -181,6 +182,123 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
+    step_infer_enabled: bool = field(
+        default=True,
+        metadata={"help": "Run a random train-sample inference at every step end on rank 0."},
+    )
+    step_infer_max_new_tokens: int = field(
+        default=64,
+        metadata={"help": "Max generated tokens for step inference logging."},
+    )
+    step_infer_do_sample: bool = field(
+        default=False,
+        metadata={"help": "Use sampling instead of greedy decoding for step inference logging."},
+    )
+
+
+class StepInferenceCallback(TrainerCallback):
+    def __init__(
+        self,
+        train_dataset,
+        data_collator,
+        tokenizer,
+        max_new_tokens: int = 64,
+        do_sample: bool = False,
+    ):
+        self.train_dataset = train_dataset
+        self.data_collator = data_collator
+        self.tokenizer = tokenizer
+        self.max_new_tokens = max_new_tokens
+        self.do_sample = do_sample
+
+    @staticmethod
+    def _trim_text(text: str, max_chars: int = 400) -> str:
+        if text is None:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + " ...<truncated>"
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not state.is_local_process_zero:
+            return control
+        if state.global_step <= 0 or len(self.train_dataset) == 0:
+            return control
+
+        model = kwargs.get("model", None)
+        if model is None:
+            return control
+
+        idx = random.randint(0, len(self.train_dataset) - 1)
+        sample = self.train_dataset[idx]
+        batch = self.data_collator([sample])
+        input_ids = batch["input_ids"][0]
+        labels = batch["labels"][0]
+
+        target_positions = torch.nonzero(labels != -100, as_tuple=False).squeeze(-1)
+        if target_positions.numel() == 0:
+            logging.info("[step-infer] step=%s sample_idx=%s skipped (no supervised target tokens).", state.global_step, idx)
+            return control
+
+        prompt_len = int(target_positions[0].item())
+        if prompt_len <= 0:
+            logging.info("[step-infer] step=%s sample_idx=%s skipped (invalid prompt length).", state.global_step, idx)
+            return control
+
+        try:
+            model_param = next(model.parameters())
+            device = model_param.device
+            model_dtype = model_param.dtype
+
+            prompt_ids = input_ids[:prompt_len].unsqueeze(0).to(device=device)
+            attention_mask = torch.ones_like(prompt_ids, dtype=torch.long, device=device)
+            position_ids = torch.arange(prompt_ids.shape[1], dtype=torch.long, device=device).unsqueeze(0)
+
+            generate_kwargs = dict(
+                input_ids=prompt_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                pixel_values=batch["pixel_values"].to(device=device, dtype=model_dtype),
+                grid_sizes=batch["grid_sizes"].to(device=device),
+                merge_sizes=batch["merge_sizes"].to(device=device),
+                modals=batch["modals"],
+                compression_parts=batch.get("compression_parts", []),
+                max_new_tokens=self.max_new_tokens,
+                do_sample=self.do_sample,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+
+            was_training = model.training
+            model.eval()
+            try:
+                with torch.no_grad():
+                    generated = model.generate(**generate_kwargs)
+            finally:
+                if was_training:
+                    model.train()
+
+            pred_ids = generated[0, prompt_len:].detach().cpu()
+            gt_ids = labels[target_positions].detach().cpu()
+
+            prompt_tail = self.tokenizer.decode(input_ids[max(0, prompt_len - 256):prompt_len], skip_special_tokens=False)
+            pred_text = self.tokenizer.decode(pred_ids, skip_special_tokens=False)
+            gt_text = self.tokenizer.decode(gt_ids, skip_special_tokens=False)
+
+            logging.info(
+                "[step-infer] step=%s sample_idx=%s prompt_tokens=%s pred_tokens=%s\n[prompt-tail]\n%s\n[ground-truth]\n%s\n[prediction]\n%s",
+                state.global_step,
+                idx,
+                prompt_len,
+                int(pred_ids.numel()),
+                self._trim_text(prompt_tail),
+                self._trim_text(gt_text),
+                self._trim_text(pred_text),
+            )
+        except Exception:
+            logging.exception("[step-infer] failed at step=%s sample_idx=%s", state.global_step, idx)
+
+        return control
 
 
 class CompressorLazySupervisedDataset(LazySupervisedDataset):
@@ -502,11 +620,27 @@ def train(attn_implementation=None):
     assert version.parse(transformers.__version__) >= version.parse("4.44.0")
     data_module = make_compressor_data_module(vlprocessor=vlprocessor, data_args=data_args)
 
+    callbacks = [LoggingCallback()]
+    if training_args.step_infer_enabled:
+        callbacks.append(
+            StepInferenceCallback(
+                train_dataset=data_module["train_dataset"],
+                data_collator=data_module["data_collator"],
+                tokenizer=tokenizer,
+                max_new_tokens=training_args.step_infer_max_new_tokens,
+                do_sample=training_args.step_infer_do_sample,
+            )
+        )
+        rank0_print(
+            f"Step inference is enabled: max_new_tokens={training_args.step_infer_max_new_tokens}, "
+            f"do_sample={training_args.step_infer_do_sample}"
+        )
+
     trainer = VideoLLaMA3Trainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
-        callbacks=[LoggingCallback()],
+        callbacks=callbacks,
         **data_module,
     )
 

@@ -311,6 +311,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         grid_sizes: Optional[torch.LongTensor] = None,
         merge_sizes: Optional[torch.LongTensor] = None,
         modals: Optional[List[str]] = None,
+        compression_parts: Optional[List[List[int]]] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         input_ids = kwargs.pop("input_ids", None)
@@ -340,6 +341,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 grid_sizes=grid_sizes,
                 merge_sizes=merge_sizes,
                 modals=modals,
+                compression_parts=compression_parts,
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(input_ids)
