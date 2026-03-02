@@ -156,13 +156,13 @@ class Videollama3MetaForCausalLM(ABC):
             assert reconstructed.shape == original_tokens_to_reconstruct.shape, f"Reconstructed tokens shape {reconstructed.shape} does not match original tokens shape {original_tokens_to_reconstruct.shape}"
             token_mse = ((reconstructed - original_tokens_to_reconstruct) ** 2).mean(dim=-1)
             reconstruction_mse_loss = token_mse.mean()
-            token_mse_detached = token_mse.detach()
+            token_mse_detached = token_mse.detach().float()
             self._last_reconstruction_stats = {
                 "token_mse_mean": float(token_mse_detached.mean().item()),
                 "token_mse_std": float(token_mse_detached.std(unbiased=False).item()),
                 "token_mse_p90": float(torch.quantile(token_mse_detached, 0.9).item()),
-                "target_l2_mean": float(original_tokens_to_reconstruct.detach().norm(dim=-1).mean().item()),
-                "pred_l2_mean": float(reconstructed.detach().norm(dim=-1).mean().item()),
+                "target_l2_mean": float(original_tokens_to_reconstruct.detach().float().norm(dim=-1).mean().item()),
+                "pred_l2_mean": float(reconstructed.detach().float().norm(dim=-1).mean().item()),
             }
         else:
             self._last_reconstruction_stats = None
