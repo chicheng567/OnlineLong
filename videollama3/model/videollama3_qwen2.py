@@ -317,7 +317,6 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
     @torch.no_grad()
     def generate(
         self,
-        # multimodal inputs
         pixel_values: Optional[torch.FloatTensor] = None,
         grid_sizes: Optional[torch.LongTensor] = None,
         merge_sizes: Optional[torch.LongTensor] = None,
@@ -329,10 +328,9 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         attention_mask = kwargs.pop("attention_mask", None)
         position_ids = kwargs.pop("position_ids", None)
         past_key_values = kwargs.pop("past_key_values", None)
-
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
-
+        position_ids = torch.arange(input_ids.shape[1], device=input_ids.device)
         if pixel_values is not None:
             (
                 input_ids,
@@ -341,7 +339,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 past_key_values,
                 inputs_embeds,
                 labels,
-                _,
+                _
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -363,6 +361,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
             inputs_embeds=inputs_embeds,
             **kwargs
         )
+        
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)

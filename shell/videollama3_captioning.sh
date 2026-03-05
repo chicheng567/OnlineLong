@@ -27,7 +27,7 @@ PYTHONPATH=. /miniconda/envs/video/bin/python videollama3/inference/captioning.p
   --bf16 True \
   --seed 42 \
   --max_frames 70 \
-  --sampling_fps 1 \
+  --fps 1 \
   --video_merge_size 2 \
   --compression_ratio 0.5 \
   --compression_window_size 10 \

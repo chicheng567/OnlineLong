@@ -26,6 +26,7 @@ import warnings
 from typing import List, Union, Dict, Optional
 
 import torch
+import transformers
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
@@ -33,6 +34,7 @@ from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from videollama3.constants import DEFAULT_IMAGE_TOKEN, IGNORE_INDEX
 from videollama3.mm_utils import load_video, load_images
+from .videollama3_encoder import image_processing_videollama3
 
 
 DEFAULT_CHAT_TEMPLATE = """
@@ -98,6 +100,14 @@ DEFAULT_CHAT_TEMPLATE += """
 """
 
 
+def _custom_import(class_name: str):
+    try:
+        attribute_class = getattr(transformers, class_name)
+    except AttributeError:
+        attribute_class = getattr(image_processing_videollama3, class_name)
+    return attribute_class
+
+
 class Videollama3ProcessorKwargs(ProcessingKwargs, total=False):
     _defaults = {
         "text_kwargs": {
@@ -110,7 +120,7 @@ class Videollama3Processor(ProcessorMixin):
     r"""
     Modified from Qwen2VLProcessor
     Args:
-        image_processor ([`Qwen2VLImageProcessor`], *optional*):
+        image_processor ([`Videollama3ImageProcessor`], *optional*):
             The image processor is a required input.
         tokenizer ([`Qwen2TokenizerFast`], *optional*):
             The tokenizer is a required input.
@@ -120,7 +130,7 @@ class Videollama3Processor(ProcessorMixin):
 
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template"]
-    image_processor_class = "Qwen2VLImageProcessor"
+    image_processor_class = "Videollama3ImageProcessor"
     tokenizer_class = ("Qwen2Tokenizer", "Qwen2TokenizerFast")
 
     def __init__(self, image_processor=None, tokenizer=None, chat_template=None, **kwargs):
@@ -143,6 +153,24 @@ class Videollama3Processor(ProcessorMixin):
         self.generation_prompt_length = len(self.generation_prompt_ids[0])
         self.image_token_id = self.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
         self.eos_token_id = self.tokenizer.eos_token_id
+
+    @classmethod
+    def _get_arguments_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        args = []
+        for attribute_name in cls.attributes:
+            class_name = getattr(cls, f"{attribute_name}_class")
+            if isinstance(class_name, tuple):
+                classes = tuple(_custom_import(n) if n is not None else None for n in class_name)
+                use_fast = kwargs.get("use_fast", True)
+                if use_fast and classes[1] is not None:
+                    attribute_class = classes[1]
+                else:
+                    attribute_class = classes[0]
+            else:
+                attribute_class = _custom_import(class_name)
+
+            args.append(attribute_class.from_pretrained(pretrained_model_name_or_path, **kwargs))
+        return args
 
     def get_generation_prompt(self):
         return self.generation_prompt
@@ -280,6 +308,7 @@ class Videollama3Processor(ProcessorMixin):
         assert len(text), "At least one text must be provided."
 
         grid_sizes = []
+        # TODO: Fix grid size is empty while captionig
         for grid_size, merge_size in zip(image_inputs.get("grid_sizes", []), image_inputs.get("merge_sizes", [])):
             if not torch.all(grid_size[1:] % merge_size == 0):
                 warnings.warn(f"Grid size {grid_size} is not divisible by merge size. Some undesired errors may occur.")
@@ -287,7 +316,6 @@ class Videollama3Processor(ProcessorMixin):
                 grid_sizes.append(grid_size[1:] / merge_size)
             elif grid_size[0] > 1:
                 grid_sizes.extend([grid_size[1:] / merge_size] * grid_size[0])
-
         if return_labels:
             return self._process_text_with_label(text, grid_sizes, **kwargs)
         return self._process_text_without_label(text, grid_sizes, **kwargs)
@@ -315,7 +343,7 @@ class Videollama3Processor(ProcessorMixin):
         Main method to prepare for the model one or several sequences(s) and image(s). This method forwards the `text`
         and `kwargs` arguments to Qwen2TokenizerFast's [`~Qwen2TokenizerFast.__call__`] if `text` is not `None` to encode
         the text. To prepare the vision inputs, this method forwards the `vision_infos` and `kwrags` arguments to
-        Qwen2VLImageProcessor's [`~Qwen2VLImageProcessor.__call__`] if `vision_infos` is not `None`.
+        Videollama3ImageProcessor's [`~Videollama3ImageProcessor.__call__`] if `vision_infos` is not `None`.
 
         Args:
             images (`PIL.Image.Image`, `np.ndarray`, `torch.Tensor`, `List[PIL.Image.Image]`, `List[np.ndarray]`, `List[torch.Tensor]`):

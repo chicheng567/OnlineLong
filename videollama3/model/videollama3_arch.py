@@ -151,7 +151,7 @@ class Videollama3MetaForCausalLM(ABC):
             compression_cu_seqlens
         )
         reconstruction_mse_loss = None
-        if getattr(self.get_token_compressor(), "compression_decoder", None) is not None:
+        if getattr(self.get_token_compressor(), "compression_decoder", None) is not None and self.training:
             reconstructed = self.get_token_compressor().decode_tokens(compressed)
             assert reconstructed.shape == original_tokens_to_reconstruct.shape, f"Reconstructed tokens shape {reconstructed.shape} does not match original tokens shape {original_tokens_to_reconstruct.shape}"
             token_mse = ((reconstructed - original_tokens_to_reconstruct) ** 2).mean(dim=-1)
@@ -207,7 +207,7 @@ class Videollama3MetaForCausalLM(ABC):
     ):
         B, N = input_ids.shape
         device = input_ids.device
-        if self.config.trainable_mm_compressor:
+        if self.config.trainable_mm_compressor and pixel_values is not None:
             assert position_ids is not None, "Currently model only supports position_ids and flatten input."
             # Compression parts should like: [[1, 3], [4, 10], [16, 20]],  where each part indicates the start and end position of vision tokens to be compressed.
             assert compression_parts is not None, "compression_parts is required for trainable token compression."

@@ -232,13 +232,14 @@ class LoggingCallback(TrainerCallback):
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, data_path: str, vlprocessor, data_args: DataArguments, dataset_name=None, dataset_root=None, online_mode=False, prefix_captioning=False):
+    def __init__(self, data_path: str, vlprocessor, data_args: DataArguments, dataset_name=None, dataset_root=None, online_mode=False, prefix_captioning=False, return_label=True):
         super(LazySupervisedDataset, self).__init__()
         data_objs = []
         self.dataset_name = dataset_name
         self.dataset_root = dataset_root
         self.online_mode = online_mode
         self.prefix_captioning = prefix_captioning
+        self.return_label = return_label
         if dataset_root is not None:
             assert os.path.exists(dataset_root), f"Dataset root {dataset_root} not exists!"
         print(f"Loading data from {data_path}, dataset name: {self.dataset_name}, dataset root: {self.dataset_root}")
@@ -591,7 +592,7 @@ class LazySupervisedDataset(Dataset):
                 images=images,
                 text=messages,
                 merge_size=merge_size,
-                return_labels=True,
+                return_labels=self.return_label,
                 return_tensors="pt",
             )
 

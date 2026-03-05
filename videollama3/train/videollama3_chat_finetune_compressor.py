@@ -323,7 +323,7 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
                 images=images,
                 text=messages,
                 merge_size=merge_size,
-                return_labels=True,
+                return_labels=self.return_label,
                 return_tensors="pt",
             )
             data_dict["modals"] = [modal] * len(images)
@@ -527,22 +527,12 @@ def train(attn_implementation=None):
         model = get_peft_model(model, lora_config)
 
     tokenizer_path = model_args.tokenizer_name_or_path or model_args.model_name_or_path
-    try:
-        from qwen2 import Qwen2TokenizerFast
-
-        tokenizer = Qwen2TokenizerFast.from_pretrained(
-            tokenizer_path,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-        )
-    except ImportError:
-        from qwen2 import Qwen2Tokenizer
-
-        tokenizer = Qwen2Tokenizer.from_pretrained(
-            tokenizer_path,
-            model_max_length=training_args.model_max_length,
-            padding_side="right",
-        )
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path=model_args.model_name_or_path,
+        model_max_length=training_args.model_max_length,
+        padding_side="right",
+        use_fast=True,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.unk_token
 
