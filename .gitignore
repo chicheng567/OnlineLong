@@ -96,7 +96,7 @@ CLAUDE.md
 AGENTS.md
 .claude/
 
-shell/*.sh
+shell/*
 anno_online/
 anno_data/
 work_dirs/
