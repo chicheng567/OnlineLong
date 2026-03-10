@@ -12,11 +12,16 @@ if __name__ == "__main__":
     output_log_path = args.output_log_path
     all_video_paths = glob(root_path + "/*")
     deprecated_count = 0
-    for video_path in tqdm(all_video_paths, desc="Checking video health"):
-        if video_path.endswith(".mp4") or video_path.endswith(".avi") or video_path.endswith(".mkv") or video_path.endswith(".webm") or video_path.endswith(".mov"):
-            frames, timestamps = load_video(video_path, fps=1, max_frames=200)
-            if len(frames) == 0 or frames is None or timestamps is None:
+    for video_path in tqdm(glob(root_path + "/**", recursive=True), desc="Checking video health"):
+        if video_path.endswith((".mp4", ".avi", ".mkv", ".webm", ".mov")):
+            try:
+                frames, timestamps = load_video(video_path, fps=1, max_frames=200)
+                if len(frames) == 0 or frames is None or timestamps is None:
+                    with open(output_log_path, "a") as f:
+                        f.write(video_path + "\n")
+                    deprecated_count += 1
+            except Exception as e:
                 with open(output_log_path, "a") as f:
-                    f.write(video_path + "\n")
+                    f.write(f"{video_path} (Error: {str(e)})\n")
                 deprecated_count += 1
     print(f"Total deprecated videos: {deprecated_count}")
