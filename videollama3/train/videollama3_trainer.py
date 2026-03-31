@@ -237,7 +237,7 @@ class VideoLLaMA3Trainer(Trainer):
                 group_by_modality=True,
             )
         else:
-            return super()._get_train_sampler(dataset=dataset)
+            return super()._get_train_sampler()
 
     def create_optimizer(self):
         """
