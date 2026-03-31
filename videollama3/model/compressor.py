@@ -151,8 +151,6 @@ class TransformerDecoderCompressor(nn.Module):
         self.query = nn.Parameter(torch.randn(1,self.compress_image_w * self.compress_image_h, config.hidden_size))
         self.window_size = getattr(config, "window_size", 1)
         self.compression_decoder = None
-        if getattr(config, "decoder_layers", 0) > 0:
-            self.compression_decoder = CNNBasedCompressorDecoder(config)
 
     def _build_query_rotary_pos_emb(self, w, h) -> torch.Tensor:
         # Keep the same indexing style as vision encoder: build (x, y), then flatten.
@@ -194,52 +192,6 @@ class TransformerDecoderCompressor(nn.Module):
         decoded_tokens = decoded_tokens.view(-1, self.hidden_size)
         return decoded_tokens
     
-class CNN3DMLP(nn.Module):
-    def __init__(self, hidden_size, upsample_factor=3):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.layer = nn.Sequential(
-            nn.Conv3d(hidden_size, hidden_size, kernel_size=(3, 1, 1), padding=(1, 0, 0)),
-            nn.GELU(),
-            nn.Conv3d(hidden_size, hidden_size, kernel_size=(3, 3, 3), padding=1),
-            nn.GELU(),
-        )
-        self.upsample = nn.Upsample(scale_factor=(upsample_factor, 1, 1), mode='trilinear', align_corners=False)
-        self.residual_conv = nn.Sequential(
-            nn.Upsample(scale_factor=(upsample_factor, 1, 1), mode='trilinear', align_corners=False),
-            nn.Conv3d(hidden_size, hidden_size, kernel_size=(3, 1, 1), padding=(1, 0, 0)),
-        )
-    def forward(self, x):
-        assert x.dim() == 5, "size should be (B, hidden_size, t, w, h)"
-        residual = self.residual_conv(x) # (B, hidden_size * upsample_factor, t, w, h)
-        x = self.upsample(x) # (B, hidden_size, t * upsample_factor, w, h)
-        x = self.layer(x)
-        x = x + residual
-        return x
-class CNNBasedCompressorDecoder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.window_size = config.window_size
-        self.hidden_size = config.hidden_size
-        self.compress_image_w = config.compress_image_w
-        self.compress_image_h = config.compress_image_h
-        self.compress_image_wh = self.compress_image_w * self.compress_image_h
-        self.decoder_layers = config.decoder_layers
-        self.upsample_rate = config.upsample_factor_per_decoder
-        self.layers = nn.ModuleList([
-            CNN3DMLP(config.hidden_size, upsample_factor=config.upsample_factor_per_decoder) for _ in range(self.decoder_layers)
-        ])
-        assert config.upsample_factor_per_decoder ** self.decoder_layers <= self.window_size, f"The total upsample factor should not exceed the compressed image size. Got {config.upsample_factor_per_decoder ** self.decoder_layers} > {self.window_size}."
-        self.output_layer = nn.Linear(self.upsample_rate ** self.decoder_layers, self.window_size)
-    def forward(self, x):
-        x = x.view(-1, self.hidden_size, 1, self.compress_image_w, self.compress_image_h) # (B, hidden_size, T, w, h)
-        for layer in self.layers:
-            x = layer(x)
-        x = x.permute(0, 1, 3, 4, 2).contiguous()
-        x = self.output_layer(x)
-        x = x.permute(0, 2, 3, 4, 1).contiguous() # (B, origin_tokens, t, w, h)
-        x = x.view(-1, self.hidden_size)
-        return x
 from transformers import PretrainedConfig
 
 class Videollama3TokenCompressorConfig(PretrainedConfig):
@@ -257,22 +209,8 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         compress_image_w=16,
         compress_image_h=16,
         window_size=1,
-        # Decoder args (canonical names).
-        decoder_layers=0,
-        upsample_factor_per_decoder=3,
         **kwargs,
     ):
-        # Backward-compatible aliases from older checkpoints/configs.
-        if "compress_w" in kwargs and "compress_image_w" not in kwargs:
-            compress_image_w = kwargs.pop("compress_w")
-        if "compress_h" in kwargs and "compress_image_h" not in kwargs:
-            compress_image_h = kwargs.pop("compress_h")
-        if "decoder_layer_num" in kwargs and "decoder_layers" not in kwargs:
-            decoder_layers = kwargs.pop("decoder_layer_num")
-        if "decoder_layers_num" in kwargs and "decoder_layers" not in kwargs:
-            decoder_layers = kwargs.pop("decoder_layers_num")
-        if "decoder_upsample_factor" in kwargs and "upsample_factor_per_decoder" not in kwargs:
-            upsample_factor_per_decoder = kwargs.pop("decoder_upsample_factor")
 
         super().__init__(**kwargs)
         self.compressor_type = compressor_type
@@ -285,9 +223,6 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         self.compress_image_w = compress_image_w
         self.compress_image_h = compress_image_h
         self.window_size = window_size
-        # Compression decoder args.
-        self.decoder_layers = decoder_layers
-        self.upsample_factor_per_decoder = upsample_factor_per_decoder
         
 def build_token_compressor(config):
     compressor = getattr(config, 'token_compressor_config', None)
@@ -306,12 +241,6 @@ def build_token_compressor(config):
             compressor["compress_image_w"] = compressor.pop("compress_w")
         if "compress_h" in compressor and "compress_image_h" not in compressor:
             compressor["compress_image_h"] = compressor.pop("compress_h")
-        if "decoder_layer_num" in compressor and "decoder_layers" not in compressor:
-            compressor["decoder_layers"] = compressor.pop("decoder_layer_num")
-        if "decoder_layers_num" in compressor and "decoder_layers" not in compressor:
-            compressor["decoder_layers"] = compressor.pop("decoder_layers_num")
-        if "decoder_upsample_factor" in compressor and "upsample_factor_per_decoder" not in compressor:
-            compressor["upsample_factor_per_decoder"] = compressor.pop("decoder_upsample_factor")
         if "hidden_size" not in compressor:
             compressor["hidden_size"] = config.hidden_size
         if "num_attention_heads" not in compressor:

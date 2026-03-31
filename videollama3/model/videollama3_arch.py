@@ -150,26 +150,10 @@ class Videollama3MetaForCausalLM(ABC):
             original_tokens_to_reconstruct,
             compression_cu_seqlens
         )
-        reconstruction_mse_loss = None
-        if getattr(self.get_token_compressor(), "compression_decoder", None) is not None and self.training:
-            reconstructed = self.get_token_compressor().decode_tokens(compressed)
-            assert reconstructed.shape == original_tokens_to_reconstruct.shape, f"Reconstructed tokens shape {reconstructed.shape} does not match original tokens shape {original_tokens_to_reconstruct.shape}"
-            token_mse = ((reconstructed - original_tokens_to_reconstruct) ** 2).mean(dim=-1)
-            reconstruction_mse_loss = token_mse.mean()
-            token_mse_detached = token_mse.detach().float()
-            self._last_reconstruction_stats = {
-                "token_mse_mean": float(token_mse_detached.mean().item()),
-                "token_mse_std": float(token_mse_detached.std(unbiased=False).item()),
-                "token_mse_p90": float(torch.quantile(token_mse_detached, 0.9).item()),
-                "target_l2_mean": float(original_tokens_to_reconstruct.detach().float().norm(dim=-1).mean().item()),
-                "pred_l2_mean": float(reconstructed.detach().float().norm(dim=-1).mean().item()),
-            }
-        else:
-            self._last_reconstruction_stats = None
         keeping_masks = ~need_compress_parts | replace_mask
         vision_tokens[replace_mask] = compressed
         vision_tokens = vision_tokens[keeping_masks]
-        return vision_tokens, reconstruction_mse_loss
+        return vision_tokens
     def encode_images(
         self,
         pixel_values: torch.FloatTensor,
@@ -185,12 +169,12 @@ class Videollama3MetaForCausalLM(ABC):
         )
         if self.config.trainable_mm_compressor and compression_parts is not None and len(compression_parts) > 0:
             assert compression_parts is not None, "compression_parts is required for trainable token compression."
-            mm_features, reconstruction_mse_loss = self.compress_visual_tokens_with_compressor(
+            mm_features = self.compress_visual_tokens_with_compressor(
                 mm_features,
                 compression_parts,
             )
         mm_features = self.get_model().mm_projector(mm_features)
-        return mm_features, reconstruction_mse_loss
+        return mm_features
     
     def prepare_inputs_labels_for_multimodal(
         self,
@@ -202,7 +186,7 @@ class Videollama3MetaForCausalLM(ABC):
         pixel_values: Optional[torch.FloatTensor] = None,
         grid_sizes: Optional[torch.LongTensor] = None,
         merge_sizes: Optional[torch.LongTensor] = None,
-        modals: Optional[List[str]] = None,
+        modals: Optional[torch.LongTensor] = None, # This parameter is currently not used in the model, but can be used to indicate the modality of each token for more flexible multimodal modeling.
         compression_parts: Optional[List[List[int]]] = None,
     ):
         B, N = input_ids.shape
@@ -228,7 +212,7 @@ class Videollama3MetaForCausalLM(ABC):
         # 2. embed visual tokens and compress if needed
         image_selected = (input_ids == self.config.image_token_index)
         image_positions = torch.nonzero(image_selected, as_tuple=False).squeeze(-1) # vision token's positions among all tokens
-        mm_features, reconstruction_mse_loss = self.encode_images(
+        mm_features = self.encode_images(
             pixel_values, grid_sizes, merge_sizes, compression_parts
         )
         
@@ -281,4 +265,4 @@ class Videollama3MetaForCausalLM(ABC):
         if position_ids is not None:
             position_ids = position_ids.view(B, -1)
 
-        return None, attention_mask, position_ids, past_key_values, inputs_embeds, labels, reconstruction_mse_loss
+        return None, attention_mask, position_ids, past_key_values, inputs_embeds, labels

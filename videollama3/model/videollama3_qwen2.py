@@ -173,7 +173,6 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         compression_parts: Optional[List[List[int]]] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        reconstruction_mse_loss = None
         if inputs_embeds is None:
             (
                 input_ids,
@@ -181,8 +180,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 position_ids,
                 past_key_values,
                 inputs_embeds,
-                labels,
-                reconstruction_mse_loss,
+                labels
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -267,9 +265,6 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
 
             if num_items_in_batch is not None:
                 loss = loss / num_items_in_batch
-            if reconstruction_mse_loss is not None:
-                mse_weight = getattr(self.config, "compression_mse_loss_weight", 1.0)
-                loss = loss + mse_weight * reconstruction_mse_loss
 
             # Lightweight debugging log: print loss components on rank 0 only.
             if self.training:
@@ -278,25 +273,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                     is_rank0 = torch.distributed.get_rank() == 0
                 if is_rank0:
                     llm_loss_value = loss.detach().float().item()
-                    if reconstruction_mse_loss is not None:
-                        llm_loss_value = (loss - mse_weight * reconstruction_mse_loss).detach().float().item()
-                        reconstruct_loss_value = reconstruction_mse_loss.detach().float().item()
-                        recon_stats = getattr(self, "_last_reconstruction_stats", None)
-                        if recon_stats is None:
-                            recon_stats = {}
-                        print(
-                            "llm_loss={:.6f}, reconstruct_loss={:.6f}, token_mse_std={:.6f}, token_mse_p90={:.6f}, "
-                            "target_l2_mean={:.6f}, pred_l2_mean={:.6f}".format(
-                                llm_loss_value,
-                                reconstruct_loss_value,
-                                float(recon_stats.get("token_mse_std", float("nan"))),
-                                float(recon_stats.get("token_mse_p90", float("nan"))),
-                                float(recon_stats.get("target_l2_mean", float("nan"))),
-                                float(recon_stats.get("pred_l2_mean", float("nan"))),
-                            )
-                        )
-                    else:
-                        print(f"llm_loss={llm_loss_value:.6f}, reconstruct_loss=None")
+                    print(f"llm_loss={llm_loss_value:.6f}")
 
         else:
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
