@@ -11,7 +11,7 @@ import torch
 import transformers
 from packaging import version
 from transformers import TrainerCallback
-
+from torch.utils.data import random_split
 sys.path.append("./")
 
 from videollama3.constants import (  # noqa: E402
@@ -160,6 +160,10 @@ class DataArguments:
     # Compressor sampling policy
     compression_ratio: float = field(default=0.3, metadata={"help": "Frame ratio to compress per video."})
     compression_window_size: int = field(default=3, metadata={"help": "Fixed frame window size for each compressed span."})
+    validation_split_rate: float = field(
+        default=0,
+        metadata={"help": "Percentage of the train set used as validation set."},
+    )
 
 
 @dataclass
@@ -194,111 +198,6 @@ class TrainingArguments(transformers.TrainingArguments):
         default=False,
         metadata={"help": "Use sampling instead of greedy decoding for step inference logging."},
     )
-
-
-class StepInferenceCallback(TrainerCallback):
-    def __init__(
-        self,
-        train_dataset,
-        data_collator,
-        tokenizer,
-        max_new_tokens: int = 64,
-        do_sample: bool = False,
-    ):
-        self.train_dataset = train_dataset
-        self.data_collator = data_collator
-        self.tokenizer = tokenizer
-        self.max_new_tokens = max_new_tokens
-        self.do_sample = do_sample
-
-    @staticmethod
-    def _trim_text(text: str, max_chars: int = 400) -> str:
-        if text is None:
-            return ""
-        if len(text) <= max_chars:
-            return text
-        return text[:max_chars] + " ...<truncated>"
-
-    def on_step_end(self, args, state, control, **kwargs):
-        if not state.is_local_process_zero:
-            return control
-        if state.global_step <= 0 or len(self.train_dataset) == 0:
-            return control
-
-        model = kwargs.get("model", None)
-        if model is None:
-            return control
-
-        idx = random.randint(0, len(self.train_dataset) - 1)
-        sample = self.train_dataset[idx]
-        batch = self.data_collator([sample])
-        input_ids = batch["input_ids"][0]
-        labels = batch["labels"][0]
-
-        target_positions = torch.nonzero(labels != -100, as_tuple=False).squeeze(-1)
-        if target_positions.numel() == 0:
-            logging.info("[step-infer] step=%s sample_idx=%s skipped (no supervised target tokens).", state.global_step, idx)
-            return control
-
-        prompt_len = int(target_positions[0].item())
-        if prompt_len <= 0:
-            logging.info("[step-infer] step=%s sample_idx=%s skipped (invalid prompt length).", state.global_step, idx)
-            return control
-
-        try:
-            model_param = next(model.parameters())
-            device = model_param.device
-            model_dtype = model_param.dtype
-
-            prompt_ids = input_ids[:prompt_len].unsqueeze(0).to(device=device)
-            attention_mask = torch.ones_like(prompt_ids, dtype=torch.long, device=device)
-            position_ids = torch.arange(prompt_ids.shape[1], dtype=torch.long, device=device).unsqueeze(0)
-
-            generate_kwargs = dict(
-                input_ids=prompt_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                pixel_values=batch["pixel_values"].to(device=device, dtype=model_dtype),
-                grid_sizes=batch["grid_sizes"].to(device=device),
-                merge_sizes=batch["merge_sizes"].to(device=device),
-                modals=batch["modals"],
-                compression_parts=batch.get("compression_parts", []),
-                max_new_tokens=self.max_new_tokens,
-                do_sample=self.do_sample,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-
-            was_training = model.training
-            model.eval()
-            try:
-                with torch.no_grad():
-                    generated = model.generate(**generate_kwargs)
-            finally:
-                if was_training:
-                    model.train()
-
-            pred_ids = generated[0, prompt_len:].detach().cpu()
-            gt_ids = labels[target_positions].detach().cpu()
-
-            prompt_tail = self.tokenizer.decode(input_ids[max(0, prompt_len - 256):prompt_len], skip_special_tokens=False)
-            pred_text = self.tokenizer.decode(pred_ids, skip_special_tokens=False)
-            gt_text = self.tokenizer.decode(gt_ids, skip_special_tokens=False)
-
-            logging.info(
-                "[step-infer] step=%s sample_idx=%s prompt_tokens=%s pred_tokens=%s\n[prompt-tail]\n%s\n[ground-truth]\n%s\n[prediction]\n%s",
-                state.global_step,
-                idx,
-                prompt_len,
-                int(pred_ids.numel()),
-                self._trim_text(prompt_tail),
-                self._trim_text(gt_text),
-                self._trim_text(pred_text),
-            )
-        except Exception:
-            logging.exception("[step-infer] failed at step=%s sample_idx=%s", state.global_step, idx)
-
-        return control
 
 
 class CompressorLazySupervisedDataset(LazySupervisedDataset):
@@ -426,13 +325,18 @@ def make_compressor_data_module(vlprocessor: transformers.ProcessorMixin, data_a
             compression_ratio=data_args.compression_ratio,
             compression_window_size=data_args.compression_window_size,
         )
-
+    if data_args.validation_split_rate > 0:
+        val_size = max(1, int(len(train_dataset) * data_args.validation_split_rate))
+        train_size = len(train_dataset) - val_size
+        train_dataset, eval_dataset = random_split(train_dataset, [train_size, val_size])
+    else:
+        eval_dataset = None
     data_collator = DataCollatorWithCompressor(
         vlprocessor=vlprocessor,
         compression_ratio=data_args.compression_ratio,
         compression_window_size=data_args.compression_window_size,
     )
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 
 def _build_token_compressor_config(model_config: Videollama3Qwen2Config, model_args: ModelArguments, data_args: Optional[DataArguments]) -> Dict:
@@ -526,7 +430,6 @@ def train(attn_implementation=None):
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
-    tokenizer_path = model_args.tokenizer_name_or_path or model_args.model_name_or_path
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path=model_args.model_name_or_path,
         model_max_length=training_args.model_max_length,
@@ -609,30 +512,13 @@ def train(attn_implementation=None):
     assert model.config._attn_implementation == "flash_attention_2"
     assert version.parse(transformers.__version__) >= version.parse("4.44.0")
     data_module = make_compressor_data_module(vlprocessor=vlprocessor, data_args=data_args)
-
-    callbacks = [LoggingCallback()]
-    if training_args.step_infer_enabled:
-        callbacks.append(
-            StepInferenceCallback(
-                train_dataset=data_module["train_dataset"],
-                data_collator=data_module["data_collator"],
-                tokenizer=tokenizer,
-                max_new_tokens=training_args.step_infer_max_new_tokens,
-                do_sample=training_args.step_infer_do_sample,
-            )
-        )
-        rank0_print(
-            f"Step inference is enabled: max_new_tokens={training_args.step_infer_max_new_tokens}, "
-            f"do_sample={training_args.step_infer_do_sample}"
-        )
-
     trainer = VideoLLaMA3Trainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
-        callbacks=callbacks,
         **data_module,
     )
+        
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
