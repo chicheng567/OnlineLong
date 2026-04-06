@@ -5,6 +5,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Sampler
 
 from transformers import Trainer
@@ -16,7 +17,8 @@ from transformers.trainer import (
     TRAINER_STATE_NAME,
 )
 from qwen2.modeling_qwen2 import Qwen2RMSNorm
-ALL_LAYERNORM_LAYERS = (nn.LayerNorm, Qwen2RMSNorm) 
+from videollama3.constants import IGNORE_INDEX
+ALL_LAYERNORM_LAYERS = (nn.LayerNorm, Qwen2RMSNorm)
 
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
@@ -222,6 +224,53 @@ class LengthGroupedSampler(Sampler):
 
 
 class VideoLLaMA3Trainer(Trainer):
+
+    def __init__(self, *args, teacher_model=None, kl_temperature=1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.teacher_model = teacher_model
+        self.kl_temperature = kl_temperature
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        if self.teacher_model is None:
+            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+
+        labels = inputs.get("labels")
+
+        # Student forward pass
+        outputs = model(**inputs)
+        student_logits = outputs.logits  # [B, T, V_student]
+
+        # Teacher forward pass (no gradient needed)
+        with torch.no_grad():
+            teacher_outputs = self.teacher_model(**inputs)
+            teacher_logits = teacher_outputs.logits  # [B, T, V_teacher]
+
+        T = self.kl_temperature
+
+        # Causal LM shift: logits[t] predicts labels[t+1]
+        shift_student = student_logits[..., :-1, :].contiguous()
+        shift_teacher = teacher_logits[..., :-1, :].contiguous()
+        shift_labels  = labels[..., 1:].contiguous()
+
+        # Only compute loss on valid (non-IGNORE_INDEX) positions
+        mask = shift_labels != IGNORE_INDEX
+        flat_mask = mask.view(-1)
+
+        flat_student = shift_student.view(-1, shift_student.size(-1))[flat_mask]  # [N, V_student]
+        flat_teacher = shift_teacher.view(-1, shift_teacher.size(-1))[flat_mask]  # [N, V_teacher]
+
+        # Align vocab dimension: student may have extra special tokens appended at the end
+        # that the teacher was never trained on and that never appear as prediction targets.
+        teacher_vocab_size = flat_teacher.size(-1)
+        flat_student = flat_student[..., :teacher_vocab_size]  # [N, V_teacher]
+
+        # KL(teacher || student): train student distribution to match teacher
+        # T^2 scaling follows standard knowledge distillation practice
+        student_log_probs = F.log_softmax(flat_student / T, dim=-1)
+        teacher_probs     = F.softmax(flat_teacher / T, dim=-1)
+        loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (T ** 2)
+
+        return (loss, outputs) if return_outputs else loss
 
     def _get_train_sampler(self, dataset: Optional[torch.utils.data.Dataset] = None) -> Optional[torch.utils.data.Sampler]:
         dataset = dataset if dataset is not None else self.train_dataset
