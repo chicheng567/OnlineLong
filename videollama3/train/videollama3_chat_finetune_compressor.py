@@ -306,7 +306,7 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
         super().__init__(*args, **kwargs)
         self.compression_ratio = compression_ratio
         self.compression_window_size = compression_window_size
-        assert compression_window_size - 2 > 1, "Compression window size cannot be less than 3."
+        assert compression_window_size - 2 > 1 and compression_ratio > 0, "Compression window size cannot be less than 3 and compression ratio must be positive."
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sample = self.list_data_dict[i]
         try:
