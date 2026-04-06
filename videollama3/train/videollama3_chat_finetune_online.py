@@ -119,6 +119,8 @@ class ModelArguments:
     mm_attn_implementation: Optional[str] = field(default="flash_attention_2") #always use flash_attention_2
     # Token downsampling Arguments
     use_token_compression: Optional[bool] = field(default=False)
+    # KL distillation Arguments
+    teacher_model_path: Optional[str] = field(default=None, metadata={"help": "Path to pretrained teacher model for KL distillation. If set, use_kl_loss must also be True."})
 
 
 @dataclass
@@ -149,6 +151,9 @@ class TrainingArguments(transformers.TrainingArguments):
     mm_projector_lr: Optional[float] = None
     compressor_lr: Optional[float] = None
     llm_lr: Optional[float] = None
+    # KL distillation Arguments
+    use_kl_loss: bool = field(default=False, metadata={"help": "Use KL divergence loss against a frozen teacher model instead of cross-entropy."})
+    kl_temperature: float = field(default=1.0, metadata={"help": "Softmax temperature for KL divergence. Higher values produce softer distributions."})
     # Training Data Arguments
     group_by_modality_length: bool = field(default=False)
     model_max_length: int = field(
@@ -964,12 +969,33 @@ def train(attn_implementation=None):
     else:
         data_module = make_supervised_data_module(vlprocessor=vlprocessor, data_args=data_args)
 
+    # Load frozen teacher model for KL distillation
+    teacher_model = None
+    if training_args.use_kl_loss:
+        if not model_args.teacher_model_path:
+            raise ValueError("teacher_model_path must be set when use_kl_loss=True.")
+        rank0_print(f"Loading teacher model from {model_args.teacher_model_path} ...")
+        teacher_config = Videollama3Qwen2Config.from_pretrained(model_args.teacher_model_path)
+        teacher_config._attn_implementation = attn_implementation
+        teacher_model = Videollama3Qwen2ForCausalLM.from_pretrained(
+            model_args.teacher_model_path,
+            config=teacher_config,
+            torch_dtype=compute_dtype,
+        )
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad = False
+        teacher_model = teacher_model.to(training_args.device)
+        rank0_print("Teacher model loaded and frozen.")
+
     # select a Trainer
     trainer = VideoLLaMA3Trainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
         callbacks=[LoggingCallback()],
+        teacher_model=teacher_model,
+        kl_temperature=training_args.kl_temperature,
         **data_module
     )
 
