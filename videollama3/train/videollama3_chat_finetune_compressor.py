@@ -11,7 +11,7 @@ import torch
 import transformers
 from packaging import version
 from transformers import TrainerCallback
-from torch.utils.data import random_split
+import torch.utils.data
 sys.path.append("./")
 
 from videollama3.constants import (  # noqa: E402
@@ -295,6 +295,25 @@ class DataCollatorWithCompressor:
         return batch
 
 
+class SubsetWithLengths(torch.utils.data.Subset):
+    """Subset that preserves `lengths` and `modality_lengths` for grouped sampling."""
+
+    def __init__(self, dataset, indices):
+        super().__init__(dataset, indices)
+        parent_lengths = dataset.lengths
+        parent_modality = dataset.modality_lengths
+        self._lengths = [parent_lengths[i] for i in indices]
+        self._modality_lengths = [parent_modality[i] for i in indices]
+
+    @property
+    def lengths(self):
+        return self._lengths
+
+    @property
+    def modality_lengths(self):
+        return self._modality_lengths
+
+
 def make_compressor_data_module(vlprocessor: transformers.ProcessorMixin, data_args: DataArguments) -> Dict:
     if data_args.multi_dataset:
         rank0_print("Use meta file to control datasets loading. Data path will use as meta path")
@@ -326,9 +345,13 @@ def make_compressor_data_module(vlprocessor: transformers.ProcessorMixin, data_a
             compression_window_size=data_args.compression_window_size,
         )
     if data_args.validation_split_rate > 0:
-        val_size = max(1, int(len(train_dataset) * data_args.validation_split_rate))
-        train_size = len(train_dataset) - val_size
-        train_dataset, eval_dataset = random_split(train_dataset, [train_size, val_size])
+        n_total = len(train_dataset)
+        n_val = max(1, int(round(n_total * data_args.validation_split_rate)))
+        n_train = n_total - n_val
+        indices = list(range(n_total))
+        random.shuffle(indices)
+        eval_dataset = SubsetWithLengths(train_dataset, indices[n_train:])
+        train_dataset = SubsetWithLengths(train_dataset, indices[:n_train])
     else:
         eval_dataset = None
     data_collator = DataCollatorWithCompressor(
