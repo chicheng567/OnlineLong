@@ -539,12 +539,11 @@ def train(attn_implementation=None):
         if not model_args.teacher_model_path:
             raise ValueError("teacher_model_path must be set when use_kl_loss=True.")
         rank0_print(f"Loading teacher model from {model_args.teacher_model_path} ...")
-        teacher_config = Videollama3Qwen2Config.from_pretrained(model_args.teacher_model_path)
-        teacher_config._attn_implementation = attn_implementation
         teacher_model = AutoModelForCausalLM.from_pretrained(
             model_args.teacher_model_path,
-            config=teacher_config,
+            attn_implementation="flash_attention_2",
             torch_dtype=compute_dtype,
+            trust_remote_code=True,
         )
         teacher_model.eval()
         for p in teacher_model.parameters():
