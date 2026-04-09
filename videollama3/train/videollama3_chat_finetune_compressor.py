@@ -138,10 +138,9 @@ class ModelArguments:
     compressor_layer_norm_eps: float = field(default=1e-6)
     compress_image_w: int = field(default=16)
     compress_image_h: int = field(default=16)
-    #compression decoder args
-    compressor_decoder_layers: int = field(default=0)
-    compression_mse_loss_weight: float = field(default=0.0)
-    upsample_factor_per_decoder: int = field(default=3)
+    # Teacher Model
+    teacher_model_path: Optional[str] = field(default=None, metadata={"help": "Path to pretrained teacher model for KL distillation. If set, use_kl_loss in TrainingArguments must also be True."})
+
 
 @dataclass
 class DataArguments:
@@ -186,6 +185,9 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
+    # KL distillation Arguments
+    use_kl_loss: bool = field(default=False, metadata={"help": "Use KL divergence loss against a frozen teacher model instead of cross-entropy."})
+    kl_temperature: float = field(default=1.0, metadata={"help": "Softmax temperature for KL divergence. Higher values produce softer distributions."})
     step_infer_enabled: bool = field(
         default=True,
         metadata={"help": "Run a random train-sample inference at every step end on rank 0."},
@@ -535,10 +537,32 @@ def train(attn_implementation=None):
     assert model.config._attn_implementation == "flash_attention_2"
     assert version.parse(transformers.__version__) >= version.parse("4.44.0")
     data_module = make_compressor_data_module(vlprocessor=vlprocessor, data_args=data_args)
+
+    # Load frozen teacher model for KL distillation
+    teacher_model = None
+    if training_args.use_kl_loss:
+        if not model_args.teacher_model_path:
+            raise ValueError("teacher_model_path must be set when use_kl_loss=True.")
+        rank0_print(f"Loading teacher model from {model_args.teacher_model_path} ...")
+        teacher_config = Videollama3Qwen2Config.from_pretrained(model_args.teacher_model_path)
+        teacher_config._attn_implementation = attn_implementation
+        teacher_model = Videollama3Qwen2ForCausalLM.from_pretrained(
+            model_args.teacher_model_path,
+            config=teacher_config,
+            torch_dtype=compute_dtype,
+        )
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad = False
+        teacher_model = teacher_model.to(training_args.device)
+        rank0_print("Teacher model loaded and frozen.")
+
     trainer = VideoLLaMA3Trainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
+        teacher_model=teacher_model,
+        kl_temperature=training_args.kl_temperature,
         **data_module,
     )
         
