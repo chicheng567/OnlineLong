@@ -242,11 +242,13 @@ class VideoLLaMA3Trainer(Trainer):
 
         # Teacher forward pass (no gradient needed)
         with torch.no_grad():
+            if "compression_parts" in inputs:
+                inputs.pop("compression_parts")  # teacher does not need compression parts
             teacher_outputs = self.teacher_model(**inputs)
             teacher_logits = teacher_outputs.logits  # [B, T, V_teacher]
 
         T = self.kl_temperature
-
+        assert 1==2, (teacher_logits.shape, student_logits.shape)
         # Causal LM shift: logits[t] predicts labels[t+1]
         shift_student = student_logits[..., :-1, :].contiguous()
         shift_teacher = teacher_logits[..., :-1, :].contiguous()
