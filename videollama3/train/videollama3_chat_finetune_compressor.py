@@ -10,7 +10,7 @@ import warnings
 import torch
 import transformers
 from packaging import version
-from transformers import TrainerCallback
+from transformers import AutoProcessor, AutoModelForCausalLM
 import torch.utils.data
 sys.path.append("./")
 
@@ -27,7 +27,6 @@ from videollama3.model.processor import Videollama3Processor  # noqa: E402
 from videollama3.train.videollama3_chat_finetune_online import (  # noqa: E402
     ConcatDatasetWithLengths,
     LazySupervisedDataset,
-    LoggingCallback,
     _is_trainable_lr,
     _set_module_trainable,
     find_all_linear_names,
@@ -376,9 +375,6 @@ def _build_token_compressor_config(model_config: Videollama3Qwen2Config, model_a
         "compress_image_w": model_args.compress_image_w,
         "compress_image_h": model_args.compress_image_h,
         "window_size": data_args.compression_window_size,
-        #compression decoder
-        "decoder_layers": model_args.compressor_decoder_layers,
-        "upsample_factor_per_decoder": model_args.upsample_factor_per_decoder,
     }
 
 
@@ -475,7 +471,6 @@ def train(attn_implementation=None):
     model.config.tokenizer_model_max_length = tokenizer.model_max_length
     model.config.mm_hidden_size = vision_encoder.hidden_size
     model.config.token_compressor_config = _build_token_compressor_config(model.config, model_args, data_args)
-    model.config.compression_mse_loss_weight = model_args.compression_mse_loss_weight
 
     # Rebuild compressor with latest config dict.
     from videollama3.model.compressor import build_token_compressor
@@ -546,7 +541,7 @@ def train(attn_implementation=None):
         rank0_print(f"Loading teacher model from {model_args.teacher_model_path} ...")
         teacher_config = Videollama3Qwen2Config.from_pretrained(model_args.teacher_model_path)
         teacher_config._attn_implementation = attn_implementation
-        teacher_model = Videollama3Qwen2ForCausalLM.from_pretrained(
+        teacher_model = AutoModelForCausalLM.from_pretrained(
             model_args.teacher_model_path,
             config=teacher_config,
             torch_dtype=compute_dtype,

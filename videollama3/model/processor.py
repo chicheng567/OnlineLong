@@ -369,6 +369,7 @@ class Videollama3Processor(ProcessorMixin):
               `None`).
             - **pixel_values** -- Pixel values to be fed to a model. Returned when `images` is not `None`.
             - **grid_sizes** -- List of image 3D grid in LLM. Returned when `images` is not `None`.
+            - **compression_parts** -- List of integers specifying the part index for each image when merge_size > 1. Returned when `images`
         """
         output_kwargs = self._merge_kwargs(
             Videollama3ProcessorKwargs,
