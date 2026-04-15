@@ -316,7 +316,6 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 past_key_values,
                 inputs_embeds,
                 labels,
-                _
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -333,7 +332,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
             inputs_embeds = self.get_model().embed_tokens(input_ids)
 
         return super().generate(
-            position_ids=position_ids,
+            position_ids=None,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             **kwargs
