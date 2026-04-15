@@ -167,7 +167,7 @@ class Videollama3MetaForCausalLM(ABC):
             grid_sizes=grid_sizes,
             merge_sizes=merge_sizes,
         )
-        if self.config.trainable_mm_compressor and compression_parts is not None and len(compression_parts) > 0:
+        if getattr(self.config, "trainable_mm_compressor", False) and compression_parts is not None and len(compression_parts) > 0:
             assert compression_parts is not None, "compression_parts is required for trainable token compression."
             mm_features = self.compress_visual_tokens_with_compressor(
                 mm_features,
@@ -191,15 +191,14 @@ class Videollama3MetaForCausalLM(ABC):
     ):
         B, N = input_ids.shape
         device = input_ids.device
-        if self.config.trainable_mm_compressor and pixel_values is not None:
+        if getattr(self.config, "trainable_mm_compressor", False) and pixel_values is not None:
             assert position_ids is not None, "Currently model only supports position_ids and flatten input."
             # Compression parts should like: [[1, 3], [4, 10], [16, 20]],  where each part indicates the start and end position of vision tokens to be compressed.
-            assert compression_parts is not None, "compression_parts is required for trainable token compression."
             assert B == 1, "Currently model only supports batch size 1 for trainable token compression."
         vision_encoder = self.get_vision_encoder()
         # NOTE: text-only situation
         if vision_encoder is None or pixel_values is None or input_ids.shape[1] == 1:
-            return input_ids, attention_mask, position_ids, past_key_values, None, labels, None
+            return input_ids, attention_mask, position_ids, past_key_values, None, labels
         # 1. flatten text inputs
         input_ids = input_ids.view(B * N)
         if attention_mask is not None:
