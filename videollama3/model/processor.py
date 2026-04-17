@@ -277,10 +277,11 @@ class Videollama3Processor(ProcessorMixin):
         grid_sizes: torch.Tensor = None,
         **kwargs,
     ):
+        assert text is not None and text[0] is not None, "Text must be provided when return_labels=False."
         if isinstance(text[0], dict):
             warnings.warn("Input text is a list of messages. Automatically convert it to a string with 'apply_chat_template' with generation prompt.")
             text = [self.tokenizer.apply_chat_template(text, tokenize=False, add_generation_prompt=True, add_system_prompt=True)]
-
+        
         image_idx = 0
         for i in range(len(text)):
             while DEFAULT_IMAGE_TOKEN in text[i]:
@@ -302,7 +303,6 @@ class Videollama3Processor(ProcessorMixin):
     ):
         kwargs.pop("padding", None)
         kwargs.pop("padding_side", None)
-
         if not isinstance(text, (list, tuple)):
             text = [text]
         assert len(text), "At least one text must be provided."
@@ -310,7 +310,7 @@ class Videollama3Processor(ProcessorMixin):
         grid_sizes = []
         # TODO: Fix grid size is empty while captionig
         for grid_size, merge_size in zip(image_inputs.get("grid_sizes", []), image_inputs.get("merge_sizes", [])):
-            if not torch.all(grid_size[1:] % merge_size == 0):
+            if not all(v % merge_size == 0 for v in grid_size[1:]):
                 warnings.warn(f"Grid size {grid_size} is not divisible by merge size. Some undesired errors may occur.")
             if grid_size[0] == 1:
                 grid_sizes.append(grid_size[1:] / merge_size)
@@ -371,11 +371,15 @@ class Videollama3Processor(ProcessorMixin):
             - **grid_sizes** -- List of image 3D grid in LLM. Returned when `images` is not `None`.
             - **compression_parts** -- List of integers specifying the part index for each image when merge_size > 1. Returned when `images`
         """
+        if(text is None and "conversation" in kwargs):
+            text = kwargs.pop("conversation")
+            text = self.tokenizer.apply_chat_template(text, tokenize=False, add_generation_prompt=self.generation_prompt is not None, add_system_prompt=True)
         output_kwargs = self._merge_kwargs(
             Videollama3ProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
             **kwargs,
         )
+        
         output_kwargs["text_kwargs"].pop("padding")
         output_kwargs["text_kwargs"].pop("padding_side")
         image_inputs = self.process_images(images, merge_size, **output_kwargs["images_kwargs"])
