@@ -5,15 +5,19 @@ Precompute teacher model ground truth for knowledge distillation.
 For every sample in each dataset listed in a meta JSON, this script runs the
 teacher model and saves two types of per-sample ground truth:
 
+  For every sample, the teacher model first generates its own response, then a
+  second forward pass computes soft labels on that teacher-generated response.
+  Original GT annotations are used only as conversational context (prior turns),
+  not as supervision targets.
+
   1. **Soft labels** (distribution GT)
-     Teacher logits at valid label positions (non-IGNORE_INDEX), stored as a
-     float16 tensor of shape [N_valid_tokens, vocab_size].
+     Teacher logits at teacher-generated token positions, stored as a
+     float16 tensor of shape [N_tokens, vocab_size].
      → {output_dir}/{dataset_name}/{sample_idx}.pt
 
-  2. **Text GT** (optional, --generate_text_gt)
-     Teacher-generated response for each assistant turn, using GT prior turns
-     as context (teacher-forcing).
-     → stored inline in the updated annotation JSON as "teacher_text_gt"
+  2. **Text GT**
+     Teacher-generated response, stored inline in the updated annotation JSON
+     as "teacher_text_gt".
 
 After the run, an updated meta JSON is written to {output_dir}/meta_with_teacher.json.
 Point --meta_path at this file when launching compressor training to skip
@@ -55,6 +59,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from tqdm import tqdm
 
 sys.path.append("./")
 
@@ -81,11 +86,16 @@ def _init_dist() -> Tuple[int, int, int]:
     """
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
+        # Bind this process to its own GPU before NCCL init so collectives
+        # (barrier, all_reduce, etc.) target the correct device.
+        torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl")
         rank = dist.get_rank()
         world_size = dist.get_world_size()
     else:
         rank = local_rank = 0
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
         world_size = 1
     return rank, local_rank, world_size
 
@@ -286,6 +296,25 @@ def _run_text_generation(
 
     generated_texts: List[str] = []
 
+    def _generate(context: List[Dict]) -> str:
+        processed = processor(
+            images=media if media else None,
+            text=context,
+            merge_size=2,
+            return_tensors="pt",
+        )
+        inputs = _inputs_to_device(processed, device, dtype)
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=pad_token_id,
+            modals=modals,
+        )
+        # model.generate() calls super().generate(inputs_embeds=...) internally,
+        # so output_ids contains ONLY the newly generated tokens (no prompt prefix).
+        return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+
     # Walk through conversation; whenever we hit an assistant turn,
     # generate using the context up to (but not including) that turn.
     context_so_far: List[Dict] = []
@@ -294,29 +323,18 @@ def _run_text_generation(
             if not context_so_far:
                 generated_texts.append("")
                 continue
-            processed = processor(
-                images=media if media else None,
-                text=context_so_far,
-                merge_size=2,
-                return_tensors="pt",
-            )
-            inputs = _inputs_to_device(processed, device, dtype)
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=pad_token_id,
-                modals=modals,
-            )
-            # model.generate() calls super().generate(inputs_embeds=...) internally,
-            # so output_ids contains ONLY the newly generated tokens (no prompt prefix).
-            text = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
-            generated_texts.append(text)
-
+            generated_texts.append(_generate(context_so_far))
             # Add GT assistant turn to context for subsequent turns
             context_so_far.append(msg)
         else:
             context_so_far.append(msg)
+
+    # Handle a trailing user turn (e.g. unannotated videos: the synthetic
+    # sample carries only one user turn and no GT assistant turn). Without
+    # this, nothing would be generated and soft labels would have no valid
+    # tokens either.
+    if context_so_far and context_so_far[-1]["role"] == "user":
+        generated_texts.append(_generate(context_so_far))
 
     return generated_texts
 
@@ -341,7 +359,7 @@ def _find_unannotated_videos(
     (a single user turn, no assistant turn) so it can be fed through the
     normal processing pipeline.  The soft-labels step will produce no .pt
     file (no GT labels to supervise against), but text-GT generation
-    (--generate_text_gt) will still run and attach "teacher_text_gt".
+    teacher generation always runs and the result is attached as "teacher_text_gt".
     """
     if not dataset_root or not os.path.isdir(dataset_root):
         return []
@@ -357,7 +375,11 @@ def _find_unannotated_videos(
         annotated.add(os.path.normpath(v))
 
     new_samples: List[Dict] = []
-    for dirpath, _, filenames in os.walk(dataset_root):
+    for dirpath, dirnames, filenames in os.walk(dataset_root):
+        # Sort dirnames in-place so os.walk descends in a deterministic order
+        # across ranks. Without this, filesystem-dependent ordering can make
+        # samples[rank::world_size] shard a different list on each rank.
+        dirnames.sort()
         for filename in sorted(filenames):
             if os.path.splitext(filename)[1].lower() not in VIDEO_EXTENSIONS:
                 continue
@@ -388,7 +410,6 @@ def process_dataset(
     fps: int,
     max_frames: int,
     output_dir: Path,
-    do_text_gt: bool,
     max_new_tokens: int,
     device: torch.device,
     dtype: torch.dtype,
@@ -455,30 +476,44 @@ def process_dataset(
     partial_results: Dict[int, Dict] = dict(existing)
     n_ok = n_skip = n_fail = 0
 
-    for idx in shard_indices:
+    pbar = tqdm(
+        shard_indices,
+        desc=f"[rank {rank}] {dataset_name}",
+        position=rank,
+        leave=True,
+        dynamic_ncols=True,
+        file=sys.stderr,
+    )
+    for idx in pbar:
         logits_path = logits_dir / f"{idx}.pt"
 
         if not overwrite and logits_path.exists() and idx in existing:
             n_skip += 1
+            pbar.set_postfix(ok=n_ok, skip=n_skip, fail=n_fail)
             continue
 
         sample = annotation[idx]
         try:
             conversation, media, modal_type = _build_conversation(sample, dataset_root, fps, max_frames)
 
-            # Soft labels
-            soft_labels = _run_soft_labels(model, processor, conversation, media, device, dtype)
+            # Always generate teacher responses first — soft labels are computed
+            # on the teacher's own output, not the original GT annotations.
+            text_gt = _run_text_generation(
+                model, processor, conversation, media, modal_type, device, dtype, max_new_tokens
+            )
+
+            # Build a teacher-complete conversation by appending generated turns.
+            teacher_conversation = list(conversation)
+            if text_gt:
+                for generated_text in text_gt:
+                    teacher_conversation.append({"role": "assistant", "content": generated_text})
+
+            # Soft labels on teacher-generated conversation.
+            soft_labels = _run_soft_labels(model, processor, teacher_conversation, media, device, dtype)
             if soft_labels is None:
                 logger.warning(f"[rank {rank}][{dataset_name}] idx={idx}: no valid labels, skipping .pt")
             else:
                 torch.save(soft_labels, logits_path)
-
-            # Text GT (optional)
-            text_gt: Optional[List[str]] = None
-            if do_text_gt:
-                text_gt = _run_text_generation(
-                    model, processor, conversation, media, modal_type, device, dtype, max_new_tokens
-                )
 
             updated_sample = dict(sample)
             updated_sample["_precompute_idx"] = idx
@@ -496,10 +531,12 @@ def process_dataset(
             partial_results[idx] = fallback
             n_fail += 1
 
+        pbar.set_postfix(ok=n_ok, skip=n_skip, fail=n_fail)
         if (n_ok + n_fail) % 100 == 1:
             logger.info(f"[rank {rank}][{dataset_name}] ok={n_ok} skip={n_skip} fail={n_fail}")
             _save_partial(partial_results, partial_anno_path)
 
+    pbar.close()
     logger.info(f"[rank {rank}][{dataset_name}] Finished: ok={n_ok} skip={n_skip} fail={n_fail}")
     _save_partial(partial_results, partial_anno_path)
 
@@ -613,13 +650,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--fps", type=int, default=1)
     p.add_argument("--max_frames", type=int, default=10)
     p.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
-    p.add_argument("--generate_text_gt", action="store_true",
-                   help="Also run model.generate() to produce text GT per assistant turn")
     p.add_argument("--max_new_tokens", type=int, default=512)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--annotate_unannotated", action="store_true",
                    help="Also process video files in data_root that are not referenced "
-                        "in the annotation (requires --generate_text_gt to produce useful output)")
+                        "in the annotation")
     p.add_argument("--default_prompt", default="Describe this video.",
                    help="Prompt used for unannotated videos (only relevant with --annotate_unannotated)")
     return p.parse_args()
@@ -683,7 +718,6 @@ def main():
             fps=args.fps,
             max_frames=args.max_frames,
             output_dir=output_dir,
-            do_text_gt=args.generate_text_gt,
             max_new_tokens=args.max_new_tokens,
             device=device,
             dtype=compute_dtype,
