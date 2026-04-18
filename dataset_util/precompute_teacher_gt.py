@@ -54,6 +54,7 @@ import logging
 import os
 import sys
 import traceback
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -77,6 +78,12 @@ logger = logging.getLogger(__name__)
 # Distributed helpers
 # ---------------------------------------------------------------------------
 
+# Separate gloo process group used exclusively for barriers. Pure CPU, so it
+# is not subject to NCCL's watchdog: ranks that finish early can safely wait
+# many hours for stragglers (e.g. when corrupted videos make shards uneven).
+_GLOO_PG = None
+
+
 def _init_dist() -> Tuple[int, int, int]:
     """
     Initialize the process group if running under torchrun, otherwise treat
@@ -84,14 +91,17 @@ def _init_dist() -> Tuple[int, int, int]:
 
     Returns (rank, local_rank, world_size).
     """
+    global _GLOO_PG
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
         # Bind this process to its own GPU before NCCL init so collectives
         # (barrier, all_reduce, etc.) target the correct device.
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
+        # Large NCCL timeout as a safety net; barriers go through gloo below.
+        dist.init_process_group(backend="nccl", timeout=timedelta(hours=8))
         rank = dist.get_rank()
         world_size = dist.get_world_size()
+        _GLOO_PG = dist.new_group(backend="gloo", timeout=timedelta(days=1))
     else:
         rank = local_rank = 0
         if torch.cuda.is_available():
@@ -102,7 +112,7 @@ def _init_dist() -> Tuple[int, int, int]:
 
 def _barrier():
     if dist.is_available() and dist.is_initialized():
-        dist.barrier()
+        dist.barrier(group=_GLOO_PG)
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +408,15 @@ def _find_unannotated_videos(
     return new_samples
 
 
+def _build_logits_filename(sample: Dict) -> str:
+    """Name the .pt file after the source video so the cache is self-describing.
+    Dataset separation is handled by the parent directory (logits_dir = output_dir / dataset_name)."""
+    v = sample["video"]
+    if isinstance(v, (list, tuple)):
+        v = v[0]
+    return f"{Path(str(v)).stem}.pt"
+
+
 # ---------------------------------------------------------------------------
 # Per-dataset processing loop
 # ---------------------------------------------------------------------------
@@ -485,14 +504,13 @@ def process_dataset(
         file=sys.stderr,
     )
     for idx in pbar:
-        logits_path = logits_dir / f"{idx}.pt"
+        sample = annotation[idx]
+        logits_path = logits_dir / _build_logits_filename(sample)
 
         if not overwrite and logits_path.exists() and idx in existing:
             n_skip += 1
             pbar.set_postfix(ok=n_ok, skip=n_skip, fail=n_fail)
             continue
-
-        sample = annotation[idx]
         try:
             conversation, media, modal_type = _build_conversation(sample, dataset_root, fps, max_frames)
 
