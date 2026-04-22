@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 """
-Precompute teacher model ground truth for knowledge distillation.
+Precompute teacher soft labels for knowledge distillation.
 
-For every sample in each dataset listed in a meta JSON, this script runs the
-teacher model and saves two types of per-sample ground truth:
-
-  For every sample, the teacher model first generates its own response, then a
-  second forward pass computes soft labels on that teacher-generated response.
-  Original GT annotations are used only as conversational context (prior turns),
-  not as supervision targets.
+For every sample (whether it has an "assistant" GT in the annotation or not),
+this script runs the teacher model ONCE via
+`model.generate(..., output_logits=True, return_dict_in_generate=True)` and
+saves both:
 
   1. **Soft labels** (distribution GT)
-     Teacher logits at teacher-generated token positions, stored as a
-     float16 tensor of shape [N_tokens, vocab_size].
-     → {output_dir}/{dataset_name}/{sample_idx}.pt
+     Per-step teacher logits over the tokens the teacher itself generated,
+     stored as a float16 tensor of shape [N_generated, vocab_size].
+     → {output_dir}/{dataset_name}/{video_stem}.pt
 
   2. **Text GT**
-     Teacher-generated response, stored inline in the updated annotation JSON
-     as "teacher_text_gt".
+     The decoded teacher response, stored inline in the updated annotation
+     JSON as "teacher_text_gt" (list with one string per sample).
 
-After the run, an updated meta JSON is written to {output_dir}/meta_with_teacher.json.
-Point --meta_path at this file when launching compressor training to skip
-the live teacher forward pass entirely (set DataArguments.teacher_cache_dir to output_dir).
+The original "assistant" turns in the annotation are IGNORED — the teacher
+sees only the user prompt (from the annotation's user turn, or
+--default_prompt if none). There is NO second teacher-forcing pass, so every
+saved logit row corresponds one-to-one with a generated token.
+
+After the run, an updated meta JSON is written to
+{output_dir}/meta_with_teacher.json. Point --meta_path at this file when
+launching compressor training, and set DataArguments.teacher_cache_dir to
+`output_dir`.
+
+NOTE: the student training side MUST construct the assistant turn from
+`teacher_text_gt` (NOT the original annotation GT) so that label positions
+line up with the cached logits.
 
 ─────────────────────────────────────────────────────────────────────────────
 Usage
@@ -33,19 +40,10 @@ Single GPU:
         --output_dir teacher_cache \\
         --fps 1 --max_frames 10
 
-Multi-GPU with torchrun (recommended):
-    torchrun --nproc_per_node=8 dataset_util/precompute_teacher_gt.py \\
-        --teacher_model_path pretrained_models/videollama3 \\
-        --meta_path anno_data/finetune_online.json \\
-        --output_dir teacher_cache \\
-        --fps 1 --max_frames 10
-
-Each rank processes samples[rank::world_size] independently (no gradient sync
-needed — pure inference). Rank 0 merges all per-rank annotation files at the
-end and writes the final meta JSON.
+Multi-GPU with torchrun:
+    torchrun --nproc_per_node=8 dataset_util/precompute_teacher_gt.py ...
 
 Resume is supported: already-computed .pt files are skipped automatically.
-─────────────────────────────────────────────────────────────────────────────
 """
 
 import argparse
@@ -69,7 +67,6 @@ from videollama3.model.videollama3_qwen2 import Videollama3Qwen2ForCausalLM
 from videollama3.model.processor import Videollama3Processor
 from videollama3.mm_utils import load_video, load_images
 
-IGNORE_INDEX = -100
 
 logger = logging.getLogger(__name__)
 
@@ -85,19 +82,11 @@ _GLOO_PG = None
 
 
 def _init_dist() -> Tuple[int, int, int]:
-    """
-    Initialize the process group if running under torchrun, otherwise treat
-    the current process as the only rank.
-
-    Returns (rank, local_rank, world_size).
-    """
+    """Initialize process group if under torchrun; otherwise act as rank 0."""
     global _GLOO_PG
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
-        # Bind this process to its own GPU before NCCL init so collectives
-        # (barrier, all_reduce, etc.) target the correct device.
         torch.cuda.set_device(local_rank)
-        # Large NCCL timeout as a safety net; barriers go through gloo below.
         dist.init_process_group(backend="nccl", timeout=timedelta(hours=8))
         rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -124,28 +113,23 @@ def _build_conversation(
     dataset_root: str,
     fps: int,
     max_frames: int,
+    default_prompt: str,
 ) -> Tuple[List[Dict], List, Optional[str]]:
     """
-    Load media and convert an annotation sample into the conversation format
-    expected by Videollama3Processor(images=..., text=...).
+    Load media and build a USER-ONLY conversation for teacher generation.
+
+    Assistant / gpt / system turns in `sample["conversations"]` are ignored.
+    If no usable user text is found, `default_prompt` is used as the single
+    user turn. Media is attached to that single user turn.
 
     Returns:
-        messages    : list of message dicts (role / content)
-        media       : list to pass as `images=` to the processor;
-                      [frames] for video, [image_list] for image, [] otherwise
-        modal_type  : "video", "image", or None
-    Supports:
-      - image samples  (sample["image"] present)
-      - video samples  (sample["video"] present)
-      - single-turn and multi-turn conversations
-      - both {"from":"human"/"gpt"} and {"role":"user"/"assistant"} formats
+        messages   : single-element list with one user message
+        media      : [frames] for video, [image_list] for image, [] otherwise
+        modal_type : "video", "image", or None
     """
     has_video = bool(sample.get("video"))
     has_image = bool(sample.get("image"))
 
-    # ------------------------------------------------------------------
-    # Load media up-front and record what the conversation block should say
-    # ------------------------------------------------------------------
     media: List = []
     modal_type: Optional[str] = None
     timestamps = None
@@ -168,62 +152,37 @@ def _build_conversation(
         media = [images]
         modal_type = "image"
 
-    # ------------------------------------------------------------------
-    # Normalise to list of {"role": ..., "value": ...}
-    # ------------------------------------------------------------------
-    raw_convs = sample.get("conversations", [])
-    norm: List[Dict] = []
-    for c in raw_convs:
+    # Collect only user-role text; drop assistant/gpt/system entirely.
+    user_texts: List[str] = []
+    for c in sample.get("conversations", []):
         role = c.get("role") or c.get("from", "")
-        if role in ("human",):
-            role = "user"
-        elif role in ("gpt",):
-            role = "assistant"
-        norm.append({"role": role, "value": c.get("value", c.get("content", ""))})
+        if role not in ("human", "user"):
+            continue
+        text = c.get("value", c.get("content", ""))
+        text = str(text).replace("<video>", "").replace("<image>", "").strip()
+        if text:
+            user_texts.append(text)
+    if not user_texts:
+        user_texts.append(default_prompt)
 
-    # Skip leading system turns
-    start = 0
-    while start < len(norm) and norm[start]["role"] == "system":
-        start += 1
-    norm = norm[start:]
+    content: List[Dict] = []
+    if has_video:
+        video_block: Dict = {"type": "video", "num_frames": num_media_frames}
+        if timestamps is not None:
+            video_block["timestamps"] = timestamps
+        content.append(video_block)
+    elif has_image:
+        for _ in image_files:
+            content.append({"type": "image"})
+    for t in user_texts:
+        content.append({"type": "text", "text": t})
 
-    messages: List[Dict] = []
-    first_user_seen = False
-
-    for conv in norm:
-        role = conv["role"]
-        value: str = conv["value"]
-
-        if role == "user":
-            # Strip placeholder tokens
-            text = value.replace("<video>", "").replace("<image>", "").strip()
-            content: List[Dict] = []
-
-            # Attach media reference to the first user turn only
-            if not first_user_seen:
-                first_user_seen = True
-                if has_video:
-                    video_block: Dict = {"type": "video", "num_frames": num_media_frames}
-                    if timestamps is not None:
-                        video_block["timestamps"] = timestamps
-                    content.append(video_block)
-                elif has_image:
-                    for _ in image_files:
-                        content.append({"type": "image"})
-
-            if text:
-                content.append({"type": "text", "text": text})
-
-            messages.append({"role": "user", "content": content})
-
-        elif role == "assistant":
-            messages.append({"role": "assistant", "content": value})
-
+    messages = [{"role": "user", "content": content}]
     return messages, media, modal_type
 
 
 # ---------------------------------------------------------------------------
-# Teacher inference helpers
+# Teacher inference
 # ---------------------------------------------------------------------------
 
 def _inputs_to_device(processed, device: torch.device, dtype: torch.dtype) -> Dict:
@@ -234,7 +193,6 @@ def _inputs_to_device(processed, device: torch.device, dtype: torch.dtype) -> Di
             v = v.to(device)
             if k == "pixel_values":
                 v = v.to(dtype)
-            # Videollama3Processor returns 1-D input_ids when return_labels=True
             if v.dim() == 1 and k == "input_ids":
                 v = v.unsqueeze(0)
             inputs[k] = v
@@ -244,49 +202,7 @@ def _inputs_to_device(processed, device: torch.device, dtype: torch.dtype) -> Di
 
 
 @torch.no_grad()
-def _run_soft_labels(
-    model,
-    processor,
-    conversation: List[Dict],
-    media: List,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Optional[torch.Tensor]:
-    """
-    Full teacher forward → float16 logits at valid label positions.
-    Returns tensor of shape [N_valid_tokens, vocab_size] or None.
-    """
-    processed = processor(
-        images=media if media else None,
-        text=conversation,
-        merge_size=2,
-        return_labels=True,
-        return_tensors="pt",
-    )
-
-    # Pop labels before moving to model (they stay on CPU for masking)
-    raw_labels: torch.Tensor = processed.pop("labels")
-    if raw_labels.dim() == 1:
-        labels = raw_labels  # keep 1-D for mask indexing after shift
-    else:
-        labels = raw_labels[0]  # take first batch element
-
-    inputs = _inputs_to_device(processed, device, dtype)
-    outputs = model(**inputs)
-
-    logits: torch.Tensor = outputs.logits   # [1, T, V]
-    shift_logits = logits[0, :-1, :]        # [T-1, V]
-    shift_labels = labels[:-1]              # [T-1]
-    mask = shift_labels != IGNORE_INDEX
-
-    if not mask.any():
-        return None
-
-    return shift_logits[mask.to(device)].half().cpu()   # [N_valid, V]
-
-
-@torch.no_grad()
-def _run_text_generation(
+def _run_teacher_inference(
     model,
     processor,
     conversation: List[Dict],
@@ -295,58 +211,47 @@ def _run_text_generation(
     device: torch.device,
     dtype: torch.dtype,
     max_new_tokens: int,
-) -> List[str]:
+) -> Tuple[str, torch.Tensor]:
     """
-    Generate one teacher response per assistant turn, using GT prior context.
-    Returns a list of strings, one per assistant turn.
+    A single teacher `generate()` call. Returns:
+      - decoded response string (for `teacher_text_gt`)
+      - per-step logits tensor, shape [N_generated, vocab_size], float16, CPU
+
+    Each logit row is the teacher's prediction distribution for the matching
+    token in `output.sequences[0]`. No second forward pass is performed.
     """
     tokenizer = processor.tokenizer
     pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     modals = [modal_type] if modal_type else []
 
-    generated_texts: List[str] = []
+    processed = processor(
+        images=media if media else None,
+        text=conversation,
+        merge_size=2,
+        return_tensors="pt",
+    )
+    inputs = _inputs_to_device(processed, device, dtype)
 
-    def _generate(context: List[Dict]) -> str:
-        processed = processor(
-            images=media if media else None,
-            text=context,
-            merge_size=2,
-            return_tensors="pt",
-        )
-        inputs = _inputs_to_device(processed, device, dtype)
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_token_id,
-            modals=modals,
-        )
-        # model.generate() calls super().generate(inputs_embeds=...) internally,
-        # so output_ids contains ONLY the newly generated tokens (no prompt prefix).
-        return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+    output = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=pad_token_id,
+        modals=modals,
+        output_logits=True,
+        return_dict_in_generate=True,
+    )
 
-    # Walk through conversation; whenever we hit an assistant turn,
-    # generate using the context up to (but not including) that turn.
-    context_so_far: List[Dict] = []
-    for msg in conversation:
-        if msg["role"] == "assistant":
-            if not context_so_far:
-                generated_texts.append("")
-                continue
-            generated_texts.append(_generate(context_so_far))
-            # Add GT assistant turn to context for subsequent turns
-            context_so_far.append(msg)
-        else:
-            context_so_far.append(msg)
+    # Videollama3Qwen2.generate delegates to super().generate(inputs_embeds=...),
+    # so output.sequences contains ONLY the newly generated tokens (no prompt prefix).
+    output_ids = output.sequences[0]
+    text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
 
-    # Handle a trailing user turn (e.g. unannotated videos: the synthetic
-    # sample carries only one user turn and no GT assistant turn). Without
-    # this, nothing would be generated and soft labels would have no valid
-    # tokens either.
-    if context_so_far and context_so_far[-1]["role"] == "user":
-        generated_texts.append(_generate(context_so_far))
-
-    return generated_texts
+    # output.logits: tuple of N tensors, each [1, vocab_size] — stack to [N, V]
+    if not output.logits:
+        raise RuntimeError("model.generate() returned empty logits; check output_logits=True support")
+    logits = torch.stack(list(output.logits), dim=0).squeeze(1).to(torch.float16).cpu()
+    return text, logits
 
 
 # ---------------------------------------------------------------------------
@@ -363,18 +268,12 @@ def _find_unannotated_videos(
 ) -> List[Dict]:
     """
     Walk *dataset_root* recursively and return synthetic samples for every
-    video file that is NOT already referenced in *annotation*.
-
-    Each returned sample has the same structure as a real annotation entry
-    (a single user turn, no assistant turn) so it can be fed through the
-    normal processing pipeline.  The soft-labels step will produce no .pt
-    file (no GT labels to supervise against), but text-GT generation
-    teacher generation always runs and the result is attached as "teacher_text_gt".
+    video file that is NOT already referenced in *annotation*. Each synthetic
+    sample has a single user turn using *default_prompt*.
     """
     if not dataset_root or not os.path.isdir(dataset_root):
         return []
 
-    # Build a normalised set of video paths already covered by the annotation.
     annotated: set = set()
     for sample in annotation:
         v = sample.get("video")
@@ -386,9 +285,7 @@ def _find_unannotated_videos(
 
     new_samples: List[Dict] = []
     for dirpath, dirnames, filenames in os.walk(dataset_root):
-        # Sort dirnames in-place so os.walk descends in a deterministic order
-        # across ranks. Without this, filesystem-dependent ordering can make
-        # samples[rank::world_size] shard a different list on each rank.
+        # Deterministic walk so samples[rank::world_size] shards consistently.
         dirnames.sort()
         for filename in sorted(filenames):
             if os.path.splitext(filename)[1].lower() not in VIDEO_EXTENSIONS:
@@ -409,8 +306,7 @@ def _find_unannotated_videos(
 
 
 def _build_logits_filename(sample: Dict) -> str:
-    """Name the .pt file after the source video so the cache is self-describing.
-    Dataset separation is handled by the parent directory (logits_dir = output_dir / dataset_name)."""
+    """Name the .pt file after the source video stem."""
     v = sample["video"]
     if isinstance(v, (list, tuple)):
         v = v[0]
@@ -435,20 +331,12 @@ def process_dataset(
     overwrite: bool,
     rank: int,
     world_size: int,
-    annotate_unannotated: bool = False,
-    default_prompt: str = "Describe this video.",
+    annotate_unannotated: bool,
+    default_prompt: str,
 ) -> Optional[Dict]:
     """
-    Process this rank's shard of the dataset.
-
-    Each rank writes a per-rank partial annotation file.
-    Returns the updated dataset config dict (rank 0 only, after merge).
-
-    When *annotate_unannotated* is True, video files found in data_root that
-    are not referenced in the annotation are appended as synthetic samples
-    (single user turn, no GT assistant turn).  Their soft-labels step will
-    be skipped (no GT), but text-GT generation still runs if --generate_text_gt
-    is set.
+    Process this rank's shard of the dataset. Each rank writes a per-rank
+    partial annotation file; rank 0 merges them at the end.
     """
     annotation_path = dataset_cfg["annotation"]
     dataset_root = dataset_cfg.get("data_root", "")
@@ -472,13 +360,9 @@ def process_dataset(
     logits_dir = output_dir / dataset_name
     logits_dir.mkdir(parents=True, exist_ok=True)
 
-    # This rank owns samples[rank::world_size]
     shard_indices = list(range(n_total))[rank::world_size]
-
-    # Per-rank partial annotation file (avoids write conflicts between ranks)
     partial_anno_path = output_dir / f"{dataset_name}_rank{rank}_partial.json"
 
-    # Load existing partial results for resume
     existing: Dict[int, Dict] = {}
     if partial_anno_path.exists() and not overwrite:
         try:
@@ -512,33 +396,20 @@ def process_dataset(
             pbar.set_postfix(ok=n_ok, skip=n_skip, fail=n_fail)
             continue
         try:
-            conversation, media, modal_type = _build_conversation(sample, dataset_root, fps, max_frames)
-
-            # Always generate teacher responses first — soft labels are computed
-            # on the teacher's own output, not the original GT annotations.
-            text_gt = _run_text_generation(
-                model, processor, conversation, media, modal_type, device, dtype, max_new_tokens
+            conversation, media, modal_type = _build_conversation(
+                sample, dataset_root, fps, max_frames, default_prompt
+            )
+            text, logits = _run_teacher_inference(
+                model, processor, conversation, media, modal_type,
+                device, dtype, max_new_tokens,
             )
 
-            # Build a teacher-complete conversation by appending generated turns.
-            teacher_conversation = list(conversation)
-            if text_gt:
-                for generated_text in text_gt:
-                    teacher_conversation.append({"role": "assistant", "content": generated_text})
-
-            # Soft labels on teacher-generated conversation.
-            soft_labels = _run_soft_labels(model, processor, teacher_conversation, media, device, dtype)
-            if soft_labels is None:
-                logger.warning(f"[rank {rank}][{dataset_name}] idx={idx}: no valid labels, skipping .pt")
-            else:
-                torch.save(soft_labels, logits_path)
+            torch.save(logits, logits_path)
 
             updated_sample = dict(sample)
             updated_sample["_precompute_idx"] = idx
-            if soft_labels is not None:
-                updated_sample["teacher_logits_path"] = str(logits_path.relative_to(output_dir))
-            if text_gt is not None:
-                updated_sample["teacher_text_gt"] = text_gt
+            updated_sample["teacher_logits_path"] = str(logits_path.relative_to(output_dir))
+            updated_sample["teacher_text_gt"] = [text]
             partial_results[idx] = updated_sample
             n_ok += 1
 
@@ -558,7 +429,6 @@ def process_dataset(
     logger.info(f"[rank {rank}][{dataset_name}] Finished: ok={n_ok} skip={n_skip} fail={n_fail}")
     _save_partial(partial_results, partial_anno_path)
 
-    # ---- Merge (rank 0 only, after all ranks finish) ----
     _barrier()
     if rank != 0:
         return None
@@ -583,10 +453,7 @@ def _merge_dataset(
     world_size: int,
     original_cfg: Dict,
 ) -> Dict:
-    """
-    Merge per-rank partial annotations into one final annotation file (rank 0).
-    Partial files are removed after a successful merge.
-    """
+    """Merge per-rank partials into one final annotation file (rank 0)."""
     logger.info(f"[rank 0][{dataset_name}] Merging {world_size} partial annotation(s) ...")
 
     merged: List[Dict] = list(original_annotation)
@@ -622,12 +489,8 @@ def _merge_dataset(
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_teacher(
-    model_path: str,
-    device: torch.device,
-    dtype: torch.dtype,
-):
-    """Load teacher model and processor using Videollama3Qwen2ForCausalLM / Videollama3Processor."""
+def load_teacher(model_path: str, device: torch.device, dtype: torch.dtype):
+    """Load teacher model + processor using Videollama3Qwen2ForCausalLM."""
     logger.info(f"Loading teacher model from {model_path} on {device} ...")
 
     model = Videollama3Qwen2ForCausalLM.from_pretrained(
@@ -642,10 +505,7 @@ def load_teacher(
         p.requires_grad = False
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        model_max_length=30000,
-        padding_side="right",
-        use_fast=True,
+        model_path, model_max_length=30000, padding_side="right", use_fast=True,
     )
     vision_encoder = model.get_vision_encoder()
     processor = Videollama3Processor(vision_encoder.image_processor, tokenizer)
@@ -672,9 +532,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--annotate_unannotated", action="store_true",
                    help="Also process video files in data_root that are not referenced "
-                        "in the annotation")
+                        "in the annotation (they get --default_prompt as the user turn)")
     p.add_argument("--default_prompt", default="Describe this video.",
-                   help="Prompt used for unannotated videos (only relevant with --annotate_unannotated)")
+                   help="Prompt used as the user turn when the annotation has no usable "
+                        "user text, or for unannotated videos discovered under data_root")
     return p.parse_args()
 
 
@@ -709,7 +570,7 @@ def main():
     output_dir = Path(args.output_dir)
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
-    _barrier()  # ensure dir exists before other ranks try to log
+    _barrier()
 
     _setup_logging(output_dir, rank)
 
