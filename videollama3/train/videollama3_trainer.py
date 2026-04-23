@@ -231,48 +231,84 @@ class VideoLLaMA3Trainer(Trainer):
         self.kl_temperature = kl_temperature
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        if self.teacher_model is None:
+        if self.teacher_model is None and "teacher_logits" not in inputs:
             return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
 
-        labels = inputs.get("labels")
+        # Save original (uncompressed) labels before student forward. Live teacher
+        # needs these because it processes the full uncompressed sequence.
+        original_labels = inputs.get("labels")
 
-        # Student forward pass
-        outputs = model(**inputs)
-        student_logits = outputs.logits  # [B, T, V_student]
+        # Keep labels in student_inputs so prepare_inputs_labels_for_multimodal
+        # compresses them in sync with the sequence. skip_ce_loss=True makes the
+        # model return full logits and stash compressed labels on
+        # self._last_compressed_labels.
+        student_inputs = {k: v for k, v in inputs.items() if k not in ("teacher_logits",)}
+        student_inputs["skip_ce_loss"] = True
+        outputs = model(**student_inputs)
+        student_logits = outputs.logits  # [B, T_compressed, V_student]
+        unwrapped = self.accelerator.unwrap_model(model) if hasattr(self, "accelerator") else model
+        compressed_labels = getattr(unwrapped, "_last_compressed_labels", None)
+        if compressed_labels is None:
+            compressed_labels = original_labels
 
-        # Teacher forward pass (no gradient needed)
-        with torch.no_grad():
-            if "compression_parts" in inputs:
-                teacher_inputs = {k: v for k, v in inputs.items() if k != "compression_parts"}
-            else:
-                teacher_inputs = inputs
-            teacher_outputs = self.teacher_model(**teacher_inputs)
-            teacher_logits = teacher_outputs.logits  # [B, T, V_teacher]
-
-        T = self.kl_temperature
-        print(teacher_logits.shape, student_logits.shape)
-        # Causal LM shift: logits[t] predicts labels[t+1]
+        T_kl = self.kl_temperature
+        # Standard next-token shift: logits[pos] predicts labels[pos+1].
+        # The teacher cache saves `generate()` output_logits where logits[i]
+        # produced generated-token i, so on the student side the distribution
+        # predicting labeled token t_i lives at shift_student[..., i, :] after
+        # selecting positions where shift_labels != IGNORE. Both sides then
+        # enumerate the same assistant tokens t_0, t_1, ..., (optionally EOS).
         shift_student = student_logits[..., :-1, :].contiguous()
-        shift_teacher = teacher_logits[..., :-1, :].contiguous()
-        shift_labels  = labels[..., 1:].contiguous()
+        shift_student_labels = compressed_labels[..., 1:].contiguous()
+        student_flat_mask = shift_student_labels.view(-1) != IGNORE_INDEX
+        flat_student = shift_student.view(-1, shift_student.size(-1))[student_flat_mask]
 
-        # Only compute loss on valid (non-IGNORE_INDEX) positions
-        mask = shift_labels != IGNORE_INDEX
-        flat_mask = mask.view(-1)
+        if "teacher_logits" in inputs:
+            # Cached path: rows correspond to each token emitted by
+            # teacher.generate(); shape [N_generated, V_teacher].
+            flat_teacher = inputs["teacher_logits"].to(student_logits.device, dtype=student_logits.dtype)
+        else:
+            # Live teacher path: standard shift against the uncompressed sequence.
+            with torch.no_grad():
+                teacher_inputs = {k: v for k, v in inputs.items()
+                                  if k not in ("compression_parts", "teacher_logits")}
+                teacher_outputs = self.teacher_model(**teacher_inputs)
+                teacher_logits_full = teacher_outputs.logits  # [B, T_original, V_teacher]
 
-        flat_student = shift_student.view(-1, shift_student.size(-1))[flat_mask]  # [N, V_student]
-        flat_teacher = shift_teacher.view(-1, shift_teacher.size(-1))[flat_mask]  # [N, V_teacher]
+            shift_teacher = teacher_logits_full[..., :-1, :].contiguous()
+            shift_teacher_labels = original_labels[..., 1:].contiguous()
+            teacher_flat_mask = shift_teacher_labels.view(-1) != IGNORE_INDEX
+            flat_teacher = shift_teacher.view(-1, shift_teacher.size(-1))[teacher_flat_mask]
 
-        # Align vocab dimension: student may have extra special tokens appended at the end
-        # that the teacher was never trained on and that never appear as prediction targets.
-        teacher_vocab_size = flat_teacher.size(-1)
-        flat_student = flat_student[..., :teacher_vocab_size]  # [N, V_teacher]
+        # Align token count: teacher may have stopped early (max_new_tokens) or
+        # the decoded/re-encoded round trip may drift by a token or two. Trim
+        # both to the common prefix so the KL is still well-defined.
+        n_common = min(flat_student.size(0), flat_teacher.size(0))
+        diff = abs(flat_student.size(0) - flat_teacher.size(0))
+        if diff > 0:
+            # A diff of 1 is expected when the teacher hit max_new_tokens without
+            # generating <|im_end|>: the student always labels that position due to
+            # the trailing \n in Qwen2's chat template, while the teacher has no
+            # logit for it.  Warn only when the gap is suspiciously large.
+            log_fn = logger.warning if diff > 1 else logger.debug
+            log_fn(
+                f"Student/teacher token count mismatch in KL: "
+                f"student={flat_student.size(0)} teacher={flat_teacher.size(0)} "
+                f"— trimming to {n_common}."
+            )
+        flat_student = flat_student[:n_common]
+        flat_teacher = flat_teacher[:n_common]
 
-        # KL(teacher || student): train student distribution to match teacher
-        # T^2 scaling follows standard knowledge distillation practice
-        student_log_probs = F.log_softmax(flat_student / T, dim=-1)
-        teacher_probs     = F.softmax(flat_teacher / T, dim=-1)
-        loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (T ** 2)
+        # Align vocab: trim both to the common (smaller) vocab size. Teacher
+        # and student lm_heads may differ due to extra special tokens or padding.
+        common_vocab = min(flat_teacher.size(-1), flat_student.size(-1))
+        flat_student = flat_student[..., :common_vocab]
+        flat_teacher = flat_teacher[..., :common_vocab]
+
+        # KL(teacher || student) with temperature scaling (T^2 restores gradient magnitude)
+        student_log_probs = F.log_softmax(flat_student / T_kl, dim=-1)
+        teacher_probs     = F.softmax(flat_teacher / T_kl, dim=-1)
+        loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (T_kl ** 2)
 
         return (loss, outputs) if return_outputs else loss
 
