@@ -767,7 +767,7 @@ class KeywordsStoppingCriteria(StoppingCriteria):
         return all(outputs)
 # Copy from internvl2
 import random
-def process_qa(self, qa, msg=""):
+def process_qa(qa, msg=""):
         # randomly shuffle qa for conversation
         if len(qa) > 1:
             random.shuffle(qa)

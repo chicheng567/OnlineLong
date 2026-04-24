@@ -104,3 +104,6 @@ referenceCode/
 utils/video_check_report.json
 utils/video_check_report_missing_by_dataset.json
 attention_visualizations/
+
+test_gemma.py
+test_videollama3_pretrained.py

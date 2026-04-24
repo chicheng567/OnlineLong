@@ -216,9 +216,18 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
 
         hidden_states = outputs[0]
 
+        # KL distillation path: caller sets skip_ce_loss=True to get full logits
+        # and to have the post-compression labels stored for alignment.
+        skip_ce_loss = loss_kwargs.pop("skip_ce_loss", False)
+
+        # Always stash the (possibly compression-modified) labels so the trainer
+        # can align them with the returned logits without re-deriving them.
+        if labels is not None:
+            self._last_compressed_labels = labels
+
         loss, logits = None, None
         # Loss computation
-        if labels is not None:
+        if labels is not None and not skip_ce_loss:
             shift_hidden_states = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             mask = shift_labels != IGNORE_INDEX
@@ -276,7 +285,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                     print(f"llm_loss={llm_loss_value:.6f}")
 
         else:
-            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+            # skip_ce_loss=True (KL path) or no labels: compute full-sequence logits.
             logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
 
         if not return_dict:
