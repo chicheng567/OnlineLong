@@ -589,10 +589,23 @@ def train(attn_implementation=None):
     projector_trainable = _is_trainable_lr(model.config.mm_projector_lr)
     compressor_trainable = _is_trainable_lr(model.config.compressor_lr)
 
-    _set_module_trainable(model.get_model(), llm_trainable)
-    _set_module_trainable(model.get_vision_encoder(), vision_trainable)
-    _set_module_trainable(model.get_mm_projector(), projector_trainable)
-    _set_module_trainable(getattr(model.get_model(), "token_compressor", None), compressor_trainable)
+    if training_args.lora_enable:
+        # get_peft_model() already froze all base weights and enabled only LoRA params.
+        # If llm_lr=0, also freeze the LoRA params themselves.
+        if not llm_trainable:
+            for name, param in model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = False
+        # vision encoder and compressor use full-parameter training; re-enable them
+        # explicitly since get_peft_model() froze everything at call time.
+        _set_module_trainable(model.get_vision_encoder(), vision_trainable)
+        _set_module_trainable(model.get_mm_projector(), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "token_compressor", None), compressor_trainable)
+    else:
+        _set_module_trainable(model.get_model(), llm_trainable)
+        _set_module_trainable(model.get_vision_encoder(), vision_trainable)
+        _set_module_trainable(model.get_mm_projector(), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "token_compressor", None), compressor_trainable)
 
     total_param_count = sum(p.numel() for p in model.parameters())
     trainable_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
