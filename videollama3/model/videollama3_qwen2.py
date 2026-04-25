@@ -281,8 +281,9 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 if torch.distributed.is_available() and torch.distributed.is_initialized():
                     is_rank0 = torch.distributed.get_rank() == 0
                 if is_rank0:
+                    seq_len = hidden_states.shape[1]
                     llm_loss_value = loss.detach().float().item()
-                    print(f"llm_loss={llm_loss_value:.6f}")
+                    print(f"seq_len={seq_len} llm_loss={llm_loss_value:.6f}")
 
         else:
             # skip_ce_loss=True (KL path) or no labels: compute full-sequence logits.
