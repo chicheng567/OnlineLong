@@ -42,7 +42,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Compressor model single-video inference")
     p.add_argument("--model_path", default="pretrained_models/compressor_videollama3")
     p.add_argument("--video_path", required=True)
-    p.add_argument("--prompt", default="Summarize all the events in this video.")
+    p.add_argument("--prompt", default="<video>\nSummarize all the events in this video. For each event. Format your response as: <start time> - <end time>, <description>")
     p.add_argument("--fps", type=int, default=1)
     p.add_argument("--max_frames", type=int, default=180)
     p.add_argument("--merge_size", type=int, default=2)

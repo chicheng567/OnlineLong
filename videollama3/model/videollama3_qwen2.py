@@ -317,6 +317,16 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         past_key_values = kwargs.pop("past_key_values", None)
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
+        if compression_parts is not None:
+            sorted_parts = sorted(compression_parts, key=lambda x: x[0])
+            for i in range(1, len(sorted_parts)):
+                prev_start, prev_end = sorted_parts[i - 1]
+                curr_start, curr_end = sorted_parts[i]
+                if curr_start < prev_end:
+                    raise ValueError(
+                        f"compression_parts has overlapping intervals: "
+                        f"[{prev_start}, {prev_end}) overlaps with [{curr_start}, {curr_end})"
+                    )
         position_ids = torch.arange(input_ids.shape[1], device=input_ids.device)
         if pixel_values is not None:
             (
