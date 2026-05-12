@@ -271,7 +271,7 @@ class VideoLLaMA3Trainer(Trainer):
             # Live teacher path: standard shift against the uncompressed sequence.
             with torch.no_grad():
                 teacher_inputs = {k: v for k, v in inputs.items()
-                                  if k not in ("compression_parts", "teacher_logits")}
+                                  if k not in ("compression_parts", "compression_ts_info", "teacher_logits")}
                 teacher_outputs = self.teacher_model(**teacher_inputs)
                 teacher_logits_full = teacher_outputs.logits  # [B, T_original, V_teacher]
 

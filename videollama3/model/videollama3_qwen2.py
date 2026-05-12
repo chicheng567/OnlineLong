@@ -171,6 +171,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         merge_sizes: Optional[torch.LongTensor] = None,
         modals: Optional[List[str]] = None,
         compression_parts: Optional[List[List[int]]] = None,
+        compression_ts_info: Optional[List] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if inputs_embeds is None:
@@ -192,6 +193,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 merge_sizes=merge_sizes,
                 modals=modals,
                 compression_parts=compression_parts,
+                compression_ts_info=compression_ts_info,
             )
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -309,6 +311,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         merge_sizes: Optional[torch.LongTensor] = None,
         modals: Optional[List[str]] = None,
         compression_parts: Optional[List[List[int]]] = None,
+        compression_ts_info: Optional[List] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         input_ids = kwargs.pop("input_ids", None)
@@ -347,6 +350,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 merge_sizes=merge_sizes,
                 modals=modals,
                 compression_parts=compression_parts,
+                compression_ts_info=compression_ts_info,
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(input_ids)

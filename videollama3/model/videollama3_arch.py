@@ -188,6 +188,7 @@ class Videollama3MetaForCausalLM(ABC):
         merge_sizes: Optional[torch.LongTensor] = None,
         modals: Optional[torch.LongTensor] = None, # This parameter is currently not used in the model, but can be used to indicate the modality of each token for more flexible multimodal modeling.
         compression_parts: Optional[List[List[int]]] = None,
+        compression_ts_info: Optional[List[Tuple[int, List[int]]]] = None,
     ):
         B, N = input_ids.shape
         device = input_ids.device
@@ -217,35 +218,111 @@ class Videollama3MetaForCausalLM(ABC):
         
         if compression_parts is not None and len(compression_parts) > 0:
             compact_vision_token_size = self.get_token_compressor().compress_image_wh
-            replace_mask = torch.zeros(input_ids.shape[0], device=device, dtype=torch.bool)
-            keep_mask = torch.ones(input_ids.shape[0], device=device, dtype=torch.bool)
-            compression_starts = torch.zeros(input_ids.shape[0], device=device, dtype=torch.bool)
-            compression_ends = torch.zeros(input_ids.shape[0], device=device, dtype=torch.bool)
-            for part in compression_parts:
-                part_start = image_positions[part[0]]
-                part_end = image_positions[part[1] - 1]
-                compression_starts[part_start] = True
-                replace_mask[part_start + 1: part_start + compact_vision_token_size + 1] = True
-                compression_ends[part_start + compact_vision_token_size + 1] = True
-                keep_mask[part_start + compact_vision_token_size + 2: part_end + 1] = False
-            input_ids[replace_mask] = self.config.image_token_index
-            input_ids[compression_starts] = self.config.compression_start_token_id
-            input_ids[compression_ends] = self.config.compression_end_token_id
-            input_ids = input_ids[keep_mask]
+            # List-based construction: build the new token sequence piece-by-piece.
+            # This lets us replace the per-frame "Time X.0s:" text with a range
+            # "Time:Xs-Ye:" before each compression block.
+            ids_segs, lbl_segs, attn_segs, is_start_segs = [], [], [], []
+
+            def _append_seg(tok_ids, lbl_fill, attn_fill, is_sample_start_mask=None):
+                if tok_ids is None or len(tok_ids) == 0:
+                    return
+                ids_segs.append(tok_ids)
+                if labels is not None:
+                    lbl_segs.append(lbl_fill)
+                if attention_mask is not None:
+                    attn_segs.append(attn_fill)
+                # Track which positions are sample-starts (position_id == 0) so we can
+                # re-number positions correctly after insertion of new tokens.
+                if position_ids is not None:
+                    if is_sample_start_mask is not None:
+                        is_start_segs.append(is_sample_start_mask)
+                    else:
+                        is_start_segs.append(torch.zeros(len(tok_ids), device=device, dtype=torch.bool))
+
+            prev = 0
+            for part_idx, part in enumerate(sorted(compression_parts, key=lambda p: p[0])):
+                part_start = image_positions[part[0]].item()
+                part_end = image_positions[part[1] - 1].item()
+
+                # How many tokens does the old "Time X.0s:" string occupy before part_start?
+                old_ts_len = 0
+                new_ts_ids: List[int] = []
+                if compression_ts_info is not None and part_idx < len(compression_ts_info):
+                    old_ts_len, new_ts_ids = compression_ts_info[part_idx]
+
+                # 1. Keep everything from prev up to (but not including) old timestamp text.
+                # Clamp: if old_ts_len is somehow larger than the gap (shouldn't happen with
+                # well-formed data), fall back to keeping up to part_start (no replacement).
+                keep_end = max(prev, part_start - old_ts_len)
+                if keep_end > prev:
+                    seg = input_ids[prev:keep_end]
+                    _append_seg(
+                        seg,
+                        labels[prev:keep_end] if labels is not None else None,
+                        attention_mask[prev:keep_end] if attention_mask is not None else None,
+                        (position_ids[prev:keep_end] == 0) if position_ids is not None else None,
+                    )
+
+                # 2. Insert new range timestamp tokens (replaces old "Time X.0s:" text).
+                if new_ts_ids:
+                    ts_tensor = torch.tensor(new_ts_ids, device=device, dtype=input_ids.dtype)
+                    _append_seg(
+                        ts_tensor,
+                        torch.full([len(new_ts_ids)], IGNORE_INDEX, device=device, dtype=labels.dtype) if labels is not None else None,
+                        torch.ones(len(new_ts_ids), device=device, dtype=attention_mask.dtype) if attention_mask is not None else None,
+                    )
+
+                # 3. <compression_start>
+                cs_tok = torch.tensor([self.config.compression_start_token_id], device=device, dtype=input_ids.dtype)
+                _append_seg(
+                    cs_tok,
+                    torch.tensor([IGNORE_INDEX], device=device, dtype=labels.dtype) if labels is not None else None,
+                    torch.ones(1, device=device, dtype=attention_mask.dtype) if attention_mask is not None else None,
+                )
+
+                # 4. Compressed image token placeholders (features filled in later by embed step).
+                img_toks = torch.full([compact_vision_token_size], self.config.image_token_index, device=device, dtype=input_ids.dtype)
+                _append_seg(
+                    img_toks,
+                    torch.full([compact_vision_token_size], IGNORE_INDEX, device=device, dtype=labels.dtype) if labels is not None else None,
+                    torch.ones(compact_vision_token_size, device=device, dtype=attention_mask.dtype) if attention_mask is not None else None,
+                )
+
+                # 5. <compression_end>
+                ce_tok = torch.tensor([self.config.compression_end_token_id], device=device, dtype=input_ids.dtype)
+                _append_seg(
+                    ce_tok,
+                    torch.tensor([IGNORE_INDEX], device=device, dtype=labels.dtype) if labels is not None else None,
+                    torch.ones(1, device=device, dtype=attention_mask.dtype) if attention_mask is not None else None,
+                )
+
+                prev = part_end + 1
+
+            # 6. Everything after the last compression part.
+            if prev < input_ids.shape[0]:
+                seg = input_ids[prev:]
+                _append_seg(
+                    seg,
+                    labels[prev:] if labels is not None else None,
+                    attention_mask[prev:] if attention_mask is not None else None,
+                    (position_ids[prev:] == 0) if position_ids is not None else None,
+                )
+
+            input_ids = torch.cat(ids_segs)
+            if labels is not None:
+                labels = torch.cat(lbl_segs)
             if attention_mask is not None:
-                attention_mask = attention_mask[keep_mask]
+                attention_mask = torch.cat(attn_segs)
             if position_ids is not None:
-                start = position_ids == 0
-                #NOTE: First token of sample will never be compressed because of BOS and system prompt, so we can use it to determine the start of each sample.
-                start = start[keep_mask]
-                start = torch.nonzero(start, as_tuple=False).squeeze(-1)
-                ends = torch.cat([start[1:], torch.tensor([position_ids[keep_mask].shape[0]], device=device)])
-                new_position_ids = torch.zeros_like(position_ids[keep_mask], device=device)
+                is_start = torch.cat(is_start_segs)
+                start = torch.nonzero(is_start, as_tuple=False).squeeze(-1)
+                if start.dim() == 0:
+                    start = start.unsqueeze(0)
+                ends = torch.cat([start[1:], torch.tensor([input_ids.shape[0]], device=device)])
+                new_position_ids = torch.zeros(input_ids.shape[0], device=device, dtype=torch.long)
                 for i in range(start.shape[0]):
                     new_position_ids[start[i]:ends[i]] = torch.arange(ends[i] - start[i], device=device)
                 position_ids = new_position_ids
-            if labels is not None:
-                labels = labels[keep_mask]
             
         # 3. embed text tokens
         inputs_embeds = self.get_model().embed_tokens(input_ids).clone()

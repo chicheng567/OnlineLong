@@ -303,6 +303,19 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
                     else:
                         modal, images, messages, merge_size = self._convert_normal(sample)
             assert modal == "video", "Compressor training currently only supports video data."
+
+            # Extract per-frame timestamps from messages before passing to processor,
+            # so we can later compute range timestamps for each compression window.
+            frame_timestamps = None
+            for msg in messages:
+                if msg.get("role") == "user":
+                    for content_item in msg.get("content", []):
+                        if isinstance(content_item, dict) and content_item.get("type") == "video":
+                            frame_timestamps = content_item.get("timestamps", None)
+                            break
+                if frame_timestamps is not None:
+                    break
+
             data_dict = self.vlprocessor(
                 images=images,
                 text=messages,
@@ -315,8 +328,9 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
                 image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
                 # NOTE: data_dict["pixel_values"].shape[0] will be 4 times than total_vision token because of 4x4 merging.
                 total_vision_tokens = int((data_dict["input_ids"] == image_token_id).sum().item())
+                total_frames = len(images[0])
                 compression_part = select_compression_parts(
-                    total_frames=len(images[0]),
+                    total_frames=total_frames,
                     total_vision_tokens=total_vision_tokens,
                     ratio=self.compression_ratio,
                     window_size=self.compression_window_size,
@@ -325,6 +339,28 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
             else:
                 compression_part = []
             data_dict["compression_parts"] = compression_part
+
+            # Build per-part timestamp replacement info: (old_ts_token_count, new_ts_token_ids).
+            # The chat template emits "Time X.0s:" before each frame's image tokens.
+            # We record how long that old string is (to know how far back to cut) and
+            # what the range string tokenizes to (so prepare_inputs_labels can splice it in).
+            tokenizer = self.vlprocessor.tokenizer
+            ts_info: List[tuple] = []
+            if compression_part and frame_timestamps is not None and total_vision_tokens > 0:
+                tpf = total_vision_tokens // total_frames
+                for s, e in compression_part:
+                    frame_s = s // tpf
+                    frame_e = e // tpf
+                    ts_start = float(frame_timestamps[frame_s])
+                    ts_end = float(frame_timestamps[min(frame_e, len(frame_timestamps)) - 1])
+                    old_ts_str = f"Time {ts_start:.1f}s:"
+                    new_ts_str = f"Time:{ts_start:.1f}s-{ts_end:.1f}s:"
+                    old_ts_ids = tokenizer.encode(old_ts_str, add_special_tokens=False)
+                    new_ts_ids = tokenizer.encode(new_ts_str, add_special_tokens=False)
+                    ts_info.append((len(old_ts_ids), new_ts_ids))
+            else:
+                ts_info = [(0, []) for _ in compression_part]
+            data_dict["compression_ts_info"] = ts_info
 
             if use_teacher_cache:
                 full_path = os.path.join(self.teacher_cache_dir, teacher_logits_path)
@@ -352,6 +388,7 @@ class DataCollatorWithCompressor:
         new_labels = []
         position_ids = []
         new_compression_parts: List[List[int]] = []
+        new_compression_ts_info: List[tuple] = []
         accumulated_length = 0
         image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
         for sample_idx in range(0, len(input_ids)):
@@ -367,9 +404,14 @@ class DataCollatorWithCompressor:
             new_labels.append(capped_labels)
             position_ids.append(torch.arange(len(capped_ids), dtype=torch.long))
             new_compression_parts.extend([[startend[0] + accumulated_length, startend[1] + accumulated_length] for startend in compression_parts[sample_idx]])
+            # Carry through per-part timestamp replacement info (offset-independent: it's token IDs, not positions).
+            if "compression_ts_info" in instances[sample_idx]:
+                new_compression_ts_info.extend(instances[sample_idx]["compression_ts_info"])
+            else:
+                new_compression_ts_info.extend([(0, []) for _ in compression_parts[sample_idx]])
             image_token_count = int((capped_ids == image_token_id).sum().item())
             accumulated_length += image_token_count
-            
+
         flat_input_ids = torch.cat(new_input_ids)
         flat_labels = torch.cat(new_labels)
         flat_position_ids = torch.cat(position_ids)
@@ -384,6 +426,7 @@ class DataCollatorWithCompressor:
         batch["merge_sizes"] = torch.cat([x["merge_sizes"] for x in instances])
         batch["modals"] = sum([x["modals"] for x in instances], [])
         batch["compression_parts"] = new_compression_parts
+        batch["compression_ts_info"] = new_compression_ts_info
 
         # Concatenate precomputed teacher soft labels if all instances have them.
         # Shape after cat: [total_N_valid_tokens, vocab_size]
