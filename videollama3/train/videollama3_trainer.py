@@ -230,86 +230,162 @@ class VideoLLaMA3Trainer(Trainer):
         self.teacher_model = teacher_model
         self.kl_temperature = kl_temperature
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        if self.teacher_model is None and "teacher_logits" not in inputs:
-            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+    def _ce_forward(self, model, base_inputs, compression_parts, compression_ts_info):
+        """Run one student forward (CE mode) with the given compression_parts.
 
-        # Save original (uncompressed) labels before student forward. Live teacher
-        # needs these because it processes the full uncompressed sequence.
-        original_labels = inputs.get("labels")
+        Returns (ce_loss, outputs).
+        """
+        fwd = {
+            k: v for k, v in base_inputs.items()
+            if k not in (
+                "teacher_logits",
+                "compression_parts", "compression_ts_info",
+                "compression_parts_full", "compression_ts_info_full",
+            )
+        }
+        fwd["compression_parts"] = compression_parts
+        fwd["compression_ts_info"] = compression_ts_info
+        outputs = model(**fwd)
+        return outputs.loss, outputs
 
-        # Keep labels in student_inputs so prepare_inputs_labels_for_multimodal
-        # compresses them in sync with the sequence. skip_ce_loss=True makes the
-        # model return full logits and stash compressed labels on
-        # self._last_compressed_labels.
-        student_inputs = {k: v for k, v in inputs.items() if k not in ("teacher_logits",)}
-        student_inputs["skip_ce_loss"] = True
-        outputs = model(**student_inputs)
-        student_logits = outputs.logits  # [B, T_compressed, V_student]
-        unwrapped = self.accelerator.unwrap_model(model) if hasattr(self, "accelerator") else model
-        compressed_labels = getattr(unwrapped, "_last_compressed_labels", None)
-        if compressed_labels is None:
-            compressed_labels = original_labels
-
-        T_kl = self.kl_temperature
-        # Standard next-token shift: logits[pos] predicts labels[pos+1].
-        # The teacher cache saves `generate()` output_logits where logits[i]
-        # produced generated-token i, so on the student side the distribution
-        # predicting labeled token t_i lives at shift_student[..., i, :] after
-        # selecting positions where shift_labels != IGNORE. Both sides then
-        # enumerate the same assistant tokens t_0, t_1, ..., (optionally EOS).
-        shift_student = student_logits[..., :-1, :].contiguous()
-        shift_student_labels = compressed_labels[..., 1:].contiguous()
-        student_flat_mask = shift_student_labels.view(-1) != IGNORE_INDEX
-        flat_student = shift_student.view(-1, shift_student.size(-1))[student_flat_mask]
-
-        if "teacher_logits" in inputs:
-            # Cached path: rows correspond to each token emitted by
-            # teacher.generate(); shape [N_generated, V_teacher].
-            flat_teacher = inputs["teacher_logits"].to(student_logits.device, dtype=student_logits.dtype)
-        else:
-            # Live teacher path: standard shift against the uncompressed sequence.
-            with torch.no_grad():
-                teacher_inputs = {k: v for k, v in inputs.items()
-                                  if k not in ("compression_parts", "compression_ts_info", "teacher_logits")}
-                teacher_outputs = self.teacher_model(**teacher_inputs)
-                teacher_logits_full = teacher_outputs.logits  # [B, T_original, V_teacher]
-
-            shift_teacher = teacher_logits_full[..., :-1, :].contiguous()
-            shift_teacher_labels = original_labels[..., 1:].contiguous()
-            teacher_flat_mask = shift_teacher_labels.view(-1) != IGNORE_INDEX
-            flat_teacher = shift_teacher.view(-1, shift_teacher.size(-1))[teacher_flat_mask]
-
-        # Align token count: teacher may have stopped early (max_new_tokens) or
-        # the decoded/re-encoded round trip may drift by a token or two. Trim
-        # both to the common prefix so the KL is still well-defined.
+    def _kl_from_flat(self, flat_student, flat_teacher, T_kl, label):
+        """Compute KL(teacher || student) given pre-filtered flat logit tensors."""
         n_common = min(flat_student.size(0), flat_teacher.size(0))
         diff = abs(flat_student.size(0) - flat_teacher.size(0))
         if diff > 0:
             # A diff of 1 is expected when the teacher hit max_new_tokens without
-            # generating <|im_end|>: the student always labels that position due to
-            # the trailing \n in Qwen2's chat template, while the teacher has no
-            # logit for it.  Warn only when the gap is suspiciously large.
+            # generating <|im_end|>. Warn only when the gap is suspiciously large.
             log_fn = logger.warning if diff > 1 else logger.debug
             log_fn(
-                f"Student/teacher token count mismatch in KL: "
+                f"Student/teacher token count mismatch in KL ({label}): "
                 f"student={flat_student.size(0)} teacher={flat_teacher.size(0)} "
                 f"— trimming to {n_common}."
             )
         flat_student = flat_student[:n_common]
         flat_teacher = flat_teacher[:n_common]
-
-        # Align vocab: trim both to the common (smaller) vocab size. Teacher
-        # and student lm_heads may differ due to extra special tokens or padding.
+        # Align vocab size.
         common_vocab = min(flat_teacher.size(-1), flat_student.size(-1))
         flat_student = flat_student[..., :common_vocab]
         flat_teacher = flat_teacher[..., :common_vocab]
-
-        # KL(teacher || student) with temperature scaling (T^2 restores gradient magnitude)
         student_log_probs = F.log_softmax(flat_student / T_kl, dim=-1)
-        teacher_probs     = F.softmax(flat_teacher / T_kl, dim=-1)
-        loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (T_kl ** 2)
+        teacher_probs = F.softmax(flat_teacher / T_kl, dim=-1)
+        return F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (T_kl ** 2)
 
+    def _student_forward(self, model, base_inputs, compression_parts, compression_ts_info):
+        """Run one student forward with the given compression_parts.
+
+        Returns (student_logits, compressed_labels, outputs).
+        """
+        fwd = {
+            k: v for k, v in base_inputs.items()
+            if k not in (
+                "teacher_logits",
+                "compression_parts", "compression_ts_info",
+                "compression_parts_full", "compression_ts_info_full",
+            )
+        }
+        fwd["compression_parts"] = compression_parts
+        fwd["compression_ts_info"] = compression_ts_info
+        fwd["skip_ce_loss"] = True
+        outputs = model(**fwd)
+        student_logits = outputs.logits
+        unwrapped = self.accelerator.unwrap_model(model) if hasattr(self, "accelerator") else model
+        compressed_labels = getattr(unwrapped, "_last_compressed_labels", None)
+        if compressed_labels is None:
+            compressed_labels = base_inputs.get("labels")
+        return student_logits, compressed_labels, outputs
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        is_kl_mode = self.teacher_model is not None or "teacher_logits" in inputs
+
+        if not is_kl_mode:
+            # CE path: run partial + full compression forwards, sum CE losses.
+            parts = inputs.get("compression_parts", [])
+            ts = inputs.get("compression_ts_info", [])
+            parts_full = inputs.get("compression_parts_full", [])
+            ts_full = inputs.get("compression_ts_info_full", [])
+
+            if not parts and not parts_full:
+                # No compression at all: fall back to standard HF CE.
+                return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+
+            loss = None
+            outputs = None
+            if parts:
+                l_partial, outs_partial = self._ce_forward(model, inputs, parts, ts)
+                loss = l_partial
+                outputs = outs_partial
+            if parts_full:
+                l_full, outs_full = self._ce_forward(model, inputs, parts_full, ts_full)
+                loss = l_full if loss is None else loss + l_full
+                if outputs is None:
+                    outputs = outs_full
+
+            return (loss, outputs) if return_outputs else loss
+
+        # Save original (uncompressed) labels before student forward. Live teacher
+        # needs these because it processes the full uncompressed sequence.
+        original_labels = inputs.get("labels")
+        T_kl = self.kl_temperature
+
+        # --- 1. Obtain flat teacher logits (computed once, shared by both forwards) ---
+        if "teacher_logits" in inputs:
+            # Cached path: rows correspond to each token emitted by
+            # teacher.generate(); shape [N_generated, V_teacher].
+            flat_teacher_raw = inputs["teacher_logits"]
+        else:
+            # Live teacher path: standard shift against the uncompressed sequence.
+            with torch.no_grad():
+                teacher_inputs = {
+                    k: v for k, v in inputs.items()
+                    if k not in (
+                        "compression_parts", "compression_ts_info",
+                        "compression_parts_full", "compression_ts_info_full",
+                        "teacher_logits",
+                    )
+                }
+                teacher_outputs = self.teacher_model(**teacher_inputs)
+                teacher_logits_full = teacher_outputs.logits  # [B, T_original, V_teacher]
+            shift_teacher = teacher_logits_full[..., :-1, :].contiguous()
+            shift_teacher_labels = original_labels[..., 1:].contiguous()
+            teacher_flat_mask = shift_teacher_labels.view(-1) != IGNORE_INDEX
+            flat_teacher_raw = shift_teacher.view(-1, shift_teacher.size(-1))[teacher_flat_mask]
+
+        # --- 2. Helper: one student forward → flat masked logits ---
+        def _flat_student(parts_key, ts_key):
+            parts = inputs.get(parts_key, [])
+            ts = inputs.get(ts_key, [])
+            if not parts:
+                return None, None, None
+            s_logits, comp_labels, outs = self._student_forward(model, inputs, parts, ts)
+            flat_t = flat_teacher_raw.to(s_logits.device, dtype=s_logits.dtype)
+            shift_s = s_logits[..., :-1, :].contiguous()
+            shift_lbl = comp_labels[..., 1:].contiguous()
+            mask = shift_lbl.view(-1) != IGNORE_INDEX
+            flat_s = shift_s.view(-1, shift_s.size(-1))[mask]
+            return flat_s, flat_t, outs
+
+        # --- 3. Partial compression forward ---
+        result_partial = _flat_student("compression_parts", "compression_ts_info")
+        flat_s_partial, flat_t_partial, outputs_partial = result_partial
+
+        # --- 4. Full compression forward ---
+        result_full = _flat_student("compression_parts_full", "compression_ts_info_full")
+        flat_s_full, flat_t_full, outputs_full = result_full
+
+        # --- 5. Sum KL losses ---
+        loss = None
+        if flat_s_partial is not None:
+            loss_partial = self._kl_from_flat(flat_s_partial, flat_t_partial, T_kl, "partial")
+            loss = loss_partial
+        if flat_s_full is not None:
+            loss_full = self._kl_from_flat(flat_s_full, flat_t_full, T_kl, "full")
+            loss = loss_full if loss is None else loss + loss_full
+
+        if loss is None:
+            raise RuntimeError("Both partial and full compression_parts are empty — cannot compute KL loss.")
+
+        outputs = outputs_partial if outputs_partial is not None else outputs_full
         return (loss, outputs) if return_outputs else loss
 
     def _get_train_sampler(self, dataset: Optional[torch.utils.data.Dataset] = None) -> Optional[torch.utils.data.Sampler]:
