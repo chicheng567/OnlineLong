@@ -225,10 +225,12 @@ class LengthGroupedSampler(Sampler):
 
 class VideoLLaMA3Trainer(Trainer):
 
-    def __init__(self, *args, teacher_model=None, kl_temperature=1.0, **kwargs):
+    def __init__(self, *args, teacher_model=None, kl_temperature=1.0, partial_loss_weight=1.0, full_loss_weight=1.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.teacher_model = teacher_model
         self.kl_temperature = kl_temperature
+        self.partial_loss_weight = partial_loss_weight
+        self.full_loss_weight = full_loss_weight
 
     def _ce_forward(self, model, base_inputs, compression_parts, compression_ts_info):
         """Run one student forward (CE mode) with the given compression_parts.
@@ -295,6 +297,126 @@ class VideoLLaMA3Trainer(Trainer):
             compressed_labels = base_inputs.get("labels")
         return student_logits, compressed_labels, outputs
 
+    def _get_flat_teacher_logits(self, inputs):
+        """Compute or retrieve flat masked teacher logits for KL distillation."""
+        if "teacher_logits" in inputs:
+            return inputs["teacher_logits"]
+        original_labels = inputs.get("labels")
+        with torch.no_grad():
+            teacher_inputs = {
+                k: v for k, v in inputs.items()
+                if k not in (
+                    "compression_parts", "compression_ts_info",
+                    "compression_parts_full", "compression_ts_info_full",
+                    "teacher_logits",
+                )
+            }
+            teacher_outputs = self.teacher_model(**teacher_inputs)
+            teacher_logits_full = teacher_outputs.logits
+        shift_teacher = teacher_logits_full[..., :-1, :].contiguous()
+        shift_teacher_labels = original_labels[..., 1:].contiguous()
+        teacher_flat_mask = shift_teacher_labels.view(-1) != IGNORE_INDEX
+        return shift_teacher.view(-1, shift_teacher.size(-1))[teacher_flat_mask]
+
+    def _get_kl_loss_for_parts(self, model, inputs, parts_key, ts_key, flat_teacher_raw):
+        """One student forward + masked KL loss for a given compression_parts key.
+        Returns (kl_loss, outputs) or (None, None) if the key is absent/empty.
+        """
+        parts = inputs.get(parts_key, [])
+        ts = inputs.get(ts_key, [])
+        if not parts:
+            return None, None
+        s_logits, comp_labels, outs = self._student_forward(model, inputs, parts, ts)
+        flat_t = flat_teacher_raw.to(s_logits.device, dtype=s_logits.dtype)
+        shift_s = s_logits[..., :-1, :].contiguous()
+        shift_lbl = comp_labels[..., 1:].contiguous()
+        mask = shift_lbl.view(-1) != IGNORE_INDEX
+        flat_s = shift_s.view(-1, shift_s.size(-1))[mask]
+        return self._kl_from_flat(flat_s, flat_t, self.kl_temperature, parts_key), outs
+
+    def _reset_ds_reduction_tracking(self):
+        """Reset DeepSpeed ZeRO stage-1/2 per-backward-pass reduction tracking.
+
+        DeepSpeed asserts that each parameter is reduced at most once per backward()
+        call. When we do two separate backward() calls within a single training step
+        we must reset this tracking between them so the second pass can proceed.
+        """
+        ds_opt = getattr(getattr(self, "deepspeed", None), "optimizer", None)
+        if ds_opt is None:
+            ds_opt = getattr(self, "optimizer", None)
+        if ds_opt is not None and hasattr(ds_opt, "params_already_reduced"):
+            ds_opt.params_already_reduced = [False] * len(ds_opt.params_already_reduced)
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        has_partial = bool(inputs.get("compression_parts"))
+        has_full = bool(inputs.get("compression_parts_full"))
+
+        # Single loss term: standard HF Trainer path, no double-reduce risk.
+        if not (has_partial and has_full):
+            return super().training_step(model, inputs, num_items_in_batch)
+
+        # Both partial and full losses requested.
+        # Combining them into one loss tensor and calling backward() once would cause
+        # DeepSpeed ZeRO to see the gradient hook fire twice for every shared parameter
+        # ("parameter already reduced" assertion).  Instead we do two separate
+        # forward+backward passes:
+        #   pass 1 — inside no_sync: accumulate gradients locally, no AllReduce.
+        #   reset DeepSpeed's per-step reduction tracking.
+        #   pass 2 — normal: accumulate more gradients, then AllReduce the combined
+        #             gradient (for the last gradient-accumulation boundary step).
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+        is_kl_mode = self.teacher_model is not None or "teacher_logits" in inputs
+
+        if is_kl_mode:
+            flat_teacher_raw = self._get_flat_teacher_logits(inputs)
+
+            with self.compute_loss_context_manager():
+                loss_p, _ = self._get_kl_loss_for_parts(
+                    model, inputs,
+                    "compression_parts", "compression_ts_info",
+                    flat_teacher_raw,
+                )
+            loss_p = self.partial_loss_weight * loss_p
+
+            with self.accelerator.no_sync(model):
+                self.accelerator.backward(loss_p)
+            self._reset_ds_reduction_tracking()
+
+            with self.compute_loss_context_manager():
+                loss_f, _ = self._get_kl_loss_for_parts(
+                    model, inputs,
+                    "compression_parts_full", "compression_ts_info_full",
+                    flat_teacher_raw,
+                )
+            loss_f = self.full_loss_weight * loss_f
+
+            self.accelerator.backward(loss_f)
+        else:
+            with self.compute_loss_context_manager():
+                l_p, _ = self._ce_forward(
+                    model, inputs,
+                    inputs.get("compression_parts", []),
+                    inputs.get("compression_ts_info", []),
+                )
+            loss_p = self.partial_loss_weight * l_p
+
+            with self.accelerator.no_sync(model):
+                self.accelerator.backward(loss_p)
+            self._reset_ds_reduction_tracking()
+
+            with self.compute_loss_context_manager():
+                l_f, _ = self._ce_forward(
+                    model, inputs,
+                    inputs.get("compression_parts_full", []),
+                    inputs.get("compression_ts_info_full", []),
+                )
+            loss_f = self.full_loss_weight * l_f
+
+            self.accelerator.backward(loss_f)
+
+        return (loss_p + loss_f).detach() / self.args.gradient_accumulation_steps
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         is_kl_mode = self.teacher_model is not None or "teacher_logits" in inputs
 
@@ -313,79 +435,38 @@ class VideoLLaMA3Trainer(Trainer):
             outputs = None
             if parts:
                 l_partial, outs_partial = self._ce_forward(model, inputs, parts, ts)
-                loss = l_partial
+                loss = self.partial_loss_weight * l_partial
                 outputs = outs_partial
             if parts_full:
                 l_full, outs_full = self._ce_forward(model, inputs, parts_full, ts_full)
-                loss = l_full if loss is None else loss + l_full
+                weighted_full = self.full_loss_weight * l_full
+                loss = weighted_full if loss is None else loss + weighted_full
                 if outputs is None:
                     outputs = outs_full
 
             return (loss, outputs) if return_outputs else loss
 
-        # Save original (uncompressed) labels before student forward. Live teacher
-        # needs these because it processes the full uncompressed sequence.
-        original_labels = inputs.get("labels")
-        T_kl = self.kl_temperature
+        # KL path: get teacher logits once, then run student forwards.
+        flat_teacher_raw = self._get_flat_teacher_logits(inputs)
 
-        # --- 1. Obtain flat teacher logits (computed once, shared by both forwards) ---
-        if "teacher_logits" in inputs:
-            # Cached path: rows correspond to each token emitted by
-            # teacher.generate(); shape [N_generated, V_teacher].
-            flat_teacher_raw = inputs["teacher_logits"]
-        else:
-            # Live teacher path: standard shift against the uncompressed sequence.
-            with torch.no_grad():
-                teacher_inputs = {
-                    k: v for k, v in inputs.items()
-                    if k not in (
-                        "compression_parts", "compression_ts_info",
-                        "compression_parts_full", "compression_ts_info_full",
-                        "teacher_logits",
-                    )
-                }
-                teacher_outputs = self.teacher_model(**teacher_inputs)
-                teacher_logits_full = teacher_outputs.logits  # [B, T_original, V_teacher]
-            shift_teacher = teacher_logits_full[..., :-1, :].contiguous()
-            shift_teacher_labels = original_labels[..., 1:].contiguous()
-            teacher_flat_mask = shift_teacher_labels.view(-1) != IGNORE_INDEX
-            flat_teacher_raw = shift_teacher.view(-1, shift_teacher.size(-1))[teacher_flat_mask]
+        loss_p, outs_p = self._get_kl_loss_for_parts(
+            model, inputs, "compression_parts", "compression_ts_info", flat_teacher_raw,
+        )
+        loss_f, outs_f = self._get_kl_loss_for_parts(
+            model, inputs, "compression_parts_full", "compression_ts_info_full", flat_teacher_raw,
+        )
 
-        # --- 2. Helper: one student forward → flat masked logits ---
-        def _flat_student(parts_key, ts_key):
-            parts = inputs.get(parts_key, [])
-            ts = inputs.get(ts_key, [])
-            if not parts:
-                return None, None, None
-            s_logits, comp_labels, outs = self._student_forward(model, inputs, parts, ts)
-            flat_t = flat_teacher_raw.to(s_logits.device, dtype=s_logits.dtype)
-            shift_s = s_logits[..., :-1, :].contiguous()
-            shift_lbl = comp_labels[..., 1:].contiguous()
-            mask = shift_lbl.view(-1) != IGNORE_INDEX
-            flat_s = shift_s.view(-1, shift_s.size(-1))[mask]
-            return flat_s, flat_t, outs
-
-        # --- 3. Partial compression forward ---
-        result_partial = _flat_student("compression_parts", "compression_ts_info")
-        flat_s_partial, flat_t_partial, outputs_partial = result_partial
-
-        # --- 4. Full compression forward ---
-        result_full = _flat_student("compression_parts_full", "compression_ts_info_full")
-        flat_s_full, flat_t_full, outputs_full = result_full
-
-        # --- 5. Sum KL losses ---
         loss = None
-        if flat_s_partial is not None:
-            loss_partial = self._kl_from_flat(flat_s_partial, flat_t_partial, T_kl, "partial")
-            loss = loss_partial
-        if flat_s_full is not None:
-            loss_full = self._kl_from_flat(flat_s_full, flat_t_full, T_kl, "full")
-            loss = loss_full if loss is None else loss + loss_full
+        if loss_p is not None:
+            loss = self.partial_loss_weight * loss_p
+        if loss_f is not None:
+            weighted = self.full_loss_weight * loss_f
+            loss = weighted if loss is None else loss + weighted
 
         if loss is None:
-            raise RuntimeError("Both partial and full compression_parts are empty — cannot compute KL loss.")
+            raise RuntimeError("Both compression_parts are empty — cannot compute KL loss.")
 
-        outputs = outputs_partial if outputs_partial is not None else outputs_full
+        outputs = outs_p if outs_p is not None else outs_f
         return (loss, outputs) if return_outputs else loss
 
     def _get_train_sampler(self, dataset: Optional[torch.utils.data.Dataset] = None) -> Optional[torch.utils.data.Sampler]:
