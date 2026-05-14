@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 from transformers.generation.utils import GenerateOutput
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -287,7 +288,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                     seq_len = hidden_states.shape[1]
                     llm_loss_value = loss.detach().float().item()
                     label_str = f" [{_debug_label}]" if _debug_label else ""
-                    print(f"seq_len={seq_len} llm_loss={llm_loss_value:.6f}{label_str}")
+                    tqdm.write(f"seq_len={seq_len} llm_loss={llm_loss_value:.6f}{label_str}")
 
         else:
             # skip_ce_loss=True (KL path) or no labels: compute full-sequence logits.

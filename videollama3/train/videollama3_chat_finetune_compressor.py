@@ -227,8 +227,8 @@ class TrainingArguments(transformers.TrainingArguments):
     use_kl_loss: bool = field(default=False, metadata={"help": "Use KL divergence loss against a frozen teacher model instead of cross-entropy."})
     kl_temperature: float = field(default=1.0, metadata={"help": "Softmax temperature for KL divergence. Higher values produce softer distributions."})
     # Dual-forward loss weights
-    partial_loss_weight: float = field(default=1.0, metadata={"help": "Weight applied to the partial-compression loss term."})
-    full_loss_weight: float = field(default=1.0, metadata={"help": "Weight applied to the full-compression loss term."})
+    partial_loss_weight: float = field(default=0.5, metadata={"help": "Weight applied to the partial-compression loss term."})
+    full_loss_weight: float = field(default=0.5, metadata={"help": "Weight applied to the full-compression loss term."})
     step_infer_enabled: bool = field(
         default=True,
         metadata={"help": "Run a random train-sample inference at every step end on rank 0."},
