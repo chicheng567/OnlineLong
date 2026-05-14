@@ -1,7 +1,7 @@
 """
 Ad-hoc inference script for the compressor model.
 
-Supports two ways to specify which frame windows to compress:
+Supports three ways to specify which frame windows to compress:
 
   --compression_ratio 0.5 --compression_window_size 10
       Auto-selects non-overlapping windows via select_compression_parts().
@@ -10,7 +10,12 @@ Supports two ways to specify which frame windows to compress:
       Manually specify frame windows (inclusive, 0-indexed).
       Multiple windows separated by commas, each as "start-end".
 
-If neither is given, runs without compression (plain video QA).
+  --compress_all [--compression_window_size 10]
+      Compress the entire video. Frames are divided into consecutive
+      non-overlapping windows of --compression_window_size. Leftover
+      frames form an extra window only if remainder > 3, otherwise discarded.
+
+If none of the above is given, runs without compression (plain video QA).
 
 Usage examples:
   python test_compressor_inference.py \
@@ -24,6 +29,12 @@ Usage examples:
       --video_path /path/to/video.mp4 \
       --prompt "What happens between frame 0 and 9?" \
       --compress_windows "0-9"
+
+  python test_compressor_inference.py \
+      --model_path pretrained_models/compressor_videollama3 \
+      --video_path /path/to/video.mp4 \
+      --prompt "Summarize the video." \
+      --compress_all --compression_window_size 10
 """
 
 import argparse
@@ -35,7 +46,7 @@ from videollama3.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from videollama3.mm_utils import load_video
 from videollama3.model import Videollama3Qwen2ForCausalLM
 from videollama3.model.processor import Videollama3Processor
-from videollama3.train.videollama3_chat_finetune_compressor import select_compression_parts
+from videollama3.train.videollama3_chat_finetune_compressor import select_compression_parts, select_full_compression_parts
 
 
 def parse_args():
@@ -65,11 +76,18 @@ def parse_args():
         default=None,
         help='Manual frame windows to compress, e.g. "0-9,30-39" (inclusive, 0-indexed).',
     )
+    comp.add_argument(
+        "--compress_all",
+        action="store_true",
+        default=False,
+        help="Compress the entire video using consecutive non-overlapping windows of "
+             "--compression_window_size. Leftover frames (> 3) form one extra window.",
+    )
     p.add_argument(
         "--compression_window_size",
         type=int,
         default=10,
-        help="Window size (frames) used with --compression_ratio.",
+        help="Window size (frames) used with --compression_ratio or --compress_all.",
     )
     return p.parse_args()
 
@@ -90,6 +108,18 @@ def build_compression_parts_auto(
         rng=rng,
     )
     return parts
+
+
+def build_compression_parts_full(
+    total_frames: int,
+    total_vision_tokens: int,
+    window_size: int,
+) -> list:
+    return select_full_compression_parts(
+        total_frames=total_frames,
+        total_vision_tokens=total_vision_tokens,
+        window_size=window_size,
+    )
 
 
 def build_compression_parts_manual(
@@ -181,6 +211,13 @@ def main():
             total_vision_tokens=total_vision_tokens,
         )
         print(f"Manual compression_parts ({len(compression_parts)} windows): {compression_parts}")
+    elif args.compress_all:
+        compression_parts = build_compression_parts_full(
+            total_frames=num_frames,
+            total_vision_tokens=total_vision_tokens,
+            window_size=args.compression_window_size,
+        )
+        print(f"Full compression_parts ({len(compression_parts)} windows): {compression_parts}")
     else:
         print("No compression specified — running plain video inference.")
 
