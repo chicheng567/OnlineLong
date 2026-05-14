@@ -362,6 +362,17 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
                 # NOTE: data_dict["pixel_values"].shape[0] will be 4 times than total_vision token because of 4x4 merging.
                 total_vision_tokens = int((data_dict["input_ids"] == image_token_id).sum().item())
                 total_frames = len(images[0])
+                if total_frames < self.compression_window_size:
+                    # Too few frames to form even one compression window; retry with a different sample
+                    # to ensure every batch has valid compression_parts on every rank. Mixed
+                    # compression/no-compression paths between ranks cause NCCL AllReduce desync
+                    # when DeepSpeed overlap_comm fires during backward.
+                    backup_idx = random.randint(0, len(self.list_data_dict) - 1)
+                    logger.debug(
+                        "Sample %s has only %d frames (< window_size %d); retrying with sample %s.",
+                        i, total_frames, self.compression_window_size, backup_idx,
+                    )
+                    return self.__getitem__(backup_idx)
                 compression_part = select_compression_parts(
                     total_frames=total_frames,
                     total_vision_tokens=total_vision_tokens,
