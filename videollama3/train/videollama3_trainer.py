@@ -232,7 +232,7 @@ class VideoLLaMA3Trainer(Trainer):
         self.partial_loss_weight = partial_loss_weight
         self.full_loss_weight = full_loss_weight
 
-    def _ce_forward(self, model, base_inputs, compression_parts, compression_ts_info):
+    def _ce_forward(self, model, base_inputs, compression_parts, compression_ts_info, label=""):
         """Run one student forward (CE mode) with the given compression_parts.
 
         Returns (ce_loss, outputs).
@@ -247,6 +247,8 @@ class VideoLLaMA3Trainer(Trainer):
         }
         fwd["compression_parts"] = compression_parts
         fwd["compression_ts_info"] = compression_ts_info
+        if label:
+            fwd["_debug_label"] = label
         outputs = model(**fwd)
         return outputs.loss, outputs
 
@@ -351,15 +353,23 @@ class VideoLLaMA3Trainer(Trainer):
             loss = None
             outputs = None
             if parts:
-                l_partial, outs_partial = self._ce_forward(model, inputs, parts, ts)
+                l_partial, outs_partial = self._ce_forward(model, inputs, parts, ts, label="partial")
                 loss = self.partial_loss_weight * l_partial
                 outputs = outs_partial
             if parts_full:
-                l_full, outs_full = self._ce_forward(model, inputs, parts_full, ts_full)
+                l_full, outs_full = self._ce_forward(model, inputs, parts_full, ts_full, label="full")
                 weighted_full = self.full_loss_weight * l_full
                 loss = weighted_full if loss is None else loss + weighted_full
                 if outputs is None:
                     outputs = outs_full
+
+            log_dict = {}
+            if parts:
+                log_dict["loss_partial"] = (self.partial_loss_weight * l_partial).detach().item()
+            if parts_full:
+                log_dict["loss_full"] = (self.full_loss_weight * l_full).detach().item()
+            if log_dict:
+                self.log(log_dict)
 
             return (loss, outputs) if return_outputs else loss
 
@@ -382,6 +392,14 @@ class VideoLLaMA3Trainer(Trainer):
 
         if loss is None:
             raise RuntimeError("Both compression_parts are empty — cannot compute KL loss.")
+
+        log_dict = {}
+        if loss_p is not None:
+            log_dict["loss_partial"] = (self.partial_loss_weight * loss_p).detach().item()
+        if loss_f is not None:
+            log_dict["loss_full"] = (self.full_loss_weight * loss_f).detach().item()
+        if log_dict:
+            self.log(log_dict)
 
         outputs = outs_p if outs_p is not None else outs_f
         return (loss, outputs) if return_outputs else loss
