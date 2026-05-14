@@ -38,6 +38,8 @@ from videollama3.train.videollama3_chat_finetune_online import (  # noqa: E402
 )
 from videollama3.train.videollama3_trainer import VideoLLaMA3Trainer  # noqa: E402
 from functools import partial
+
+logger = logging.getLogger(__name__)
 torch.load = partial(torch.load, weights_only=False)
 try:
     from deepspeed.runtime.fp16.loss_scaler import LossScaler
@@ -368,7 +370,7 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
                     # compression/no-compression paths between ranks cause NCCL AllReduce desync
                     # when DeepSpeed overlap_comm fires during backward.
                     backup_idx = random.randint(0, len(self.list_data_dict) - 1)
-                    logger.debug(
+                    logger.warning(
                         "Sample %s has only %d frames (< window_size %d); retrying with sample %s.",
                         i, total_frames, self.compression_window_size, backup_idx,
                     )
