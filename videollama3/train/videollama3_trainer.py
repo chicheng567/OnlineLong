@@ -232,7 +232,7 @@ class VideoLLaMA3Trainer(Trainer):
         self.partial_loss_weight = partial_loss_weight
         self.full_loss_weight = full_loss_weight
 
-    def _ce_forward(self, model, base_inputs, compression_parts, compression_ts_info, label=""):
+    def _ce_forward(self, model, base_inputs, compression_parts, compression_ts_info, label="", num_items_in_batch=None):
         """Run one student forward (CE mode) with the given compression_parts.
 
         Returns (ce_loss, outputs).
@@ -249,6 +249,10 @@ class VideoLLaMA3Trainer(Trainer):
         fwd["compression_ts_info"] = compression_ts_info
         if label:
             fwd["_debug_label"] = label
+        # Pass num_items_in_batch so the model uses sum/N_total reduction instead of mean,
+        # which is required when model_accepts_loss_kwargs=True (HF won't divide by GAS).
+        if num_items_in_batch is not None:
+            fwd["num_items_in_batch"] = num_items_in_batch
         outputs = model(**fwd)
         return outputs.loss, outputs
 
@@ -338,9 +342,13 @@ class VideoLLaMA3Trainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         is_kl_mode = self.teacher_model is not None or "teacher_logits" in inputs
+        # HF passes num_items_in_batch (total non-IGNORE tokens across all GAS micro-batches)
+        # when model_accepts_loss_kwargs=True. Forward it to _ce_forward so the model uses
+        # sum/N_total reduction instead of mean — critical for correct GAS normalisation.
+        num_items_in_batch = kwargs.get("num_items_in_batch")
 
         if not is_kl_mode:
-            # CE path: run partial + full compression forwards, sum CE losses.
+            # CE path: run partial + full compression forwards, average CE losses.
             parts = inputs.get("compression_parts", [])
             ts = inputs.get("compression_ts_info", [])
             parts_full = inputs.get("compression_parts_full", [])
@@ -353,11 +361,11 @@ class VideoLLaMA3Trainer(Trainer):
             loss = None
             outputs = None
             if parts:
-                l_partial, outs_partial = self._ce_forward(model, inputs, parts, ts, label="partial")
+                l_partial, outs_partial = self._ce_forward(model, inputs, parts, ts, label="partial", num_items_in_batch=num_items_in_batch)
                 loss = self.partial_loss_weight * l_partial
                 outputs = outs_partial
             if parts_full:
-                l_full, outs_full = self._ce_forward(model, inputs, parts_full, ts_full, label="full")
+                l_full, outs_full = self._ce_forward(model, inputs, parts_full, ts_full, label="full", num_items_in_batch=num_items_in_batch)
                 weighted_full = self.full_loss_weight * l_full
                 loss = weighted_full if loss is None else loss + weighted_full
                 if outputs is None:
