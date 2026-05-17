@@ -639,6 +639,15 @@ def train(attn_implementation=None):
     new_vocabulary_size = len(tokenizer)
     if new_tokens > 0:
         model.resize_token_embeddings(len(tokenizer))
+        # resize_token_embeddings allocates NEW nn.Parameter tensors (requires_grad=True by
+        # default) for embed_tokens and lm_head, bypassing the _set_module_trainable calls
+        # above.  With ZeRO-2 gradient partitioning these "rogue" requires_grad parameters
+        # are swept into the AllReduce buckets but have no corresponding optimizer state,
+        # corrupting the compressor gradient communication and causing NaN at step 2.
+        if not llm_trainable:
+            _set_module_trainable(model.get_input_embeddings(), False)
+            if model.get_output_embeddings() is not None:
+                _set_module_trainable(model.get_output_embeddings(), False)
     model.config.image_token_index = tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
     model.config.compression_start_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_START_TOKEN)
     model.config.compression_end_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_END_TOKEN)

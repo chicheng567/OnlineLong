@@ -4,7 +4,18 @@ from transformers.activations import GELUTanh
 from torch import nn
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from .videollama3_encoder.modeling_videollama3_encoder import VisionRotaryEmbedding, apply_rotary_pos_emb_vision
-from torch.nn import functional as F 
+from torch.nn import functional as F
+
+
+def _build_2d_rotary_pos_emb(rotary_pos_emb_module, w, h):
+    device = rotary_pos_emb_module.inv_freq.device
+    hpos_ids = torch.arange(h, device=device).unsqueeze(1).expand(-1, w).reshape(-1)
+    wpos_ids = torch.arange(w, device=device).unsqueeze(0).expand(h, -1).reshape(-1)
+    pos_ids = torch.stack([hpos_ids, wpos_ids], dim=-1)
+    rotary_pos_emb_full = rotary_pos_emb_module(max(h, w))
+    return rotary_pos_emb_full[pos_ids].flatten(1)
+
+
 class mlp(nn.Module):
     def __init__(self, hidden_size, intermediate_size):
         super().__init__()
@@ -153,14 +164,7 @@ class TransformerDecoderCompressor(nn.Module):
         self.compression_decoder = None
 
     def _build_query_rotary_pos_emb(self, w, h) -> torch.Tensor:
-        # Keep the same indexing style as vision encoder: build (x, y), then flatten.
-        device = self.rotary_pos_emb.inv_freq.device
-        hpos_ids = torch.arange(h, device=device).unsqueeze(1).expand(-1, w).reshape(-1)
-        wpos_ids = torch.arange(w, device=device).unsqueeze(0).expand(h, -1).reshape(-1)
-        pos_ids = torch.stack([hpos_ids, wpos_ids], dim=-1)
-        max_grid_size = max(h, w)
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        return rotary_pos_emb_full[pos_ids].flatten(1)
+        return _build_2d_rotary_pos_emb(self.rotary_pos_emb, w, h)
 
     def forward(self, kv, compression_cu_seqlens):
         # kv: (1, total_tokens, hidden_size)
@@ -191,7 +195,147 @@ class TransformerDecoderCompressor(nn.Module):
         decoded_tokens = self.compression_decoder(compressed_tokens)
         decoded_tokens = decoded_tokens.view(-1, self.hidden_size)
         return decoded_tokens
-    
+
+
+# ---------------------------------------------------------------------------
+# LocalAttnConvCompressor
+#
+# Each query corresponds to one spatial position (i, j) in the output grid.
+# compress_image_w × compress_image_h == patches per frame.
+# Each compression window must contain exactly T × compress_image_wh tokens
+# (T frames in frame-major order), so this compressor performs pure *temporal*
+# compression while preserving spatial resolution.
+#
+# Layer order per transformer block:
+#   1. Local cross-attention  (query p attends only to the T tokens at position p)
+#   2. Spatial self-attention (all H×W queries within a window communicate)
+#   3. MLP
+# All sub-layers use pre-norm + residual connection.
+# ---------------------------------------------------------------------------
+
+class LocalAttnConvLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.cross_attn = CrossFlashAttention2(
+            embed_dim=config.hidden_size,
+            n_head=config.num_attention_heads,
+            dropout=config.attention_probs_dropout_prob,
+            causal=False,
+        )
+        # Spatial self-attention over the output query grid — no causal ordering.
+        self.self_attn = selfFlashAttention(
+            embed_dim=config.hidden_size,
+            n_head=config.num_attention_heads,
+            dropout=config.attention_probs_dropout_prob,
+            causal=False,
+        )
+        self.embed_dim = config.hidden_size
+        self.layer_norm1 = LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self.layer_norm2 = LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self.layer_norm3 = LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self.mlp = mlp(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size)
+
+    def forward(self, q, kv_local, cu_seqlens_q_local, cu_seqlens_kv_local, cu_seqlens_q_self, rotary_pos_emb):
+        # 1. Local cross-attention: query at position p sees only position p's T frame tokens.
+        q = q + self.cross_attn(self.layer_norm1(q), kv_local, cu_seqlens_q_local, cu_seqlens_kv_local)
+        # 2. Spatial self-attention: queries within a window exchange spatial context.
+        q = q + self.self_attn(self.layer_norm2(q), cu_seqlens_q_self, rotary_pos_emb)
+        # 3. MLP.
+        q = q + self.mlp(self.layer_norm3(q))
+        return q
+
+
+class LocalAttnConvCompressor(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        num_layers = config.num_layers
+        head_dim = config.hidden_size // config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = head_dim
+        self.num_head = config.num_attention_heads
+        self.rotary_pos_emb = VisionRotaryEmbedding(dim=head_dim // 2)
+        self.layers = nn.ModuleList([LocalAttnConvLayer(config) for _ in range(num_layers)])
+        self.num_layers = num_layers
+        self.compress_image_w = config.compress_image_w
+        self.compress_image_h = config.compress_image_h
+        self.compress_image_wh = self.compress_image_w * self.compress_image_h
+        # One learned query initialiser per spatial position; shared across windows and batch.
+        self.query = nn.Parameter(torch.randn(1, self.compress_image_wh, config.hidden_size))
+        self.window_size = getattr(config, "window_size", 1)
+        self.compression_decoder = None
+
+    def _build_query_rotary_pos_emb(self, w, h) -> torch.Tensor:
+        return _build_2d_rotary_pos_emb(self.rotary_pos_emb, w, h)
+
+    def forward(self, kv, compression_cu_seqlens):
+        # kv: (total_tokens, hidden_size) or (1, total_tokens, hidden_size)
+        # Each window i spans kv[compression_cu_seqlens[i] : compression_cu_seqlens[i+1]]
+        # and must contain exactly T_i * compress_image_wh tokens (frame-major order).
+        if kv.dim() == 3:
+            kv = kv.squeeze(0)
+
+        device = kv.device
+        compression_cu_seqlens = compression_cu_seqlens.to(device=device, dtype=torch.int32)
+        B = compression_cu_seqlens.size(0) - 1
+        HW = self.compress_image_wh
+
+        # Queries: (B * HW, hidden_size)
+        query = self.query.expand(B, -1, -1).contiguous().view(-1, self.hidden_size)
+
+        # Validate and derive number of frames per window.
+        window_lens = (compression_cu_seqlens[1:] - compression_cu_seqlens[:-1]).long()
+        assert (window_lens % HW == 0).all(), (
+            f"LocalAttnConvCompressor: token count per window must be divisible by "
+            f"spatial grid size HW={HW}. Got window lengths: {window_lens.tolist()}"
+        )
+        T_per_window = window_lens // HW  # (B,)
+
+        # Rearrange each window's KV from frame-major to spatial-major layout so that
+        # position p's T tokens are contiguous:
+        #   input  window i: [frame0_p0, frame0_p1, ..., frame0_pHW-1, frame1_p0, ...]
+        #   output window i: [p0_f0..fT, p1_f0..fT, ..., pHW-1_f0..fT]
+        kv_local_parts = []
+        for i in range(B):
+            s = compression_cu_seqlens[i].item()
+            e = compression_cu_seqlens[i + 1].item()
+            T_i = T_per_window[i].item()
+            kv_i = kv[s:e].view(T_i, HW, self.hidden_size).permute(1, 0, 2).reshape(-1, self.hidden_size)
+            kv_local_parts.append(kv_i)
+        kv_local = torch.cat(kv_local_parts, dim=0)  # (sum_i(T_i * HW), hidden_size)
+
+        # cu_seqlens for local cross-attention
+        #   Q side: every query is its own single-token group → [0, 1, 2, ..., B*HW]
+        #   K side: group (i*HW + j) corresponds to window i, position j → T_i tokens
+        cu_seqlens_q_local = torch.arange(0, B * HW + 1, device=device, dtype=torch.int32)
+        T_repeated = T_per_window.to(device=device, dtype=torch.int32).repeat_interleave(HW)  # (B*HW,)
+        cu_seqlens_kv_local = torch.cat([
+            torch.zeros(1, device=device, dtype=torch.int32),
+            T_repeated.cumsum(0),
+        ])
+
+        # cu_seqlens for spatial self-attention: window i owns queries [i*HW, (i+1)*HW)
+        cu_seqlens_q_self = torch.arange(0, (B + 1) * HW, step=HW, device=device, dtype=torch.int32)
+
+        rotary_pos_emb = self._build_query_rotary_pos_emb(self.compress_image_w, self.compress_image_h)
+
+        for layer in self.layers:
+            query = layer(query, kv_local, cu_seqlens_q_local, cu_seqlens_kv_local, cu_seqlens_q_self, rotary_pos_emb)
+
+        return query
+
+    def decode_tokens(self, compressed_tokens: torch.Tensor) -> torch.Tensor:
+        assert self.compression_decoder is not None, "compression_decoder is not defined, cannot decode tokens."
+        if compressed_tokens.dim() == 2:
+            compressed_tokens = compressed_tokens.view(-1, 1, self.compress_image_w, self.compress_image_h, self.hidden_size)
+            compressed_tokens = compressed_tokens.permute(0, 4, 1, 2, 3).contiguous()
+        assert compressed_tokens.dim() == 5, (
+            f"Expected compressed_tokens with 5 dims (B, hidden_size, T, w, h), got {compressed_tokens.shape}"
+        )
+        decoded_tokens = self.compression_decoder(compressed_tokens)
+        decoded_tokens = decoded_tokens.view(-1, self.hidden_size)
+        return decoded_tokens
+
+
 from transformers import PretrainedConfig
 
 class Videollama3TokenCompressorConfig(PretrainedConfig):
@@ -246,6 +390,10 @@ def build_token_compressor(config):
         if "num_attention_heads" not in compressor:
             compressor["num_attention_heads"] = config.num_attention_heads
         compressor = Videollama3TokenCompressorConfig(**compressor)
-    if isinstance(compressor, Videollama3TokenCompressorConfig) and "transformer_decoder" in compressor.compressor_type:
-        return TransformerDecoderCompressor(config=compressor)
+    if isinstance(compressor, Videollama3TokenCompressorConfig):
+        ct = compressor.compressor_type
+        if "transformer_decoder" in ct:
+            return TransformerDecoderCompressor(config=compressor)
+        if ct == "local_attn_conv":
+            return LocalAttnConvCompressor(config=compressor)
     raise ValueError(f"Unknown token compressor type: {getattr(compressor, 'compressor_type', None)}")
