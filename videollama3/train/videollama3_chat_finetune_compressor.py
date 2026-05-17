@@ -1,4 +1,3 @@
-import copy
 from dataclasses import dataclass, field
 import json
 import logging
@@ -11,7 +10,7 @@ import warnings
 import torch
 import transformers
 from packaging import version
-from transformers import AutoProcessor, AutoModelForCausalLM
+
 import torch.utils.data
 sys.path.append("./")
 
@@ -170,8 +169,6 @@ class ModelArguments:
     compressor_layer_norm_eps: float = field(default=1e-6)
     compress_image_w: int = field(default=16)
     compress_image_h: int = field(default=16)
-    # Teacher Model
-    teacher_model_path: Optional[str] = field(default=None, metadata={"help": "Path to pretrained teacher model for KL distillation. If set, use_kl_loss in TrainingArguments must also be True."})
 
 
 @dataclass
@@ -195,12 +192,6 @@ class DataArguments:
         default=0,
         metadata={"help": "Percentage of the train set used as validation set."},
     )
-    # Offline teacher GT cache (produced by dataset_util/precompute_teacher_gt.py)
-    teacher_cache_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Root directory of precomputed teacher GT (output_dir of precompute_teacher_gt.py). "
-                  "When set, teacher soft labels are loaded from disk instead of running a live teacher model."},
-    )
 
 
 @dataclass
@@ -223,12 +214,10 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
-    # KL distillation Arguments
-    use_kl_loss: bool = field(default=False, metadata={"help": "Use KL divergence loss against a frozen teacher model instead of cross-entropy."})
-    kl_temperature: float = field(default=1.0, metadata={"help": "Softmax temperature for KL divergence. Higher values produce softer distributions."})
     # Dual-forward loss weights
+    use_dual_forward: bool = field(default=True, metadata={"help": "Run both partial and full compression forwards and sum their CE losses."})
     partial_loss_weight: float = field(default=0.5, metadata={"help": "Weight applied to the partial-compression loss term."})
-    full_loss_weight: float = field(default=0.5, metadata={"help": "Weight applied to the full-compression loss term."})
+    full_loss_weight: float = field(default=0.5, metadata={"help": "Weight applied to the full-compression loss term (only used when use_dual_forward=True)."})
     step_infer_enabled: bool = field(
         default=True,
         metadata={"help": "Run a random train-sample inference at every step end on rank 0."},
@@ -243,100 +232,25 @@ class TrainingArguments(transformers.TrainingArguments):
     )
 
 
-def _build_teacher_cache_sample(raw_sample: Dict, teacher_text_gt) -> Dict:
-    """
-    Produce a sample whose conversations list is exactly `[user, assistant]`,
-    matching the structure the teacher saw during precompute: one user turn
-    with all original user text concatenated, one assistant turn populated
-    with the decoded teacher output.
-
-    The media tag (<video>/<image>) is preserved at the front of the user
-    text so _convert_normal attaches media to the user turn.
-    """
-    sample = copy.deepcopy(raw_sample)
-    original_convs = sample.get("conversations", [])
-
-    user_parts: List[str] = []
-    for c in original_convs:
-        role = c.get("from", c.get("role", ""))
-        if role in ("human", "user"):
-            text = c.get("value", c.get("content", ""))
-            if text is None:
-                continue
-            user_parts.append(str(text))
-
-    if user_parts:
-        combined = "\n".join(p.strip() for p in user_parts if p.strip())
-    else:
-        combined = ""
-
-    media_tag = None
-    if sample.get("video"):
-        media_tag = "<video>"
-    elif sample.get("image"):
-        media_tag = "<image>"
-
-    if media_tag is not None:
-        stripped = combined.replace("<video>", "").replace("<image>", "").strip()
-        combined = f"{media_tag}\n{stripped}" if stripped else f"{media_tag}\n"
-    elif not combined:
-        combined = "Describe this video."
-
-    if isinstance(teacher_text_gt, (list, tuple)):
-        assistant_text = str(teacher_text_gt[0]) if teacher_text_gt else ""
-    else:
-        assistant_text = str(teacher_text_gt)
-
-    sample["conversations"] = [
-        {"from": "human", "value": combined},
-        {"from": "gpt", "value": assistant_text},
-    ]
-    # Drop online-only fields so downstream code doesn't try to use them.
-    for k in ("stream", "all_image_files", "image_bboxes", "query_template", "need_reset_timestamp"):
-        sample.pop(k, None)
-    return sample
-
-
 class CompressorLazySupervisedDataset(LazySupervisedDataset):
-    def __init__(self, *args, compression_ratio: float = 0.3, compression_window_size: int = 3, teacher_cache_dir: Optional[str] = None, **kwargs):
+    def __init__(self, *args, compression_ratio: float = 0.3, compression_window_size: int = 3, **kwargs):
         super().__init__(*args, **kwargs)
         self.compression_ratio = compression_ratio
         self.compression_window_size = compression_window_size
-        self.teacher_cache_dir = teacher_cache_dir
         assert compression_window_size - 2 > 1, "Compression window size cannot be less than 3."
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         raw_sample = self.list_data_dict[i]
         try:
-            # If teacher cache is active and this sample has precomputed logits,
-            # synthesize a single user→assistant conversation matching exactly
-            # what the teacher precompute saw (all user text concatenated into
-            # one turn, assistant turn = decoded teacher output). This bypasses
-            # the online/stream conversation builders entirely so the student
-            # reads frames via the same load_video path the teacher used, and
-            # lets the processor label the assistant turn with token positions
-            # that line up one-to-one with the cached logits.
-            teacher_logits_path = raw_sample.get("teacher_logits_path")
-            teacher_text_gt = raw_sample.get("teacher_text_gt")
-            use_teacher_cache = (
-                self.teacher_cache_dir is not None
-                and teacher_logits_path is not None
-                and teacher_text_gt
-            )
-
-            if use_teacher_cache:
-                sample = _build_teacher_cache_sample(raw_sample, teacher_text_gt)
-                modal, images, messages, merge_size = self._convert_normal(sample)
+            sample = raw_sample
+            if self.online_mode:
+                modal, images, messages, merge_size = self._convert_online_video(sample)
             else:
-                sample = raw_sample
-                if self.online_mode:
-                    modal, images, messages, merge_size = self._convert_online_video(sample)
+                if "stream" in sample and sample["stream"]:
+                    raise NotImplementedError("Online stream data is not supported in compressor training yet.")
+                    modal, images, messages, merge_size = self._convert_stream(sample)
                 else:
-                    if "stream" in sample and sample["stream"]:
-                        raise NotImplementedError("Online stream data is not supported in compressor training yet.")
-                        modal, images, messages, merge_size = self._convert_stream(sample)
-                    else:
-                        modal, images, messages, merge_size = self._convert_normal(sample)
+                    modal, images, messages, merge_size = self._convert_normal(sample)
             assert modal == "video", "Compressor training currently only supports video data."
 
             # Extract per-frame timestamps from messages before passing to processor,
@@ -420,12 +334,6 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
             data_dict["compression_ts_info"] = _build_ts_info(compression_part)
             data_dict["compression_ts_info_full"] = _build_ts_info(compression_part_full)
 
-            if use_teacher_cache:
-                full_path = os.path.join(self.teacher_cache_dir, teacher_logits_path)
-                if os.path.exists(full_path):
-                    data_dict["teacher_logits"] = torch.load(full_path, map_location="cpu", weights_only=True)
-                else:
-                    warnings.warn(f"Teacher logits cache not found: {full_path}")
         except Exception:
             backup_idx = random.randint(0, len(self.list_data_dict) - 1)
             logger.exception("Failed to process sample %s. Fallback index: %s.", i, backup_idx)
@@ -436,8 +344,6 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
 @dataclass
 class DataCollatorWithCompressor:
     vlprocessor: transformers.ProcessorMixin
-    compression_ratio: float = 0.3
-    compression_window_size: int = 3
 
     def __call__(self, instances: Sequence[Dict], separator_id=-100) -> Dict[str, torch.Tensor]:
         # input_ids: List[torch.Tensor], labels: List[torch.Tensor]
@@ -497,11 +403,6 @@ class DataCollatorWithCompressor:
         batch["compression_parts_full"] = new_compression_parts_full
         batch["compression_ts_info_full"] = new_compression_ts_info_full
 
-        # Concatenate precomputed teacher soft labels if all instances have them.
-        # Shape after cat: [total_N_valid_tokens, vocab_size]
-        if all("teacher_logits" in x for x in instances):
-            batch["teacher_logits"] = torch.cat([x["teacher_logits"] for x in instances], dim=0)
-
         return batch
 
 
@@ -543,7 +444,6 @@ def make_compressor_data_module(vlprocessor: transformers.ProcessorMixin, data_a
                     prefix_captioning=dataset_cfg.get("prefix_captioning", False),
                     compression_ratio=data_args.compression_ratio,
                     compression_window_size=data_args.compression_window_size,
-                    teacher_cache_dir=data_args.teacher_cache_dir,
                 )
             )
         train_dataset = ConcatDatasetWithLengths(collected_datasets)
@@ -554,7 +454,6 @@ def make_compressor_data_module(vlprocessor: transformers.ProcessorMixin, data_a
             data_args=data_args,
             compression_ratio=data_args.compression_ratio,
             compression_window_size=data_args.compression_window_size,
-            teacher_cache_dir=data_args.teacher_cache_dir,
         )
     if data_args.validation_split_rate > 0:
         n_total = len(train_dataset)
@@ -566,11 +465,7 @@ def make_compressor_data_module(vlprocessor: transformers.ProcessorMixin, data_a
         train_dataset = SubsetWithLengths(train_dataset, indices[:n_train])
     else:
         eval_dataset = None
-    data_collator = DataCollatorWithCompressor(
-        vlprocessor=vlprocessor,
-        compression_ratio=data_args.compression_ratio,
-        compression_window_size=data_args.compression_window_size,
-    )
+    data_collator = DataCollatorWithCompressor(vlprocessor=vlprocessor)
     return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 
@@ -758,39 +653,16 @@ def train(attn_implementation=None):
     assert version.parse(transformers.__version__) >= version.parse("4.44.0")
     data_module = make_compressor_data_module(vlprocessor=vlprocessor, data_args=data_args)
 
-    # Load frozen teacher model for KL distillation
-    # Prefer cached teacher logits (teacher_cache_dir) over live teacher forward.
-    teacher_model = None
-    if training_args.use_kl_loss:
-        if data_args.teacher_cache_dir:
-            rank0_print(f"Using cached teacher distributions from {data_args.teacher_cache_dir}; skipping teacher model load.")
-        elif model_args.teacher_model_path:
-            rank0_print(f"Loading teacher model from {model_args.teacher_model_path} ...")
-            teacher_model = AutoModelForCausalLM.from_pretrained(
-                model_args.teacher_model_path,
-                attn_implementation="flash_attention_2",
-                torch_dtype=compute_dtype,
-                trust_remote_code=True,
-            )
-            teacher_model.eval()
-            for p in teacher_model.parameters():
-                p.requires_grad = False
-            teacher_model = teacher_model.to(training_args.device)
-            rank0_print("Teacher model loaded and frozen.")
-        else:
-            raise ValueError("use_kl_loss=True requires either teacher_cache_dir (preferred) or teacher_model_path.")
-
     trainer = VideoLLaMA3Trainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
-        teacher_model=teacher_model,
-        kl_temperature=training_args.kl_temperature,
+        use_dual_forward=training_args.use_dual_forward,
         partial_loss_weight=training_args.partial_loss_weight,
         full_loss_weight=training_args.full_loss_weight,
         **data_module,
     )
-        
+
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

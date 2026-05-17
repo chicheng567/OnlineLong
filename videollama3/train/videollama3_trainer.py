@@ -5,7 +5,6 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Sampler
 
 from transformers import Trainer
@@ -17,7 +16,6 @@ from transformers.trainer import (
     TRAINER_STATE_NAME,
 )
 from qwen2.modeling_qwen2 import Qwen2RMSNorm
-from videollama3.constants import IGNORE_INDEX
 ALL_LAYERNORM_LAYERS = (nn.LayerNorm, Qwen2RMSNorm)
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -225,10 +223,9 @@ class LengthGroupedSampler(Sampler):
 
 class VideoLLaMA3Trainer(Trainer):
 
-    def __init__(self, *args, teacher_model=None, kl_temperature=1.0, partial_loss_weight=1.0, full_loss_weight=1.0, **kwargs):
+    def __init__(self, *args, use_dual_forward=True, partial_loss_weight=1.0, full_loss_weight=1.0, **kwargs):
         super().__init__(*args, **kwargs)
-        self.teacher_model = teacher_model
-        self.kl_temperature = kl_temperature
+        self.use_dual_forward = use_dual_forward
         self.partial_loss_weight = partial_loss_weight
         self.full_loss_weight = full_loss_weight
 
@@ -240,7 +237,6 @@ class VideoLLaMA3Trainer(Trainer):
         fwd = {
             k: v for k, v in base_inputs.items()
             if k not in (
-                "teacher_logits",
                 "compression_parts", "compression_ts_info",
                 "compression_parts_full", "compression_ts_info_full",
             )
@@ -256,160 +252,44 @@ class VideoLLaMA3Trainer(Trainer):
         outputs = model(**fwd)
         return outputs.loss, outputs
 
-    def _kl_from_flat(self, flat_student, flat_teacher, T_kl, label):
-        """Compute KL(teacher || student) given pre-filtered flat logit tensors."""
-        n_common = min(flat_student.size(0), flat_teacher.size(0))
-        diff = abs(flat_student.size(0) - flat_teacher.size(0))
-        if diff > 0:
-            # A diff of 1 is expected when the teacher hit max_new_tokens without
-            # generating <|im_end|>. Warn only when the gap is suspiciously large.
-            log_fn = logger.warning if diff > 1 else logger.debug
-            log_fn(
-                f"Student/teacher token count mismatch in KL ({label}): "
-                f"student={flat_student.size(0)} teacher={flat_teacher.size(0)} "
-                f"— trimming to {n_common}."
-            )
-        flat_student = flat_student[:n_common]
-        flat_teacher = flat_teacher[:n_common]
-        # Align vocab size.
-        common_vocab = min(flat_teacher.size(-1), flat_student.size(-1))
-        flat_student = flat_student[..., :common_vocab]
-        flat_teacher = flat_teacher[..., :common_vocab]
-        student_log_probs = F.log_softmax(flat_student / T_kl, dim=-1)
-        teacher_probs = F.softmax(flat_teacher / T_kl, dim=-1)
-        return F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (T_kl ** 2)
-
-    def _student_forward(self, model, base_inputs, compression_parts, compression_ts_info):
-        """Run one student forward with the given compression_parts.
-
-        Returns (student_logits, compressed_labels, outputs).
-        """
-        fwd = {
-            k: v for k, v in base_inputs.items()
-            if k not in (
-                "teacher_logits",
-                "compression_parts", "compression_ts_info",
-                "compression_parts_full", "compression_ts_info_full",
-            )
-        }
-        fwd["compression_parts"] = compression_parts
-        fwd["compression_ts_info"] = compression_ts_info
-        fwd["skip_ce_loss"] = True
-        outputs = model(**fwd)
-        student_logits = outputs.logits
-        unwrapped = self.accelerator.unwrap_model(model) if hasattr(self, "accelerator") else model
-        compressed_labels = getattr(unwrapped, "_last_compressed_labels", None)
-        if compressed_labels is None:
-            compressed_labels = base_inputs.get("labels")
-        return student_logits, compressed_labels, outputs
-
-    def _get_flat_teacher_logits(self, inputs):
-        """Compute or retrieve flat masked teacher logits for KL distillation."""
-        if "teacher_logits" in inputs:
-            return inputs["teacher_logits"]
-        original_labels = inputs.get("labels")
-        with torch.no_grad():
-            teacher_inputs = {
-                k: v for k, v in inputs.items()
-                if k not in (
-                    "compression_parts", "compression_ts_info",
-                    "compression_parts_full", "compression_ts_info_full",
-                    "teacher_logits",
-                )
-            }
-            teacher_outputs = self.teacher_model(**teacher_inputs)
-            teacher_logits_full = teacher_outputs.logits
-        shift_teacher = teacher_logits_full[..., :-1, :].contiguous()
-        shift_teacher_labels = original_labels[..., 1:].contiguous()
-        teacher_flat_mask = shift_teacher_labels.view(-1) != IGNORE_INDEX
-        return shift_teacher.view(-1, shift_teacher.size(-1))[teacher_flat_mask]
-
-    def _get_kl_loss_for_parts(self, model, inputs, parts_key, ts_key, flat_teacher_raw):
-        """One student forward + masked KL loss for a given compression_parts key.
-        Returns (kl_loss, outputs) or (None, None) if the key is absent/empty.
-        """
-        parts = inputs.get(parts_key, [])
-        ts = inputs.get(ts_key, [])
-        if not parts:
-            return None, None
-        s_logits, comp_labels, outs = self._student_forward(model, inputs, parts, ts)
-        flat_t = flat_teacher_raw.to(s_logits.device, dtype=s_logits.dtype)
-        shift_s = s_logits[..., :-1, :].contiguous()
-        shift_lbl = comp_labels[..., 1:].contiguous()
-        mask = shift_lbl.view(-1) != IGNORE_INDEX
-        flat_s = shift_s.view(-1, shift_s.size(-1))[mask]
-        return self._kl_from_flat(flat_s, flat_t, self.kl_temperature, parts_key), outs
-
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        is_kl_mode = self.teacher_model is not None or "teacher_logits" in inputs
         # HF passes num_items_in_batch (total non-IGNORE tokens across all GAS micro-batches)
         # when model_accepts_loss_kwargs=True. Forward it to _ce_forward so the model uses
         # sum/N_total reduction instead of mean — critical for correct GAS normalisation.
         num_items_in_batch = kwargs.get("num_items_in_batch")
+        parts = inputs.get("compression_parts", [])
+        ts = inputs.get("compression_ts_info", [])
+        parts_full = inputs.get("compression_parts_full", [])
+        ts_full = inputs.get("compression_ts_info_full", [])
 
-        if not is_kl_mode:
-            # CE path: run partial + full compression forwards, average CE losses.
-            parts = inputs.get("compression_parts", [])
-            ts = inputs.get("compression_ts_info", [])
-            parts_full = inputs.get("compression_parts_full", [])
-            ts_full = inputs.get("compression_ts_info_full", [])
-
-            if not parts and not parts_full:
-                # No compression at all: fall back to standard HF CE.
-                return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
-
-            loss = None
-            outputs = None
-            if parts:
-                l_partial, outs_partial = self._ce_forward(model, inputs, parts, ts, label="partial", num_items_in_batch=num_items_in_batch)
-                loss = self.partial_loss_weight * l_partial
-                outputs = outs_partial
-            if parts_full:
-                l_full, outs_full = self._ce_forward(model, inputs, parts_full, ts_full, label="full", num_items_in_batch=num_items_in_batch)
-                weighted_full = self.full_loss_weight * l_full
-                loss = weighted_full if loss is None else loss + weighted_full
-                if outputs is None:
-                    outputs = outs_full
-
-            log_dict = {}
-            if parts:
-                log_dict["loss_partial"] = (self.partial_loss_weight * l_partial).detach().item()
-            if parts_full:
-                log_dict["loss_full"] = (self.full_loss_weight * l_full).detach().item()
-            if log_dict:
-                self.log(log_dict)
-
-            return (loss, outputs) if return_outputs else loss
-
-        # KL path: get teacher logits once, then run student forwards.
-        flat_teacher_raw = self._get_flat_teacher_logits(inputs)
-
-        loss_p, outs_p = self._get_kl_loss_for_parts(
-            model, inputs, "compression_parts", "compression_ts_info", flat_teacher_raw,
-        )
-        loss_f, outs_f = self._get_kl_loss_for_parts(
-            model, inputs, "compression_parts_full", "compression_ts_info_full", flat_teacher_raw,
-        )
+        if not parts and not parts_full:
+            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
 
         loss = None
-        if loss_p is not None:
-            loss = self.partial_loss_weight * loss_p
-        if loss_f is not None:
-            weighted = self.full_loss_weight * loss_f
-            loss = weighted if loss is None else loss + weighted
+        outputs = None
+        l_partial = None
+        l_full = None
 
-        if loss is None:
-            raise RuntimeError("Both compression_parts are empty — cannot compute KL loss.")
+        if parts:
+            l_partial, outs_partial = self._ce_forward(model, inputs, parts, ts, label="partial", num_items_in_batch=num_items_in_batch)
+            loss = self.partial_loss_weight * l_partial
+            outputs = outs_partial
+
+        if self.use_dual_forward and parts_full:
+            l_full, outs_full = self._ce_forward(model, inputs, parts_full, ts_full, label="full", num_items_in_batch=num_items_in_batch)
+            weighted_full = self.full_loss_weight * l_full
+            loss = weighted_full if loss is None else loss + weighted_full
+            if outputs is None:
+                outputs = outs_full
 
         log_dict = {}
-        if loss_p is not None:
-            log_dict["loss_partial"] = (self.partial_loss_weight * loss_p).detach().item()
-        if loss_f is not None:
-            log_dict["loss_full"] = (self.full_loss_weight * loss_f).detach().item()
+        if l_partial is not None:
+            log_dict["loss_partial"] = (self.partial_loss_weight * l_partial).detach().item()
+        if l_full is not None:
+            log_dict["loss_full"] = (self.full_loss_weight * l_full).detach().item()
         if log_dict:
             self.log(log_dict)
 
-        outputs = outs_p if outs_p is not None else outs_f
         return (loss, outputs) if return_outputs else loss
 
     def _get_train_sampler(self, dataset: Optional[torch.utils.data.Dataset] = None) -> Optional[torch.utils.data.Sampler]:
