@@ -1,3 +1,4 @@
+import bisect
 from dataclasses import dataclass, field
 import json
 import logging
@@ -425,7 +426,40 @@ class SubsetWithLengths(torch.utils.data.Subset):
         return self._modality_lengths
 
 
-def make_compressor_data_module(vlprocessor: transformers.ProcessorMixin, data_args: DataArguments) -> Dict:
+def _collect_val_video_paths(dataset, val_indices: List[int]) -> List[str]:
+    """Return the full video paths for the given global indices in dataset.
+
+    Handles both a single CompressorLazySupervisedDataset and a
+    ConcatDatasetWithLengths that wraps multiple sub-datasets.
+    """
+    paths: List[str] = []
+    for idx in val_indices:
+        if isinstance(dataset, torch.utils.data.ConcatDataset):
+            ds_idx = bisect.bisect_right(dataset.cumulative_sizes, idx)
+            local_idx = idx if ds_idx == 0 else idx - dataset.cumulative_sizes[ds_idx - 1]
+            sub_ds = dataset.datasets[ds_idx]
+        else:
+            sub_ds = dataset
+            local_idx = idx
+
+        sample = sub_ds.list_data_dict[local_idx]
+        video = sample.get("video")
+        if video is None:
+            continue
+        if isinstance(video, list):
+            video = video[0]
+
+        if sub_ds.online_mode:
+            root = sub_ds.dataset_root or ""
+        else:
+            root = getattr(sub_ds.data_args, "data_folder", None) or ""
+
+        full_path = os.path.join(root, video) if root else video
+        paths.append(full_path)
+    return paths
+
+
+def make_compressor_data_module(vlprocessor: transformers.ProcessorMixin, data_args: DataArguments, output_dir: Optional[str] = None) -> Dict:
     if data_args.multi_dataset:
         rank0_print("Use meta file to control datasets loading. Data path will use as meta path")
         ds_collection = dict()
@@ -461,8 +495,18 @@ def make_compressor_data_module(vlprocessor: transformers.ProcessorMixin, data_a
         n_train = n_total - n_val
         indices = list(range(n_total))
         random.shuffle(indices)
-        eval_dataset = SubsetWithLengths(train_dataset, indices[n_train:])
+        val_indices = indices[n_train:]
+        original_dataset = train_dataset
+        eval_dataset = SubsetWithLengths(train_dataset, val_indices)
         train_dataset = SubsetWithLengths(train_dataset, indices[:n_train])
+        if output_dir is not None and local_rank in (0, -1):
+            val_paths = _collect_val_video_paths(original_dataset, val_indices)
+            os.makedirs(output_dir, exist_ok=True)
+            out_path = os.path.join(output_dir, "val_video_paths.txt")
+            with open(out_path, "w") as f:
+                for p in val_paths:
+                    f.write(p + "\n")
+            rank0_print(f"[INFO] Val dataset video paths ({len(val_paths)}) saved to {out_path}")
     else:
         eval_dataset = None
     data_collator = DataCollatorWithCompressor(vlprocessor=vlprocessor)
@@ -660,7 +704,7 @@ def train(attn_implementation=None):
     assert data_args.use_batch_flattening, "Compressor training currently requires flattening mode (batch size 1 sequence)."
     assert model.config._attn_implementation == "flash_attention_2"
     assert version.parse(transformers.__version__) >= version.parse("4.44.0")
-    data_module = make_compressor_data_module(vlprocessor=vlprocessor, data_args=data_args)
+    data_module = make_compressor_data_module(vlprocessor=vlprocessor, data_args=data_args, output_dir=training_args.output_dir)
 
     trainer = VideoLLaMA3Trainer(
         model=model,
