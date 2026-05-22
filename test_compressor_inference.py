@@ -38,6 +38,8 @@ Usage examples:
 """
 
 import argparse
+import json
+import os
 import random
 
 import torch
@@ -46,6 +48,7 @@ from videollama3.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from videollama3.mm_utils import load_video
 from videollama3.model import Videollama3Qwen2ForCausalLM
 from videollama3.model.processor import Videollama3Processor
+from videollama3.model.videollama3_qwen2 import Videollama3Qwen2Config
 from videollama3.train.videollama3_chat_finetune_compressor import select_compression_parts, select_full_compression_parts
 
 
@@ -141,6 +144,61 @@ def build_compression_parts_manual(
     return parts
 
 
+def _load_model(model_path: str, dtype) -> Videollama3Qwen2ForCausalLM:
+    """Load a compressor model from either a full SFT checkpoint or a LoRA checkpoint."""
+    adapter_config_path = os.path.join(model_path, "adapter_config.json")
+    if not os.path.exists(adapter_config_path):
+        # Full SFT checkpoint: load directly.
+        return Videollama3Qwen2ForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            attn_implementation="flash_attention_2",
+        )
+
+    # LoRA checkpoint: the output dir has adapter_config.json + non_lora_trainables.bin
+    # but no full model.safetensors.  We must:
+    #   1. Load the base model using the *LoRA checkpoint* config (which carries
+    #      trainable_mm_compressor=True and token_compressor_config) so the
+    #      compressor module is constructed before weight loading.
+    #   2. Restore compressor / projector weights from non_lora_trainables.bin.
+    #   3. Apply the LoRA adapter and merge it into the base weights.
+    from peft import PeftModel
+
+    with open(adapter_config_path) as f:
+        adapter_cfg = json.load(f)
+    base_model_path = adapter_cfg["base_model_name_or_path"]
+
+    # Config from the LoRA dir has trainable_mm_compressor + token_compressor_config.
+    config = Videollama3Qwen2Config.from_pretrained(model_path)
+    config._attn_implementation = "flash_attention_2"
+
+    print(f"Detected LoRA checkpoint. Loading base model from {base_model_path} ...")
+    model = Videollama3Qwen2ForCausalLM.from_pretrained(
+        base_model_path,
+        config=config,
+        torch_dtype=dtype,
+        attn_implementation="flash_attention_2",
+    )
+
+    non_lora_path = os.path.join(model_path, "non_lora_trainables.bin")
+    if os.path.exists(non_lora_path):
+        print("Loading non-LoRA trainables (compressor, projector) ...")
+        try:
+            non_lora_sd = torch.load(non_lora_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            non_lora_sd = torch.load(non_lora_path, map_location="cpu")
+        # Strip PeftModel key prefixes added during training.
+        non_lora_sd = {(k[11:] if k.startswith("base_model.") else k): v for k, v in non_lora_sd.items()}
+        if any(k.startswith("model.model.") for k in non_lora_sd):
+            non_lora_sd = {(k[6:] if k.startswith("model.") else k): v for k, v in non_lora_sd.items()}
+        model.load_state_dict(non_lora_sd, strict=False)
+
+    print("Loading LoRA weights and merging ...")
+    model = PeftModel.from_pretrained(model, model_path)
+    model = model.merge_and_unload()
+    return model
+
+
 def main():
     args = parse_args()
 
@@ -148,12 +206,7 @@ def main():
     torch.manual_seed(args.seed)
 
     print(f"Loading model from {args.model_path} ...")
-    model = Videollama3Qwen2ForCausalLM.from_pretrained(
-        args.model_path,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    )
+    model = _load_model(args.model_path, dtype=torch.bfloat16)
     model.to(args.device)
     model.eval()
 
