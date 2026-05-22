@@ -157,9 +157,9 @@ def _load_model(model_path: str, dtype) -> Videollama3Qwen2ForCausalLM:
 
     # LoRA checkpoint: the output dir has adapter_config.json + non_lora_trainables.bin
     # but no full model.safetensors.  We must:
-    #   1. Load the base model using the *LoRA checkpoint* config (which carries
-    #      trainable_mm_compressor=True and token_compressor_config) so the
-    #      compressor module is constructed before weight loading.
+    #   1. Load the base model using a config whose vocab_size matches the base model
+    #      weights (to avoid embedding size mismatch), while patching in the compressor
+    #      attributes from the LoRA checkpoint config.
     #   2. Restore compressor / projector weights from non_lora_trainables.bin.
     #   3. Apply the LoRA adapter and merge it into the base weights.
     from peft import PeftModel
@@ -168,8 +168,19 @@ def _load_model(model_path: str, dtype) -> Videollama3Qwen2ForCausalLM:
         adapter_cfg = json.load(f)
     base_model_path = adapter_cfg["base_model_name_or_path"]
 
-    # Config from the LoRA dir has trainable_mm_compressor + token_compressor_config.
-    config = Videollama3Qwen2Config.from_pretrained(model_path)
+    # Start from base model's own config (correct vocab_size / architecture) and
+    # patch in compressor-specific attributes recorded in the LoRA checkpoint config.
+    config = Videollama3Qwen2Config.from_pretrained(base_model_path)
+    lora_config = Videollama3Qwen2Config.from_pretrained(model_path)
+    for attr in (
+        "trainable_mm_compressor",
+        "use_token_compression",
+        "token_compressor_config",
+        "compression_start_token_id",
+        "compression_end_token_id",
+    ):
+        if hasattr(lora_config, attr):
+            setattr(config, attr, getattr(lora_config, attr))
     config._attn_implementation = "flash_attention_2"
 
     print(f"Detected LoRA checkpoint. Loading base model from {base_model_path} ...")
