@@ -310,7 +310,7 @@ class LocalAttnConvCompressor(nn.Module):
         T_repeated = T_per_window.to(device=device, dtype=torch.int32).repeat_interleave(HW)  # (B*HW,)
         cu_seqlens_kv_local = torch.cat([
             torch.zeros(1, device=device, dtype=torch.int32),
-            T_repeated.cumsum(0),
+            T_repeated.cumsum(0).to(torch.int32),
         ])
 
         # cu_seqlens for spatial self-attention: window i owns queries [i*HW, (i+1)*HW)

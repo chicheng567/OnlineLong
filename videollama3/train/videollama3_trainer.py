@@ -357,6 +357,16 @@ class VideoLLaMA3Trainer(Trainer):
 
             if compressor_lr is not None and compressor_lr > 0:
                 compressor_parameters = [name for name, _ in optimized_parameters if "token_compressor" in name]
+                # When the LLM is frozen (llm_lr=0) but embed_tokens was extended
+                # for new compression tokens, route embed_tokens into this group so
+                # ZeRO-2 always has optimizer state for it (avoids AllReduce NaN).
+                # lm_head is excluded because it is frozen (new token rows are masked
+                # in labels and never produce gradients).
+                if llm_lr is None or llm_lr <= 0:
+                    compressor_parameters += [
+                        name for name, _ in optimized_parameters
+                        if "embed_tokens" in name and name not in compressor_parameters
+                    ]
                 decay_compressor_parameters = [name for name in compressor_parameters if name in decay_parameters]
                 nodecay_compressor_parameters = [name for name in compressor_parameters if name not in decay_parameters]
                 optimizer_grouped_parameters.extend([

@@ -202,6 +202,17 @@ def _load_model(model_path: str, dtype) -> Videollama3Qwen2ForCausalLM:
         non_lora_sd = {(k[11:] if k.startswith("base_model.") else k): v for k, v in non_lora_sd.items()}
         if any(k.startswith("model.model.") for k in non_lora_sd):
             non_lora_sd = {(k[6:] if k.startswith("model.") else k): v for k, v in non_lora_sd.items()}
+        # embed_tokens may have been extended during training (new compression tokens).
+        # The base model has a different vocab size, so handle the resize explicitly
+        # before calling load_state_dict (which raises on size mismatches).
+        embed_key = "model.embed_tokens.weight"
+        if embed_key in non_lora_sd:
+            saved_embed = non_lora_sd.pop(embed_key)
+            saved_vocab = saved_embed.shape[0]
+            current_vocab = model.get_input_embeddings().weight.shape[0]
+            if saved_vocab != current_vocab:
+                model.resize_token_embeddings(saved_vocab)
+            model.get_input_embeddings().weight.data.copy_(saved_embed.to(dtype=model.dtype))
         model.load_state_dict(non_lora_sd, strict=False)
 
     print("Loading LoRA weights and merging ...")
