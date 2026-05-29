@@ -332,15 +332,20 @@ def load_internvideo2_l(
     return model
 
 
-# Mean/std for input normalization.  InternVideo2 uses the OpenAI-CLIP norm.
-IV2_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
-IV2_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
+# Mean/std for input normalization.  InternVideo2's own ViT encoders (the
+# vision_encoder name contains "internvideo"/"vit"/"umt") use **ImageNet**
+# normalization — NOT the OpenAI-CLIP norm.  The CLIP norm is only used by IV2
+# when the encoder is an actual OpenAI-CLIP tower (name contains "clip").
+# Verified against the IV2 multi_modality dataset transforms (norm picked by
+# encoder name) and the official demo (v_mean/v_std = the values below).
+IV2_IMAGE_MEAN = (0.485, 0.456, 0.406)
+IV2_IMAGE_STD = (0.229, 0.224, 0.225)
 
 
 def normalize_for_iv2(images: torch.Tensor) -> torch.Tensor:
     """
     Normalize images from ``[-1, 1]`` (taming-transformers output convention)
-    into the CLIP normalization expected by IV2.
+    into the ImageNet normalization expected by the IV2 ViT encoder.
 
     Accepts ``(B, 3, H, W)`` or ``(B, 3, T, H, W)``.
     """
