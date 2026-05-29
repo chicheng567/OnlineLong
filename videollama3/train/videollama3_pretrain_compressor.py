@@ -39,7 +39,10 @@ from videollama3.model.compressor import (
     TransformerDecoderCompressor,
     Videollama3TokenCompressorConfig,
 )
+from videollama3.model.internvideo2_vendor import load_internvideo2_l
 from videollama3.model.processor import Videollama3Processor
+from videollama3.model.semantic_loss import GlobalSemanticLoss
+from videollama3.model.vqgan_vendor import load_vqgan_decoder
 
 logger = logging.getLogger(__name__)
 local_rank = None
@@ -89,6 +92,34 @@ class ModelArguments:
         metadata={"help": "Decoder depth; defaults to compressor_num_layers."},
     )
     max_output_frames: int = field(default=10)
+    # --- Global semantic loss (optional) ---
+    use_semantic_loss: bool = field(
+        default=False,
+        metadata={"help": "Add MLP → VQ-GAN → IV2 cycle loss against cached IV2 video features."},
+    )
+    semantic_loss_weight: float = field(default=0.1)
+    vqgan_state_dict: Optional[str] = field(
+        default="pretrained_models/vqgan/state_dict.pt",
+        metadata={"help": "Plain state-dict extracted from vqgan-f16-16384."},
+    )
+    iv2_ckpt: Optional[str] = field(
+        default="pretrained_models/iv2_L/pytorch_model.bin",
+        metadata={"help": "InternVideo2-L Stage-2 checkpoint."},
+    )
+    semantic_mlp_hidden: Optional[int] = field(
+        default=None,
+        metadata={"help": "Hidden width of the semantic-loss MLP; default 2× VQGAN z_channels (=512)."},
+    )
+    commit_loss_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight for the VQ commitment loss ||z - sg(e_nearest)||² on the MLP "
+                "projection that feeds VQ-GAN.  Keeps z close to the frozen codebook. "
+                "Requires use_semantic_loss=True (the MLP only exists on that path)."
+            ),
+        },
+    )
 
 
 @dataclass
@@ -114,6 +145,16 @@ class DataArguments:
         default=4,
         metadata={"help": "Skip videos that decode to fewer than this many frames."},
     )
+    iv2_cache_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Directory of precomputed IV2 video features (one .pt per video stem). "
+                "Required when training_args.use_semantic_loss is True; samples lacking a "
+                "cache file are dropped at dataset-load time."
+            ),
+        },
+    )
 
 
 @dataclass
@@ -122,6 +163,10 @@ class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
     compressor_lr: float = field(default=1e-4)
     decoder_lr: float = field(default=1e-4)
+    semantic_mlp_lr: Optional[float] = field(
+        default=None,
+        metadata={"help": "LR for the semantic-loss MLP head; default → compressor_lr."},
+    )
     model_max_length: int = field(default=512)
     group_by_modality_length: bool = field(default=False)
 
@@ -134,6 +179,10 @@ class VideoPretrainDataset(Dataset):
     """
     Loads videos and returns visual features in a format ready for the AE model.
     No conversation labels required.
+
+    When ``iv2_cache_dir`` is given, samples whose precomputed IV2 feature is
+    missing are filtered out at construction time (rather than being silently
+    skipped at __getitem__), so length and __getitem__ stay consistent.
     """
 
     def __init__(
@@ -144,6 +193,7 @@ class VideoPretrainDataset(Dataset):
         merge_size: int = 2,
         data_root: Optional[str] = None,
         min_frames: int = 4,
+        iv2_cache_dir: Optional[str] = None,
     ):
         with open(data_path) as f:
             raw = json.load(f)
@@ -160,15 +210,45 @@ class VideoPretrainDataset(Dataset):
                     if "video" in entry and root:
                         entry["_data_root"] = root
                     items.append(entry)
-            self.data = items
+            data = items
         else:
-            self.data = raw
+            data = raw
 
         self.processor = processor
         self.max_frames = max_frames
         self.merge_size = merge_size
         self.data_root = data_root
         self.min_frames = min_frames
+        self.iv2_cache_dir = iv2_cache_dir
+
+        # If using cached IV2 features, drop samples that don't have a cache file.
+        if iv2_cache_dir is not None:
+            kept: List[Dict] = []
+            cache_root = os.path.abspath(iv2_cache_dir)
+            for entry in data:
+                v = entry.get("video")
+                if not v:
+                    continue
+                if isinstance(v, (list, tuple)):
+                    v = v[0]
+                stem = os.path.splitext(os.path.basename(str(v)))[0]
+                # honor explicit "iv2_feat_path" if precompute meta was passed in,
+                # otherwise look it up by stem under cache_root.
+                feat_path = entry.get("iv2_feat_path")
+                if feat_path is None or not os.path.isabs(feat_path):
+                    feat_path = os.path.join(cache_root, f"{stem}.pt")
+                if not os.path.exists(feat_path):
+                    continue
+                entry = dict(entry)
+                entry["_iv2_feat_path"] = feat_path
+                kept.append(entry)
+            n_drop = len(data) - len(kept)
+            if n_drop:
+                logger.warning("Dropped %d/%d samples without IV2 cache under %s",
+                               n_drop, len(data), iv2_cache_dir)
+            self.data = kept
+        else:
+            self.data = data
 
     def __len__(self):
         return len(self.data)
@@ -210,12 +290,17 @@ class VideoPretrainDataset(Dataset):
             logger.warning("Processor failed on %s: %s — retrying", video_path, exc)
             return self.__getitem__(random.randint(0, len(self.data) - 1))
 
-        return {
+        out: Dict = {
             "pixel_values": data_dict["pixel_values"],
             "grid_sizes": data_dict["grid_sizes"],
             "merge_sizes": data_dict["merge_sizes"],
             "n_frames": torch.tensor(n_frames, dtype=torch.long),
         }
+        if "_iv2_feat_path" in item:
+            # Cached IV2 vector saved as fp16; collator/model casts later.
+            vid_feat = torch.load(item["_iv2_feat_path"], map_location="cpu", weights_only=True)
+            out["vid_feat"] = vid_feat.to(torch.float32)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +314,8 @@ class DataCollatorForPretraining:
         batch["grid_sizes"] = torch.cat([x["grid_sizes"] for x in instances], dim=0)
         batch["merge_sizes"] = torch.cat([x["merge_sizes"] for x in instances], dim=0)
         batch["n_frames"] = torch.stack([x["n_frames"] for x in instances])
+        if "vid_feat" in instances[0]:
+            batch["vid_feat"] = torch.stack([x["vid_feat"] for x in instances])
         return batch
 
 
@@ -242,6 +329,9 @@ from typing import Optional as _Optional
 @_dataclass
 class AEOutput(BaseModelOutput):
     loss: _Optional[torch.Tensor] = None
+    mse_loss: _Optional[torch.Tensor] = None
+    sem_loss: _Optional[torch.Tensor] = None
+    commit_loss: _Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -260,11 +350,17 @@ class CompressorAutoEncoder(nn.Module):
         vision_encoder: nn.Module,
         compressor: nn.Module,
         decoder: CompressorDecoder,
+        semantic_loss: Optional[GlobalSemanticLoss] = None,
+        semantic_loss_weight: float = 0.0,
+        commit_loss_weight: float = 0.0,
     ):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.compressor = compressor
         self.decoder = decoder
+        self.semantic_loss = semantic_loss
+        self.semantic_loss_weight = semantic_loss_weight
+        self.commit_loss_weight = commit_loss_weight
 
         # Vision encoder is always frozen.
         for p in self.vision_encoder.parameters():
@@ -277,6 +373,7 @@ class CompressorAutoEncoder(nn.Module):
         grid_sizes: torch.Tensor,
         merge_sizes: torch.Tensor,
         n_frames: torch.Tensor,
+        vid_feat: Optional[torch.Tensor] = None,
         **_kwargs,
     ) -> AEOutput:
         n_frames_list: List[int] = n_frames.tolist()
@@ -329,17 +426,39 @@ class CompressorAutoEncoder(nn.Module):
         # 5. MSE loss with uniform frame sampling.
         decoded_4d = decoded.view(B, max_T, HW, -1)
 
-        loss = torch.tensor(0.0, device=device, dtype=visual_tokens.dtype)
+        mse = torch.tensor(0.0, device=device, dtype=visual_tokens.dtype)
         offset = 0
         for b, n in enumerate(n_frames_list):
             target = visual_tokens[offset : offset + n * HW].view(n, HW, -1).detach()
             offset += n * HW
             indices = _uniform_frame_indices(n, max_T)
             sampled = decoded_4d[b, indices]  # (n, HW, hidden_size)
-            loss = loss + F.mse_loss(sampled, target)
+            mse = mse + F.mse_loss(sampled, target)
+        mse = mse / B
 
-        loss = loss / B
-        return AEOutput(loss=loss)
+        # 6. Optional global semantic loss (frozen VQ-GAN → frozen IV2 cycle)
+        #    and/or VQ commitment loss on the MLP projection.
+        sem: Optional[torch.Tensor] = None
+        commit: Optional[torch.Tensor] = None
+        need_semantic_path = (
+            self.semantic_loss is not None
+            and vid_feat is not None
+            and (self.semantic_loss_weight > 0.0 or self.commit_loss_weight > 0.0)
+        )
+        if need_semantic_path:
+            sem, commit = self.semantic_loss(compressed, vid_feat.to(device))
+
+        loss = mse
+        if sem is not None and self.semantic_loss_weight > 0.0:
+            loss = loss + self.semantic_loss_weight * sem.to(mse.dtype)
+        if commit is not None and self.commit_loss_weight > 0.0:
+            loss = loss + self.commit_loss_weight * commit.to(mse.dtype)
+        return AEOutput(
+            loss=loss,
+            mse_loss=mse.detach(),
+            sem_loss=sem.detach() if sem is not None else None,
+            commit_loss=commit.detach() if commit is not None else None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +466,12 @@ class CompressorAutoEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class PretrainTrainer(Trainer):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Running sums for auxiliary (per-component) losses; flushed by self.log().
+        self._aux_running: Dict[str, float] = {}
+        self._aux_count: int = 0
 
     def create_optimizer(self):
         from transformers.trainer_pt_utils import get_parameter_names
@@ -358,14 +483,20 @@ class PretrainTrainer(Trainer):
         assert self.model is not None
         compressor_lr = getattr(self.args, "compressor_lr", 1e-4)
         decoder_lr = getattr(self.args, "decoder_lr", 1e-4)
+        semantic_mlp_lr = getattr(self.args, "semantic_mlp_lr", None) or compressor_lr
 
         decay_params = get_parameter_names(self.model, ALL_LAYERNORM_LAYERS)
         decay_params = [n for n in decay_params if "bias" not in n]
 
         trainable = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
 
-        compressor_names = {n for n, _ in trainable if "compressor" in n}
-        decoder_names    = {n for n, _ in trainable if "decoder"    in n}
+        # ``semantic_loss.mlp.*`` must be matched first to avoid being caught by
+        # the broader ``compressor`` / ``decoder`` filters (which use substring
+        # tests against the full dotted path).
+        semantic_names = {n for n, _ in trainable if n.startswith("semantic_loss.")}
+        rest = [(n, p) for n, p in trainable if n not in semantic_names]
+        compressor_names = {n for n, _ in rest if "compressor" in n}
+        decoder_names    = {n for n, _ in rest if "decoder"    in n}
 
         def _groups(names, lr):
             decay   = [p for n, p in trainable if n in names and n in decay_params]
@@ -377,11 +508,36 @@ class PretrainTrainer(Trainer):
                 out.append({"params": nodecay, "weight_decay": 0.0, "lr": lr})
             return out
 
-        param_groups = _groups(compressor_names, compressor_lr) + _groups(decoder_names, decoder_lr)
+        param_groups = (
+            _groups(compressor_names, compressor_lr)
+            + _groups(decoder_names, decoder_lr)
+            + _groups(semantic_names, semantic_mlp_lr)
+        )
 
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
         self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
         return self.optimizer
+
+    # ------------------------------------------------------------------
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        outputs = model(**inputs)
+        loss = outputs.loss
+        for key in ("mse_loss", "sem_loss", "commit_loss"):
+            v = getattr(outputs, key, None)
+            if v is None:
+                continue
+            self._aux_running[key] = self._aux_running.get(key, 0.0) + float(v.detach().float().item())
+        self._aux_count += 1
+        return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs: Dict[str, float], *args, **kwargs):
+        # Inject averaged auxiliary losses whenever HF Trainer logs.
+        if self._aux_count > 0:
+            for key, total in self._aux_running.items():
+                logs[key] = total / self._aux_count
+            self._aux_running.clear()
+            self._aux_count = 0
+        return super().log(logs, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +627,13 @@ def train():
         f"and the MSE loss receives conflicting targets at the same slot."
     )
 
+    if model_args.commit_loss_weight > 0.0 and not model_args.use_semantic_loss:
+        raise ValueError(
+            "commit_loss_weight > 0 requires use_semantic_loss=True — the "
+            "commitment loss is computed on the MLP projection that only exists "
+            "on the semantic-loss path."
+        )
+
     # ---- Vision encoder ------------------------------------------------
     vision_encoder, _, ve_hidden_size = _load_vision_encoder(
         model_args.model_name_or_path,
@@ -490,11 +653,48 @@ def train():
     rank0_print(f"Decoder layers={model_args.decoder_num_layers or compressor_cfg.num_layers} "
                 f"max_output_frames={model_args.max_output_frames}")
 
+    # ---- Optional global semantic loss --------------------------------
+    semantic_loss_module: Optional[GlobalSemanticLoss] = None
+    if model_args.use_semantic_loss:
+        if data_args.iv2_cache_dir is None:
+            raise ValueError(
+                "model_args.use_semantic_loss=True but data_args.iv2_cache_dir is not set. "
+                "Run shell/precompute_iv2.sh first and pass --iv2_cache_dir."
+            )
+        if not model_args.vqgan_state_dict or not model_args.iv2_ckpt:
+            raise ValueError(
+                "use_semantic_loss=True requires --vqgan_state_dict and --iv2_ckpt."
+            )
+        rank0_print(f"Loading frozen VQ-GAN from {model_args.vqgan_state_dict}")
+        vqgan = load_vqgan_decoder(
+            model_args.vqgan_state_dict,
+            dtype=torch.bfloat16 if training_args.bf16 else torch.float32,
+        )
+        rank0_print(f"Loading frozen InternVideo2-L from {model_args.iv2_ckpt}")
+        iv2 = load_internvideo2_l(
+            model_args.iv2_ckpt,
+            dtype=torch.bfloat16 if training_args.bf16 else torch.float32,
+        )
+        semantic_loss_module = GlobalSemanticLoss(
+            compressor_hidden=ve_hidden_size,
+            vqgan=vqgan,
+            iv2=iv2,
+            mlp_hidden=model_args.semantic_mlp_hidden,
+            use_commit_loss=(model_args.commit_loss_weight > 0.0),
+        )
+        rank0_print(
+            f"Semantic loss enabled. weight={model_args.semantic_loss_weight} "
+            f"trainable MLP params={sum(p.numel() for p in semantic_loss_module.mlp.parameters()):,}"
+        )
+
     # ---- AE model ------------------------------------------------------
     ae_model = CompressorAutoEncoder(
         vision_encoder=vision_encoder,
         compressor=compressor,
         decoder=decoder,
+        semantic_loss=semantic_loss_module,
+        semantic_loss_weight=model_args.semantic_loss_weight,
+        commit_loss_weight=model_args.commit_loss_weight,
     )
 
     # ---- Processor & Dataset -------------------------------------------
@@ -527,6 +727,7 @@ def train():
         merge_size=data_args.video_merge_size,
         data_root=data_args.data_root,
         min_frames=data_args.min_frames,
+        iv2_cache_dir=data_args.iv2_cache_dir if model_args.use_semantic_loss else None,
     )
     rank0_print(f"Dataset size: {len(train_dataset)}")
 
