@@ -45,6 +45,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 sys.path.append("./")
@@ -140,58 +141,75 @@ class FrameToIV2:
 
 
 # ---------------------------------------------------------------------------
-# Worker loop
+# Dataset: parallel frame decode + transform.
+#
+# Decoding (decord) is the real bottleneck, so it is spread across DataLoader
+# workers while the main process keeps the GPU busy with batched IV2 forwards.
+# Every item is padded/trimmed to exactly num_frames, so all returned tensors
+# share the shape (3, num_frames, H, W) and can be stacked into a batch.
 # ---------------------------------------------------------------------------
 
-def _process_sample(
-    sample: Dict,
-    output_dir: Path,
-    model,
-    transform: FrameToIV2,
-    num_frames: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    overwrite: bool,
-) -> Optional[str]:
-    """
-    Returns the relative .pt path if cached/computed; None on failure.
-    """
-    root = sample.get("_data_root", "")
-    video_field = sample["video"]
-    if isinstance(video_field, (list, tuple)):
-        video_field = video_field[0]
-    video_path = os.path.join(root, video_field) if root else video_field
+class _IV2FrameDataset(Dataset):
+    def __init__(
+        self,
+        samples: List[Dict],
+        output_dir: Path,
+        transform: FrameToIV2,
+        num_frames: int,
+        overwrite: bool,
+    ):
+        self.samples = samples
+        self.output_dir = output_dir
+        self.transform = transform
+        self.num_frames = num_frames
+        self.overwrite = overwrite
 
-    stem = Path(str(video_field)).stem
-    out_path = output_dir / f"{stem}.pt"
+    def __len__(self) -> int:
+        return len(self.samples)
 
-    if out_path.exists() and not overwrite:
-        return str(out_path)
+    def __getitem__(self, i: int) -> Dict:
+        sample = self.samples[i]
+        root = sample.get("_data_root", "")
+        video_field = sample["video"]
+        if isinstance(video_field, (list, tuple)):
+            video_field = video_field[0]
+        video_path = os.path.join(root, video_field) if root else video_field
 
-    try:
-        # return_timestamps=False (default) → List[PIL.Image].
-        frames = read_frames_decord(video_path, num_frames=num_frames, sample="middle")
-        assert isinstance(frames, list)
-    except Exception as exc:
-        logger.warning("decord failed on %s: %s", video_path, exc)
-        return None
+        stem = Path(str(video_field)).stem
+        out_path = self.output_dir / f"{stem}.pt"
 
-    # Pad / trim to exactly num_frames so pos_embed lookup is consistent.
-    if len(frames) == 0:
-        logger.warning("empty frames for %s", video_path)
-        return None
-    if len(frames) < num_frames:
-        frames = frames + [frames[-1]] * (num_frames - len(frames))
-    elif len(frames) > num_frames:
-        frames = frames[:num_frames]
+        out_sample = {k: v for k, v in sample.items() if k != "_data_root"}
+        result: Dict = {"sample": out_sample, "out_path": str(out_path)}
 
-    tensor = transform(frames).unsqueeze(0).to(device=device, dtype=dtype)  # (1, 3, T, 224, 224)
-    with torch.no_grad():
-        feat = model(tensor).squeeze(0).to(torch.float16).cpu()              # (768,)
+        if out_path.exists() and not self.overwrite:
+            result["status"] = "cached"
+            return result
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(feat, out_path)
-    return str(out_path)
+        try:
+            # return_timestamps=False (default) → List[PIL.Image].
+            frames = read_frames_decord(video_path, num_frames=self.num_frames, sample="middle")
+            assert isinstance(frames, list) and len(frames) > 0
+        except Exception as exc:
+            logger.warning("decord failed on %s: %s", video_path, exc)
+            result["status"] = "fail"
+            return result
+
+        # Pad / trim to exactly num_frames so pos_embed lookup is consistent and
+        # every item is stackable.
+        if len(frames) < self.num_frames:
+            frames = frames + [frames[-1]] * (self.num_frames - len(frames))
+        elif len(frames) > self.num_frames:
+            frames = frames[: self.num_frames]
+
+        result["pixel"] = self.transform(frames)  # (3, T, H, W) fp32
+        result["status"] = "ok"
+        return result
+
+
+def _identity_collate(batch: List[Dict]) -> List[Dict]:
+    # Keep the per-sample dicts as a list; cached/failed items must not consume
+    # GPU batch slots, so the actual tensor stacking is done in the main loop.
+    return batch
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +227,12 @@ def main():
     parser.add_argument("--num_frames", type=int, default=8,
                         help="Frames sampled per video; must equal IV2 pretrain config (8).")
     parser.add_argument("--image_size", type=int, default=224)
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="Videos per IV2 forward pass. All frames are padded/trimmed to "
+                             "num_frames so the batch is shape-uniform.")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader workers for parallel video decoding (the real "
+                             "bottleneck). 0 = decode in the main process.")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     args = parser.parse_args()
@@ -233,17 +257,39 @@ def main():
         logger.info("Total samples: %d  |  this rank: %d  |  world_size: %d",
                     len(samples), len(shard), world_size)
 
+    dataset = _IV2FrameDataset(shard, output_dir, transform, args.num_frames, args.overwrite)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=False,
+        collate_fn=_identity_collate,
+    )
+
     processed: List[Dict] = []
-    for sample in tqdm(shard, desc=f"[rank {rank}]", disable=(rank != 0)):
-        feat_path = _process_sample(
-            sample, output_dir, model, transform,
-            args.num_frames, device, dtype, args.overwrite,
-        )
-        if feat_path is None:
-            continue
-        out_sample = {k: v for k, v in sample.items() if k != "_data_root"}
-        out_sample["iv2_feat_path"] = feat_path
-        processed.append(out_sample)
+    n_fail = 0
+    with tqdm(total=len(shard), desc=f"[rank {rank}]", disable=(rank != 0)) as pbar:
+        for batch in loader:
+            to_run = [r for r in batch if r["status"] == "ok"]
+            if to_run:
+                pixels = torch.stack([r["pixel"] for r in to_run]).to(device=device, dtype=dtype)
+                with torch.no_grad():
+                    feats = model(pixels).to(torch.float16).cpu()  # (b, 768)
+                for r, feat in zip(to_run, feats):
+                    Path(r["out_path"]).parent.mkdir(parents=True, exist_ok=True)
+                    # .clone() so each .pt owns a (768,) storage, not a view into
+                    # the whole batch tensor (which torch.save would serialize).
+                    torch.save(feat.clone(), r["out_path"])
+            for r in batch:
+                if r["status"] == "fail":
+                    n_fail += 1
+                    continue
+                s = dict(r["sample"])
+                s["iv2_feat_path"] = r["out_path"]
+                processed.append(s)
+            pbar.update(len(batch))
+    if n_fail:
+        logger.warning("rank %d: %d samples failed to decode and were skipped", rank, n_fail)
 
     # Write per-rank partial meta; rank 0 merges.
     partial_path = output_dir / f".meta_partial_rank{rank}.json"
