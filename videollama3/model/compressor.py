@@ -17,6 +17,33 @@ def _build_2d_rotary_pos_emb(rotary_pos_emb_module, w, h):
     return rotary_pos_emb_full[pos_ids].flatten(1)
 
 
+def _build_factorized_rotary(inv_freq: torch.Tensor, coords_list, dims_list) -> torch.Tensor:
+    """
+    Build a factorized (multi-axis) rotary frequency table for cross-attention.
+
+    Each axis ``a`` gets a contiguous slice of ``inv_freq`` of width ``dims_list[a]``
+    and is multiplied by its per-token coordinate ``coords_list[a]`` (shape ``(N,)``).
+    The concatenation has shape ``(N, sum(dims_list))`` which must equal
+    ``(N, head_dim // 2)`` so that ``apply_rotary_pos_emb_vision`` can duplicate it to
+    ``head_dim`` and pair channel ``i`` with ``i + head_dim // 2``.
+
+    This realizes M-RoPE-style position encoding: e.g. for ``coords_list=[t, h, w]``
+    each frequency band rotates a disjoint set of channels, so the same dot product
+    encodes relative temporal *and* spatial offsets simultaneously.  A 1-D variant
+    (``coords_list=[t]``) dedicates the whole budget to the temporal axis.
+
+    ``inv_freq`` is the buffer of a ``VisionRotaryEmbedding(dim=head_dim)`` module, so
+    ``len(inv_freq) == head_dim // 2``.
+    """
+    parts = []
+    start = 0
+    for coords, d in zip(coords_list, dims_list):
+        band = inv_freq[start:start + d]
+        parts.append(torch.outer(coords.to(band.dtype), band))
+        start += d
+    return torch.cat(parts, dim=-1)  # (N, sum(dims_list)) == (N, head_dim // 2)
+
+
 class mlp(nn.Module):
     def __init__(self, hidden_size, intermediate_size):
         super().__init__()
@@ -52,15 +79,26 @@ class CrossFlashAttention2(Attention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-    def forward(self, x_q, x_kv, cu_seqlens_q, cu_seqlens_kv):
+    def forward(self, x_q, x_kv, cu_seqlens_q, cu_seqlens_kv,
+                rotary_pos_emb_q: torch.Tensor = None,
+                rotary_pos_emb_kv: torch.Tensor = None):
         # x_q should be of shape (batch_size * seq_len_q, d_model)
         # x_kv should be of shape (batch_size * seq_len_kv, d_model)
         # cu_seqlens_q should be of shape (batch_size + 1,) like (0, 4, 7, 9, 32, 33, ...)
         # cu_seqlens_kv should be of shape (batch_size + 1,) like (0, 4, 7, 9, 32, 33, ...)
+        # rotary_pos_emb_{q,kv}: optional (total_tokens, head_dim // 2) RoPE tables.
+        #   Only q and k are rotated (never v).  Leaving rotary_pos_emb_q=None is
+        #   equivalent to placing every query at coordinate 0 — used by
+        #   LocalAttnConvCompressor so each query sits at temporal slot 0 while the
+        #   keys carry their real frame index, encoding the relative offset -t.
         drop_rate = self.dropout_rate if self.training else 0.0
         q = self.w_q(x_q).view(-1, self.n_head, self.head_dim)
         k = self.w_k(x_kv).view(-1, self.n_head, self.head_dim)
         v = self.w_v(x_kv).view(-1, self.n_head, self.head_dim)
+        if rotary_pos_emb_q is not None:
+            q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb_q).squeeze(0)
+        if rotary_pos_emb_kv is not None:
+            k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb_kv).squeeze(0)
         assert cu_seqlens_q[0].item() == 0 and cu_seqlens_kv[0].item() == 0
         assert cu_seqlens_q[-1].item() == q.shape[0], (cu_seqlens_q[-1].item(), q.shape[0])
         assert cu_seqlens_kv[-1].item() == k.shape[0], (cu_seqlens_kv[-1].item(), k.shape[0])
@@ -140,12 +178,14 @@ class TransformerDecoderLayer(nn.Module):
         self.layer_norm2 = LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.layer_norm3 = LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = mlp(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size)
-    def forward(self, q, kv, cu_seqlens_q, cu_seqlens_kv, rotary_pos_emb):
+    def forward(self, q, kv, cu_seqlens_q, cu_seqlens_kv, rotary_pos_emb,
+                cross_rotary_q=None, cross_rotary_kv=None):
         q = q + self.self_attn(self.layer_norm1(q), cu_seqlens_q, rotary_pos_emb)
-        q = q + self.cross_attn(self.layer_norm2(q), kv, cu_seqlens_q, cu_seqlens_kv)
+        q = q + self.cross_attn(self.layer_norm2(q), kv, cu_seqlens_q, cu_seqlens_kv,
+                                cross_rotary_q, cross_rotary_kv)
         q = q + self.mlp(self.layer_norm3(q))
         return q
-    
+
 class TransformerDecoderCompressor(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -155,6 +195,12 @@ class TransformerDecoderCompressor(nn.Module):
         self.head_dim = head_dim
         self.num_head = config.num_attention_heads
         self.rotary_pos_emb = VisionRotaryEmbedding(dim=head_dim // 2)
+        # 3D (t, h, w) rotary for the cross-attention onto the input video tokens.
+        # Its inv_freq holds head_dim // 2 frequencies, split into temporal / height /
+        # width bands so the query↔key dot product encodes relative spatial *and*
+        # temporal offsets — without it the cross-attention is permutation-invariant
+        # over the flattened T×HW token set and loses all frame ordering.
+        self.cross_rotary = VisionRotaryEmbedding(dim=head_dim)
         self.layers = nn.ModuleList([TransformerDecoderLayer(config) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.compress_image_w = config.compress_image_w
@@ -166,6 +212,50 @@ class TransformerDecoderCompressor(nn.Module):
 
     def _build_query_rotary_pos_emb(self, w, h) -> torch.Tensor:
         return _build_2d_rotary_pos_emb(self.rotary_pos_emb, w, h)
+
+    def _build_cross_rotary_3d(self, compression_cu_seqlens, device):
+        """
+        Build 3-D (t, h, w) rotary tables for the cross-attention.
+
+        Queries: one HW grid per window, all anchored at temporal slot 0 with their
+        2-D spatial coordinates.  Keys: the window's T×HW input tokens in frame-major
+        order — temporal coordinate = frame index, spatial coordinate = position
+        within the frame.  Returns (q_freqs, kv_freqs), each (N, head_dim // 2).
+        """
+        H, W, HW = self.compress_image_h, self.compress_image_w, self.compress_image_wh
+        # Per-frame spatial coords, matching the _build_2d_rotary_pos_emb convention.
+        hpos = torch.arange(H, device=device).unsqueeze(1).expand(-1, W).reshape(-1)  # (HW,)
+        wpos = torch.arange(W, device=device).unsqueeze(0).expand(H, -1).reshape(-1)  # (HW,)
+
+        window_lens = (compression_cu_seqlens[1:] - compression_cu_seqlens[:-1]).long()
+        assert (window_lens % HW == 0).all(), (
+            f"TransformerDecoderCompressor: token count per window must be divisible "
+            f"by HW={HW}. Got window lengths: {window_lens.tolist()}"
+        )
+        T_per = (window_lens // HW).tolist()
+        B = len(T_per)
+
+        # Keys: frame-major layout [frame0_p0..p_{HW-1}, frame1_p0.., ...]
+        kv_t, kv_h, kv_w = [], [], []
+        for Ti in T_per:
+            kv_t.append(torch.arange(Ti, device=device).repeat_interleave(HW))
+            kv_h.append(hpos.repeat(Ti))
+            kv_w.append(wpos.repeat(Ti))
+        kv_t = torch.cat(kv_t); kv_h = torch.cat(kv_h); kv_w = torch.cat(kv_w)
+
+        # Queries: B grids, all at t=0.
+        q_t = torch.zeros(B * HW, device=device)
+        q_h = hpos.repeat(B); q_w = wpos.repeat(B)
+
+        inv_freq = self.cross_rotary.inv_freq  # (head_dim // 2,)
+        D = inv_freq.shape[0]
+        d_t = D // 3
+        d_h = (D - d_t) // 2
+        d_w = D - d_t - d_h
+        dims = [d_t, d_h, d_w]
+        kv_freqs = _build_factorized_rotary(inv_freq, [kv_t, kv_h, kv_w], dims)
+        q_freqs = _build_factorized_rotary(inv_freq, [q_t, q_h, q_w], dims)
+        return q_freqs, kv_freqs
 
     def forward(self, kv, compression_cu_seqlens):
         # kv: (1, total_tokens, hidden_size)
@@ -183,8 +273,10 @@ class TransformerDecoderCompressor(nn.Module):
         ).contiguous()
         compression_cu_seqlens = compression_cu_seqlens.to(device=kv.device, dtype=torch.int32).contiguous()
         rotary_pos_emb = self._build_query_rotary_pos_emb(self.compress_image_w, self.compress_image_h)
+        cross_rotary_q, cross_rotary_kv = self._build_cross_rotary_3d(compression_cu_seqlens, kv.device)
         for layer in self.layers:
-            query = layer(query, kv, cu_seqlens_q, compression_cu_seqlens, rotary_pos_emb)
+            query = layer(query, kv, cu_seqlens_q, compression_cu_seqlens, rotary_pos_emb,
+                          cross_rotary_q, cross_rotary_kv)
         return query
 
     def decode_tokens(self, compressed_tokens: torch.Tensor) -> torch.Tensor:
@@ -236,9 +328,14 @@ class LocalAttnConvLayer(nn.Module):
         self.layer_norm3 = LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = mlp(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size)
 
-    def forward(self, q, kv_local, cu_seqlens_q_local, cu_seqlens_kv_local, cu_seqlens_q_self, rotary_pos_emb):
+    def forward(self, q, kv_local, cu_seqlens_q_local, cu_seqlens_kv_local, cu_seqlens_q_self, rotary_pos_emb,
+                cross_rotary_kv=None):
         # 1. Local cross-attention: query at position p sees only position p's T frame tokens.
-        q = q + self.cross_attn(self.layer_norm1(q), kv_local, cu_seqlens_q_local, cu_seqlens_kv_local)
+        #    The query stays at temporal slot 0 (rotary_pos_emb_q=None → identity) while the
+        #    keys carry their frame index via cross_rotary_kv, so the dot product encodes the
+        #    relative offset -t and the T frames are no longer exchangeable.
+        q = q + self.cross_attn(self.layer_norm1(q), kv_local, cu_seqlens_q_local, cu_seqlens_kv_local,
+                                None, cross_rotary_kv)
         # 2. Spatial self-attention: queries within a window exchange spatial context.
         q = q + self.self_attn(self.layer_norm2(q), cu_seqlens_q_self, rotary_pos_emb)
         # 3. MLP.
@@ -255,6 +352,12 @@ class LocalAttnConvCompressor(nn.Module):
         self.head_dim = head_dim
         self.num_head = config.num_attention_heads
         self.rotary_pos_emb = VisionRotaryEmbedding(dim=head_dim // 2)
+        # 1-D temporal rotary for the local cross-attention.  Spatial position is
+        # already fixed by the local routing (query p only sees position p's frames),
+        # so the whole frequency budget (head_dim // 2) is dedicated to the temporal
+        # axis — this is what lets the compressor tell the T frames apart instead of
+        # treating them as an unordered set.
+        self.cross_rotary = VisionRotaryEmbedding(dim=head_dim)
         self.layers = nn.ModuleList([LocalAttnConvLayer(config) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.compress_image_w = config.compress_image_w
@@ -319,8 +422,19 @@ class LocalAttnConvCompressor(nn.Module):
 
         rotary_pos_emb = self._build_query_rotary_pos_emb(self.compress_image_w, self.compress_image_h)
 
+        # 1-D temporal rotary on the keys.  kv_local is position-major within each
+        # window ([p0_f0..f{T-1}, p1_f0.., ...]), so the per-key frame index is
+        # arange(T_i) tiled HW times per window.  Queries stay at temporal slot 0
+        # (rotary_pos_emb_q=None in the layer), encoding the relative offset -t.
+        kv_t = torch.cat([
+            torch.arange(int(t), device=device).repeat(HW) for t in T_per_window.tolist()
+        ])
+        inv_freq = self.cross_rotary.inv_freq
+        cross_rotary_kv = _build_factorized_rotary(inv_freq, [kv_t], [inv_freq.shape[0]])
+
         for layer in self.layers:
-            query = layer(query, kv_local, cu_seqlens_q_local, cu_seqlens_kv_local, cu_seqlens_q_self, rotary_pos_emb)
+            query = layer(query, kv_local, cu_seqlens_q_local, cu_seqlens_kv_local, cu_seqlens_q_self, rotary_pos_emb,
+                          cross_rotary_kv)
 
         return query
 
