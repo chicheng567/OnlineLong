@@ -15,11 +15,20 @@ Encoder / LPIPS / discriminator are intentionally excluded.
 
 Compatible with the public ``vqgan-f16-16384`` checkpoint
 (``ch=128, ch_mult=[1,1,2,2,4], attn_resolutions=[16], z_channels=embed_dim=256,
-n_embed=16384``). Use ``load_vqgan_decoder`` to construct + load weights from a
-pre-extracted plain state-dict (see scripts/extract_vqgan_state_dict.py).
+n_embed=16384``). Use ``load_vqgan_decoder`` to construct + load weights from
+either a pre-extracted plain state-dict or the raw public ``model.ckpt``
+directly (the loader transparently handles the Lightning checkpoint wrapper and
+the PyTorch>=2.6 ``weights_only`` default).
 """
 from __future__ import annotations
 
+import importlib.abc
+import importlib.machinery
+import importlib.util
+import sys
+import types
+import warnings
+from contextlib import contextmanager
 from typing import List, Optional, Sequence
 
 import torch
@@ -302,6 +311,140 @@ class VQGANDecoder(nn.Module):
         return self.decoder(z_q)
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint loading
+# ---------------------------------------------------------------------------
+
+# Modules referenced by the pickled objects (callbacks, optimizer states,
+# hyper-parameters) inside a *raw* taming/Lightning VQ-GAN checkpoint such as
+# the public ``vqgan-f16-16384`` ``model.ckpt``.  We only need the tensors under
+# ``ckpt["state_dict"]``; these training-time deps are absent from the inference
+# environment, so we fabricate inert stand-ins to let the unpickler complete.
+_VQGAN_CKPT_FAKE_PREFIXES = ("pytorch_lightning", "omegaconf", "taming", "ldm", "main")
+
+
+class _DummyGlobal:
+    """Inert placeholder for any class/function referenced by a foreign pickle."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+
+    def __reduce__(self):
+        return (_DummyGlobal, ())
+
+    def __call__(self, *args, **kwargs):
+        return _DummyGlobal()
+
+    def __getattr__(self, name):
+        return _DummyGlobal
+
+
+class _FakeModule(types.ModuleType):
+    def __getattr__(self, name):
+        return _DummyGlobal
+
+
+class _FakeModuleFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Resolves any import under ``prefixes`` to a module of ``_DummyGlobal``s."""
+
+    def __init__(self, prefixes: Sequence[str]):
+        self.prefixes = tuple(prefixes)
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".")[0] in self.prefixes:
+            return importlib.machinery.ModuleSpec(fullname, self)
+        return None
+
+    def create_module(self, spec):
+        return _FakeModule(spec.name)
+
+    def exec_module(self, module):
+        pass
+
+
+@contextmanager
+def _fake_missing_modules(prefixes: Sequence[str]):
+    """
+    Temporarily fabricate any *not-installed* top-level package in ``prefixes``
+    so a foreign pickle can be unpickled without its training-time deps.
+
+    Genuinely installed packages are left untouched (the real module loads).
+    Fabricated modules are removed again on exit so they don't mask a later
+    real install.
+    """
+    to_fake = []
+    for p in prefixes:
+        try:
+            spec = importlib.util.find_spec(p)
+        except (ImportError, ValueError, AttributeError):
+            spec = None
+        if spec is None:
+            to_fake.append(p)
+
+    if not to_fake:
+        yield
+        return
+
+    finder = _FakeModuleFinder(to_fake)
+    sys.meta_path.insert(0, finder)
+    before = set(sys.modules)
+    try:
+        yield
+    finally:
+        try:
+            sys.meta_path.remove(finder)
+        except ValueError:
+            pass
+        for name in set(sys.modules) - before:
+            if (
+                name.split(".")[0] in tuple(to_fake)
+                and isinstance(sys.modules.get(name), _FakeModule)
+            ):
+                del sys.modules[name]
+
+
+def _load_vqgan_state_dict(path: str) -> dict:
+    """
+    Load weights from either a pre-extracted plain state-dict (``state_dict.pt``)
+    or a raw taming/Lightning checkpoint (``model.ckpt``), returning a flat
+    ``{param_name: tensor}`` dict.
+
+    PyTorch >= 2.6 defaults ``torch.load(weights_only=True)``, which rejects the
+    pickled Lightning objects embedded in ``model.ckpt``.  We try the safe path
+    first (works for the plain state-dict) and fall back to ``weights_only=False``
+    for trusted local checkpoints, fabricating the absent training-time deps so
+    the unpickle succeeds.
+    """
+    try:
+        obj = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:  # noqa: BLE001 — any unpickle failure → unsafe fallback
+        warnings.warn(
+            f"weights_only load of VQ-GAN checkpoint '{path}' failed ({exc}); "
+            "falling back to weights_only=False for this trusted local file "
+            "(e.g. a raw Lightning model.ckpt).",
+            stacklevel=2,
+        )
+        with _fake_missing_modules(_VQGAN_CKPT_FAKE_PREFIXES):
+            obj = torch.load(path, map_location="cpu", weights_only=False)
+
+    # Unwrap Lightning structure: weights live under obj["state_dict"].
+    if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
+        obj = obj["state_dict"]
+
+    # Keep only tensors and drop the discriminator / perceptual-loss branch
+    # ("loss.*"), which the deployed VQGANDecoder does not own.  (The plain
+    # state_dict.pt already omits these, so this is a no-op there.)
+    return {
+        k: v
+        for k, v in obj.items()
+        if isinstance(v, torch.Tensor) and not k.startswith("loss.")
+    }
+
+
 def load_vqgan_decoder(
     state_dict_path: str,
     *,
@@ -310,14 +453,16 @@ def load_vqgan_decoder(
     strict: bool = False,
 ) -> VQGANDecoder:
     """
-    Build a VQGANDecoder with vqgan-f16-16384 defaults and load the plain
-    state-dict produced by scripts/extract_vqgan_state_dict.py.
+    Build a VQGANDecoder with vqgan-f16-16384 defaults and load its weights.
+
+    Accepts either a pre-extracted plain state-dict (``state_dict.pt``) or the
+    raw public ``model.ckpt`` directly — see ``_load_vqgan_state_dict``.
 
     ``strict=False`` because the on-disk state-dict still contains encoder
     and quant_conv tensors which this wrapper does not own.
     """
     model = VQGANDecoder()
-    sd = torch.load(state_dict_path, map_location="cpu", weights_only=True)
+    sd = _load_vqgan_state_dict(state_dict_path)
     missing, unexpected = model.load_state_dict(sd, strict=False)
     unexpected_keep = [k for k in unexpected
                        if not (k.startswith("encoder.") or k.startswith("quant_conv."))]
