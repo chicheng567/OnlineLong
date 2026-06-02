@@ -6,7 +6,7 @@ Pipeline (no LLM required):
   2. Compressor (trainable)  → HW compressed tokens   (single window over all N frames)
   3. Decoder   (trainable)   → 10 × HW decoded tokens  (fixed 10 frame-slots)
   4. Loss: uniformly sample N frame-slot indices from [0..9],
-           MSE between sampled decoded frames and original N visual-token frames.
+           L1 between sampled decoded frames and original N visual-token frames.
 
 Spatial-token constraint:
   For LocalAttnConvCompressor the input must have exactly compress_image_wh tokens
@@ -355,7 +355,7 @@ from typing import Optional as _Optional
 @_dataclass
 class AEOutput(BaseModelOutput):
     loss: _Optional[torch.Tensor] = None
-    mse_loss: _Optional[torch.Tensor] = None
+    recon_loss: _Optional[torch.Tensor] = None
     sem_loss: _Optional[torch.Tensor] = None
     commit_loss: _Optional[torch.Tensor] = None
 
@@ -367,7 +367,7 @@ class AEOutput(BaseModelOutput):
 class CompressorAutoEncoder(nn.Module):
     """
     Wraps vision_encoder (frozen) + compressor + decoder.
-    Forward returns AEOutput(loss=mse_loss).
+    Forward returns AEOutput(loss=recon_loss).
     Compatible with HF Trainer (returns dict-like with 'loss').
     """
 
@@ -521,15 +521,16 @@ class CompressorAutoEncoder(nn.Module):
         decoded = self.decoder(compressed)
         # decoded: (B * max_output_frames * HW, hidden_size)
 
-        # 5. MSE loss with uniform frame sampling. Targets are always the original
-        #    (unmasked) tokens; with tube masking the loss defaults to the masked
-        #    positions only (MAE-style).
+        # 5. Reconstruction loss with uniform frame sampling. Targets are always the
+        #    original (unmasked) tokens; with tube masking the loss defaults to the
+        #    masked positions only (MAE-style).
         decoded_4d = decoded.view(B, max_T, HW, -1)
 
-        # Reconstruction loss is always accumulated in fp32: the encoder features
-        # run in bf16, and bf16's 8-bit mantissa makes the squared error numerically
-        # unstable on the large/outlier ViT activations (a known divergence source).
-        mse = torch.zeros((), device=device, dtype=torch.float32)
+        # L1 reconstruction loss, always accumulated in fp32. L1 penalizes the large
+        # SigLIP/ViT outlier activations linearly instead of quadratically, which is
+        # far more stable than MSE on these unbounded targets; fp32 avoids bf16's
+        # 8-bit mantissa corrupting the per-element error.
+        recon = torch.zeros((), device=device, dtype=torch.float32)
         offset = 0
         for b, n in enumerate(n_frames_list):
             target = visual_tokens[offset : offset + n * HW].view(n, HW, -1).detach()
@@ -538,10 +539,10 @@ class CompressorAutoEncoder(nn.Module):
             sampled = decoded_4d[b, indices]  # (n, HW, hidden_size)
             if spatial_masks is not None and self.recon_masked_only:
                 m = spatial_masks[b]  # (HW,) bool — masked positions
-                mse = mse + F.mse_loss(sampled[:, m, :].float(), target[:, m, :].float())
+                recon = recon + F.l1_loss(sampled[:, m, :].float(), target[:, m, :].float())
             else:
-                mse = mse + F.mse_loss(sampled.float(), target.float())
-        mse = mse / B
+                recon = recon + F.l1_loss(sampled.float(), target.float())
+        recon = recon / B
 
         # 6. Optional global semantic loss (frozen VQ-GAN → frozen IV2 cycle)
         #    and/or VQ commitment loss on the MLP projection.
@@ -557,14 +558,14 @@ class CompressorAutoEncoder(nn.Module):
 
         # Combine everything in fp32 so the optimized loss never round-trips
         # through bf16, regardless of the component dtypes.
-        loss = mse
+        loss = recon
         if sem is not None and self.semantic_loss_weight > 0.0:
             loss = loss + self.semantic_loss_weight * sem.float()
         if commit is not None and self.commit_loss_weight > 0.0:
             loss = loss + self.commit_loss_weight * commit.float()
         return AEOutput(
             loss=loss,
-            mse_loss=mse.detach(),
+            recon_loss=recon.detach(),
             sem_loss=sem.detach() if sem is not None else None,
             commit_loss=commit.detach() if commit is not None else None,
         )
@@ -633,7 +634,7 @@ class PretrainTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(**inputs)
         loss = outputs.loss
-        for key in ("mse_loss", "sem_loss", "commit_loss"):
+        for key in ("recon_loss", "sem_loss", "commit_loss"):
             v = getattr(outputs, key, None)
             if v is None:
                 continue
