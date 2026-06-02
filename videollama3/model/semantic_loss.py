@@ -127,8 +127,9 @@ class GlobalSemanticLoss(nn.Module):
                 + cb_fp32.pow(2).sum(dim=1)
             )
             nearest_idx = d.argmin(dim=1)
-            nearest_e = codebook[nearest_idx].detach().to(z_flat.dtype)
-        return F.mse_loss(z_flat, nearest_e)
+            nearest_e = codebook[nearest_idx].detach()
+        # Commitment loss in fp32 to match the rest of the loss path.
+        return F.mse_loss(z_flat.float(), nearest_e.float())
 
     # ------------------------------------------------------------------
     def forward(self, compressed: torch.Tensor, vid_feat: torch.Tensor):

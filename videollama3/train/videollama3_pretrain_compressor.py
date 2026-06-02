@@ -526,7 +526,10 @@ class CompressorAutoEncoder(nn.Module):
         #    positions only (MAE-style).
         decoded_4d = decoded.view(B, max_T, HW, -1)
 
-        mse = torch.tensor(0.0, device=device, dtype=visual_tokens.dtype)
+        # Reconstruction loss is always accumulated in fp32: the encoder features
+        # run in bf16, and bf16's 8-bit mantissa makes the squared error numerically
+        # unstable on the large/outlier ViT activations (a known divergence source).
+        mse = torch.zeros((), device=device, dtype=torch.float32)
         offset = 0
         for b, n in enumerate(n_frames_list):
             target = visual_tokens[offset : offset + n * HW].view(n, HW, -1).detach()
@@ -535,9 +538,9 @@ class CompressorAutoEncoder(nn.Module):
             sampled = decoded_4d[b, indices]  # (n, HW, hidden_size)
             if spatial_masks is not None and self.recon_masked_only:
                 m = spatial_masks[b]  # (HW,) bool — masked positions
-                mse = mse + F.mse_loss(sampled[:, m, :], target[:, m, :])
+                mse = mse + F.mse_loss(sampled[:, m, :].float(), target[:, m, :].float())
             else:
-                mse = mse + F.mse_loss(sampled, target)
+                mse = mse + F.mse_loss(sampled.float(), target.float())
         mse = mse / B
 
         # 6. Optional global semantic loss (frozen VQ-GAN → frozen IV2 cycle)
@@ -552,11 +555,13 @@ class CompressorAutoEncoder(nn.Module):
         if need_semantic_path:
             sem, commit = self.semantic_loss(compressed, vid_feat.to(device))
 
+        # Combine everything in fp32 so the optimized loss never round-trips
+        # through bf16, regardless of the component dtypes.
         loss = mse
         if sem is not None and self.semantic_loss_weight > 0.0:
-            loss = loss + self.semantic_loss_weight * sem.to(mse.dtype)
+            loss = loss + self.semantic_loss_weight * sem.float()
         if commit is not None and self.commit_loss_weight > 0.0:
-            loss = loss + self.commit_loss_weight * commit.to(mse.dtype)
+            loss = loss + self.commit_loss_weight * commit.float()
         return AEOutput(
             loss=loss,
             mse_loss=mse.detach(),
@@ -864,7 +869,10 @@ def train():
     trainer.train()
 
     # Save only compressor weights (decoder is a pretraining artifact).
-    if training_args.local_rank in (-1, 0):
+    # Use the global process rank (not local_rank) so that on multi-node runs
+    # with a shared filesystem only one process writes the checkpoint instead of
+    # every node's local_rank 0 racing to overwrite the same file.
+    if trainer.is_world_process_zero():
         out_dir = training_args.output_dir
         os.makedirs(out_dir, exist_ok=True)
         compressor_state = {
