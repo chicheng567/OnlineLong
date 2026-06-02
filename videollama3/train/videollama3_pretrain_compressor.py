@@ -120,6 +120,32 @@ class ModelArguments:
             ),
         },
     )
+    # --- VideoMAE-style temporal tube masking (optional) ---
+    use_tube_mask: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable VideoMAE-style temporal tube masking of the compressor input. "
+                "A random subset of spatial positions is replaced by a learnable "
+                "mask_token in *every* frame (a temporal tube), so the model cannot "
+                "exploit temporal redundancy to trivially copy the masked content."
+            ),
+        },
+    )
+    mask_ratio: float = field(
+        default=0.75,
+        metadata={"help": "Fraction of the HW spatial positions to mask (shared across all frames)."},
+    )
+    recon_masked_only: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When use_tube_mask is set, compute the reconstruction MSE on the "
+                "masked positions only (MAE-style).  Set False to keep the loss over "
+                "all positions."
+            ),
+        },
+    )
 
 
 @dataclass
@@ -353,6 +379,9 @@ class CompressorAutoEncoder(nn.Module):
         semantic_loss: Optional[GlobalSemanticLoss] = None,
         semantic_loss_weight: float = 0.0,
         commit_loss_weight: float = 0.0,
+        use_tube_mask: bool = False,
+        mask_ratio: float = 0.75,
+        recon_masked_only: bool = True,
     ):
         super().__init__()
         self.vision_encoder = vision_encoder
@@ -361,10 +390,66 @@ class CompressorAutoEncoder(nn.Module):
         self.semantic_loss = semantic_loss
         self.semantic_loss_weight = semantic_loss_weight
         self.commit_loss_weight = commit_loss_weight
+        self.use_tube_mask = use_tube_mask
+        self.mask_ratio = mask_ratio
+        self.recon_masked_only = recon_masked_only
+
+        # Learnable mask embedding for VideoMAE-style tube masking. Created only
+        # when masking is enabled so it does not show up in the saved state dict
+        # otherwise. Lives at the AE top level; create_optimizer routes it into
+        # the compressor LR group.
+        if use_tube_mask:
+            hidden: int = compressor.hidden_size  # type: ignore[attr-defined]
+            self.mask_token = nn.Parameter(torch.zeros(hidden))
+            nn.init.normal_(self.mask_token, std=0.02)
 
         # Vision encoder is always frozen.
         for p in self.vision_encoder.parameters():
             p.requires_grad = False
+
+    # ------------------------------------------------------------------
+    def _apply_tube_mask(
+        self,
+        visual_tokens: torch.Tensor,
+        n_frames_list: List[int],
+        HW: int,
+    ):
+        """
+        VideoMAE-style temporal tube masking.
+
+        For each sample an independent set of ``round(mask_ratio * HW)`` spatial
+        positions is chosen and masked in *every* frame (a temporal tube), so the
+        same spatial columns are hidden across the whole clip. Masked tokens are
+        replaced by the learnable ``mask_token``; visible tokens are untouched.
+
+        Returns
+        -------
+        masked_tokens : (total_tokens, hidden)  compressor input with mask_token
+            substituted at the masked tube positions.
+        spatial_masks : list of (HW,) bool tensors — the masked positions per
+            sample, reused to restrict the reconstruction loss.
+        """
+        device = visual_tokens.device
+        # Keep at least one visible and one masked position.
+        k = int(round(self.mask_ratio * HW))
+        k = min(max(k, 1), HW - 1)
+
+        spatial_masks: List[torch.Tensor] = []
+        token_mask_parts: List[torch.Tensor] = []
+        for n in n_frames_list:
+            bm = torch.zeros(HW, dtype=torch.bool, device=device)
+            idx = torch.randperm(HW, device=device)[:k]
+            bm[idx] = True
+            spatial_masks.append(bm)
+            # Same spatial mask repeated for each of the n frames (the "tube").
+            token_mask_parts.append(bm.unsqueeze(0).expand(n, HW).reshape(-1))
+        token_mask = torch.cat(token_mask_parts)  # (total_tokens,)
+
+        mask_tok = self.mask_token.to(visual_tokens.dtype)
+        masked_tokens = torch.where(
+            token_mask.unsqueeze(-1), mask_tok.unsqueeze(0), visual_tokens
+        )
+        return masked_tokens, spatial_masks
 
     # ------------------------------------------------------------------
     def forward(
@@ -409,6 +494,19 @@ class CompressorAutoEncoder(nn.Module):
                 "Check video_merge_size matches compress_image_w/h."
             )
 
+        # 1b. Optional VideoMAE-style temporal tube masking. A random subset of
+        #     spatial positions is masked in *every* frame, so the compressor must
+        #     infer them from visible spatial neighbours instead of copying the
+        #     temporally-redundant content. The reconstruction target stays the
+        #     *unmasked* encoder output; only the compressor input is corrupted.
+        spatial_masks: Optional[List[torch.Tensor]] = None
+        if self.use_tube_mask:
+            compressor_input, spatial_masks = self._apply_tube_mask(
+                visual_tokens, n_frames_list, HW
+            )
+        else:
+            compressor_input = visual_tokens
+
         # 2. Build cu_seqlens for single-window compression per sample.
         cu_ends = [0]
         for n in n_frames_list:
@@ -416,14 +514,16 @@ class CompressorAutoEncoder(nn.Module):
         cu_seqlens = torch.tensor(cu_ends, device=device, dtype=torch.int32)
 
         # 3. Compress: each sample's N frames → HW compressed tokens.
-        compressed = self.compressor(visual_tokens, cu_seqlens)
+        compressed = self.compressor(compressor_input, cu_seqlens)
         # compressed: (B * HW, hidden_size)
 
         # 4. Decode to 10 frame slots.
         decoded = self.decoder(compressed)
         # decoded: (B * max_output_frames * HW, hidden_size)
 
-        # 5. MSE loss with uniform frame sampling.
+        # 5. MSE loss with uniform frame sampling. Targets are always the original
+        #    (unmasked) tokens; with tube masking the loss defaults to the masked
+        #    positions only (MAE-style).
         decoded_4d = decoded.view(B, max_T, HW, -1)
 
         mse = torch.tensor(0.0, device=device, dtype=visual_tokens.dtype)
@@ -433,7 +533,11 @@ class CompressorAutoEncoder(nn.Module):
             offset += n * HW
             indices = _uniform_frame_indices(n, max_T)
             sampled = decoded_4d[b, indices]  # (n, HW, hidden_size)
-            mse = mse + F.mse_loss(sampled, target)
+            if spatial_masks is not None and self.recon_masked_only:
+                m = spatial_masks[b]  # (HW,) bool — masked positions
+                mse = mse + F.mse_loss(sampled[:, m, :], target[:, m, :])
+            else:
+                mse = mse + F.mse_loss(sampled, target)
         mse = mse / B
 
         # 6. Optional global semantic loss (frozen VQ-GAN → frozen IV2 cycle)
@@ -495,7 +599,9 @@ class PretrainTrainer(Trainer):
         # tests against the full dotted path).
         semantic_names = {n for n, _ in trainable if n.startswith("semantic_loss.")}
         rest = [(n, p) for n, p in trainable if n not in semantic_names]
-        compressor_names = {n for n, _ in rest if "compressor" in n}
+        # The learnable mask_token lives at the AE top level (no "compressor"/
+        # "decoder" substring), so route it explicitly into the compressor group.
+        compressor_names = {n for n, _ in rest if "compressor" in n or n == "mask_token"}
         decoder_names    = {n for n, _ in rest if "decoder"    in n}
 
         def _groups(names, lr):
@@ -634,6 +740,12 @@ def train():
             "on the semantic-loss path."
         )
 
+    if model_args.use_tube_mask and not (0.0 < model_args.mask_ratio < 1.0):
+        raise ValueError(
+            f"mask_ratio must be in (0, 1) when use_tube_mask=True; "
+            f"got {model_args.mask_ratio}."
+        )
+
     # ---- Vision encoder ------------------------------------------------
     vision_encoder, _, ve_hidden_size = _load_vision_encoder(
         model_args.model_name_or_path,
@@ -652,6 +764,11 @@ def train():
     )
     rank0_print(f"Decoder layers={model_args.decoder_num_layers or compressor_cfg.num_layers} "
                 f"max_output_frames={model_args.max_output_frames}")
+    if model_args.use_tube_mask:
+        rank0_print(
+            f"Tube masking enabled: mask_ratio={model_args.mask_ratio} "
+            f"recon_masked_only={model_args.recon_masked_only}"
+        )
 
     # ---- Optional global semantic loss --------------------------------
     semantic_loss_module: Optional[GlobalSemanticLoss] = None
@@ -695,6 +812,9 @@ def train():
         semantic_loss=semantic_loss_module,
         semantic_loss_weight=model_args.semantic_loss_weight,
         commit_loss_weight=model_args.commit_loss_weight,
+        use_tube_mask=model_args.use_tube_mask,
+        mask_ratio=model_args.mask_ratio,
+        recon_masked_only=model_args.recon_masked_only,
     )
 
     # ---- Processor & Dataset -------------------------------------------
