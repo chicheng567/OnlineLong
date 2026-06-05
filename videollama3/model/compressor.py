@@ -202,6 +202,11 @@ class TransformerDecoderCompressor(nn.Module):
         # over the flattened T×HW token set and loses all frame ordering.
         self.cross_rotary = VisionRotaryEmbedding(dim=head_dim)
         self.layers = nn.ModuleList([TransformerDecoderLayer(config) for _ in range(num_layers)])
+        # Final norm on the compressor output. Each layer is pre-norm residual, so
+        # the residual stream is never normalized and its magnitude grows unbounded
+        # with depth. Normalizing here keeps the compressed tokens (which feed both
+        # the AE decoder and, downstream, the LLM) at a stable scale.
+        self.post_layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.num_layers = num_layers
         self.compress_image_w = config.compress_image_w
         self.compress_image_h = config.compress_image_h
@@ -277,6 +282,7 @@ class TransformerDecoderCompressor(nn.Module):
         for layer in self.layers:
             query = layer(query, kv, cu_seqlens_q, compression_cu_seqlens, rotary_pos_emb,
                           cross_rotary_q, cross_rotary_kv)
+        query = self.post_layernorm(query)
         return query
 
     def decode_tokens(self, compressed_tokens: torch.Tensor) -> torch.Tensor:
@@ -359,6 +365,9 @@ class LocalAttnConvCompressor(nn.Module):
         # treating them as an unordered set.
         self.cross_rotary = VisionRotaryEmbedding(dim=head_dim)
         self.layers = nn.ModuleList([LocalAttnConvLayer(config) for _ in range(num_layers)])
+        # Final norm on the compressor output. See TransformerDecoderCompressor:
+        # the pre-norm residual stream is otherwise left unnormalized and drifts.
+        self.post_layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.num_layers = num_layers
         self.compress_image_w = config.compress_image_w
         self.compress_image_h = config.compress_image_h
@@ -436,6 +445,7 @@ class LocalAttnConvCompressor(nn.Module):
             query = layer(query, kv_local, cu_seqlens_q_local, cu_seqlens_kv_local, cu_seqlens_q_self, rotary_pos_emb,
                           cross_rotary_kv)
 
+        query = self.post_layernorm(query)
         return query
 
     def decode_tokens(self, compressed_tokens: torch.Tensor) -> torch.Tensor:
@@ -628,6 +638,13 @@ class CompressorDecoder(nn.Module):
         # Stage 3: post-attention layers (self-attn + cross-attn to compressed + MLP)
         self.post_layers = nn.ModuleList([CompressorDecoderLayer(config) for _ in range(n_post)])
 
+        # Final norm on the decoded output. The post_layers are pre-norm residual,
+        # so their output is unnormalized and can drift to a large magnitude, while
+        # the L1 reconstruction target (the encoder's post_layernorm output) is
+        # O(1). Normalizing here matches the prediction's scale to the target and
+        # keeps the reconstruction loss well-conditioned.
+        self.post_layernorm = LayerNorm(dim, eps=config.layer_norm_eps)
+
     # ------------------------------------------------------------------
     def _build_spatial_rotary_pos_emb(self) -> torch.Tensor:
         return _build_2d_rotary_pos_emb(self.rotary_pos_emb, self.W, self.H)
@@ -683,6 +700,7 @@ class CompressorDecoder(nn.Module):
         for layer in self.post_layers:
             x = layer(x, compressed_refined, cu_self, cu_q_cross, cu_kv_cross, rotary_pos_emb)
 
+        x = self.post_layernorm(x)
         return x  # (B * T * HW, hidden_size)
 
 
