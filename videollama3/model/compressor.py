@@ -211,7 +211,9 @@ class TransformerDecoderCompressor(nn.Module):
         self.compress_image_w = config.compress_image_w
         self.compress_image_h = config.compress_image_h
         self.compress_image_wh = self.compress_image_w * self.compress_image_h
-        self.query = nn.Parameter(torch.randn(1,self.compress_image_w * self.compress_image_h, config.hidden_size))
+        # Small-scale init (std=0.02): a std=1 query injects a large magnitude into
+        # the residual stream from layer 0, which the pre-norm stack then amplifies.
+        self.query = nn.Parameter(torch.randn(1, self.compress_image_w * self.compress_image_h, config.hidden_size) * 0.02)
         self.window_size = getattr(config, "window_size", 1)
         self.compression_decoder = None
 
@@ -373,7 +375,8 @@ class LocalAttnConvCompressor(nn.Module):
         self.compress_image_h = config.compress_image_h
         self.compress_image_wh = self.compress_image_w * self.compress_image_h
         # One learned query initialiser per spatial position; shared across windows and batch.
-        self.query = nn.Parameter(torch.randn(1, self.compress_image_wh, config.hidden_size))
+        # Small-scale init (std=0.02): see TransformerDecoderCompressor.query.
+        self.query = nn.Parameter(torch.randn(1, self.compress_image_wh, config.hidden_size) * 0.02)
         self.window_size = getattr(config, "window_size", 1)
         self.compression_decoder = None
 
