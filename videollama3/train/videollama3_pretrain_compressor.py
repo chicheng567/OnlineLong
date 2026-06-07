@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from torch.utils.data import Dataset
-from transformers import Trainer
+from transformers import Trainer, TrainerCallback
 from transformers.modeling_outputs import BaseModelOutput
 
 sys.path.append("./")
@@ -572,6 +572,50 @@ class CompressorAutoEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Per-module gradient-norm diagnostics
+# ---------------------------------------------------------------------------
+
+def _grad_group_key(name: str) -> str:
+    """Coarse module bucket for a parameter name, used to localise which part of
+    the compressor / decoder a gradient spike comes from."""
+    if name.startswith("semantic_loss"):
+        return "semantic"
+    if name == "mask_token":
+        return "mask_token"
+    if name.startswith("compressor."):
+        if "post_layernorm" in name:
+            return "compressor.post_ln"
+        if name.endswith(".query"):
+            return "compressor.query"
+        if ".layers." in name:
+            idx = name.split(".layers.")[1].split(".")[0]
+            return f"compressor.layer{idx}"
+        return "compressor.other"
+    if name.startswith("decoder."):
+        if "post_layernorm" in name:
+            return "decoder.post_ln"
+        if "pre_layers" in name:
+            return "decoder.pre_layers"
+        if "upsample_blocks" in name:
+            return "decoder.upsample"
+        if "post_layers" in name:
+            return "decoder.post_layers"
+        return "decoder.other"
+    return "other"
+
+
+class _PerModuleGradNormCallback(TrainerCallback):
+    """Fires after grad accumulation, *before* clipping — the only point where the
+    true (unclipped) per-module gradient magnitudes are visible."""
+
+    def __init__(self, trainer: "PretrainTrainer"):
+        self._trainer = trainer
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        self._trainer._collect_grad_norms()
+
+
+# ---------------------------------------------------------------------------
 # Custom Trainer (separate LR groups for compressor vs decoder)
 # ---------------------------------------------------------------------------
 
@@ -582,6 +626,57 @@ class PretrainTrainer(Trainer):
         # Running sums for auxiliary (per-component) losses; flushed by self.log().
         self._aux_running: Dict[str, float] = {}
         self._aux_count: int = 0
+        # Latest per-module grad norms, injected into the next self.log() call.
+        self._grad_norm_logs: Dict[str, float] = {}
+        # Print the exact exploding tensor name once a single param's grad norm
+        # crosses this; tune via env if it is too chatty / too quiet.
+        self._grad_norm_warn_threshold: float = float(os.environ.get("GRAD_NORM_WARN", "100"))
+        self.add_callback(_PerModuleGradNormCallback(self))
+
+    # ------------------------------------------------------------------
+    def _collect_grad_norms(self):
+        """Group unclipped gradient norms by module and record the single
+        largest-grad parameter, so a spike can be traced to an exact tensor.
+
+        Only runs on steps that will be logged (aligned to logging_steps) to keep
+        the per-tensor norm kernels off the hot path; set logging_steps=1 for
+        fine-grained localisation while debugging the explosion.
+        """
+        log_every = int(getattr(self.args, "logging_steps", 0) or 0)
+        if log_every and ((self.state.global_step + 1) % log_every != 0):
+            return
+
+        names: List[str] = []
+        norms: List[torch.Tensor] = []
+        for n, p in self.model.named_parameters():
+            if p.grad is None:
+                continue
+            names.append(n)
+            norms.append(p.grad.detach().norm(2))  # GPU scalar, no host sync yet
+        if not norms:
+            return
+
+        # Accumulate squared norms per group on-device, then a single sync per group.
+        group_sq: Dict[str, torch.Tensor] = {}
+        for n, t in zip(names, norms):
+            key = _grad_group_key(n)
+            sq = t * t
+            group_sq[key] = sq if key not in group_sq else group_sq[key] + sq
+        logs = {f"gradnorm/{k}": (v.item() ** 0.5) for k, v in group_sq.items()}
+
+        stacked = torch.stack(norms)
+        mx = torch.argmax(stacked)
+        max_idx = int(mx.item())
+        max_val = float(stacked[max_idx].item())
+        max_name = names[max_idx]
+        logs["gradnorm/max_param"] = max_val
+        self._grad_norm_logs = logs
+
+        if max_val > self._grad_norm_warn_threshold:
+            rank0_print(
+                f"[gradnorm] step {self.state.global_step}: "
+                f"largest grad ‖{max_name}‖ = {max_val:.1f}"
+            )
 
     def create_optimizer(self):
         from transformers.trainer_pt_utils import get_parameter_names
@@ -649,6 +744,10 @@ class PretrainTrainer(Trainer):
                 logs[key] = total / self._aux_count
             self._aux_running.clear()
             self._aux_count = 0
+        # Inject the most recent per-module grad norms.
+        if self._grad_norm_logs:
+            logs.update(self._grad_norm_logs)
+            self._grad_norm_logs = {}
         return super().log(logs, *args, **kwargs)
 
 
