@@ -641,12 +641,16 @@ class CompressorDecoder(nn.Module):
         # Stage 3: post-attention layers (self-attn + cross-attn to compressed + MLP)
         self.post_layers = nn.ModuleList([CompressorDecoderLayer(config) for _ in range(n_post)])
 
-        # Final norm on the decoded output. The post_layers are pre-norm residual,
-        # so their output is unnormalized and can drift to a large magnitude, while
-        # the L1 reconstruction target (the encoder's post_layernorm output) is
-        # O(1). Normalizing here matches the prediction's scale to the target and
-        # keeps the reconstruction loss well-conditioned.
-        self.post_layernorm = LayerNorm(dim, eps=config.layer_norm_eps)
+        # NOTE: intentionally NO final LayerNorm on the decoded output.
+        # A LayerNorm right before the reconstruction L1 loss makes the loss
+        # invariant to the per-token mean/scale of its input (LayerNorm(c*x) ==
+        # LayerNorm(x)), turning that scale into an unconstrained "flat" direction.
+        # When it drifts toward 0 the LayerNorm input-gradient (∝ gamma / sqrt(σ²+eps))
+        # blows up, which is exactly the gradient explosion that was concentrated in
+        # `post_layers` (while this norm's own gamma/beta gradient collapsed to ~1e-8).
+        # The decoded output is left as the raw post_layers residual stream; the L1
+        # loss against the (already normalized) encoder target directly constrains its
+        # scale, so there is no flat direction to run away.
 
     # ------------------------------------------------------------------
     def _build_spatial_rotary_pos_emb(self) -> torch.Tensor:
@@ -703,7 +707,6 @@ class CompressorDecoder(nn.Module):
         for layer in self.post_layers:
             x = layer(x, compressed_refined, cu_self, cu_q_cross, cu_kv_cross, rotary_pos_emb)
 
-        x = self.post_layernorm(x)
         return x  # (B * T * HW, hidden_size)
 
 

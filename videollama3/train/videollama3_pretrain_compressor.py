@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from torch.utils.data import Dataset
-from transformers import Trainer, TrainerCallback
+from transformers import Trainer
 from transformers.modeling_outputs import BaseModelOutput
 
 sys.path.append("./")
@@ -604,17 +604,6 @@ def _grad_group_key(name: str) -> str:
     return "other"
 
 
-class _PerModuleGradNormCallback(TrainerCallback):
-    """Fires after grad accumulation, *before* clipping — the only point where the
-    true (unclipped) per-module gradient magnitudes are visible."""
-
-    def __init__(self, trainer: "PretrainTrainer"):
-        self._trainer = trainer
-
-    def on_pre_optimizer_step(self, args, state, control, **kwargs):
-        self._trainer._collect_grad_norms()
-
-
 # ---------------------------------------------------------------------------
 # Custom Trainer (separate LR groups for compressor vs decoder)
 # ---------------------------------------------------------------------------
@@ -631,7 +620,21 @@ class PretrainTrainer(Trainer):
         # Print the exact exploding tensor name once a single param's grad norm
         # crosses this; tune via env if it is too chatty / too quiet.
         self._grad_norm_warn_threshold: float = float(os.environ.get("GRAD_NORM_WARN", "100"))
-        self.add_callback(_PerModuleGradNormCallback(self))
+
+    # ------------------------------------------------------------------
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        # super().training_step runs the backward pass. On the micro-batch that will
+        # actually step the optimizer, accelerator.sync_gradients is True and the
+        # gradients are fully accumulated and all-reduced but NOT yet clipped — HF's
+        # gradient clipping runs *after* training_step returns (right before
+        # optimizer.step). This is the only point where the true *pre-clip* per-module
+        # gradient magnitudes are visible. (The previous on_pre_optimizer_step callback
+        # fired *after* clipping, so every logged per-module norm was post-clip and
+        # summed in quadrature to max_grad_norm, hiding the real explosion.)
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        if self.accelerator.sync_gradients:
+            self._collect_grad_norms()
+        return loss
 
     # ------------------------------------------------------------------
     def _collect_grad_norms(self):
