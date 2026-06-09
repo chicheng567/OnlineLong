@@ -1,5 +1,5 @@
 from torch.nn import LayerNorm
-from typing import List, cast
+from typing import List
 import torch
 from transformers.activations import GELUTanh
 from torch import nn
@@ -202,20 +202,15 @@ class TransformerDecoderCompressor(nn.Module):
         # over the flattened T×HW token set and loses all frame ordering.
         self.cross_rotary = VisionRotaryEmbedding(dim=head_dim)
         self.layers = nn.ModuleList([TransformerDecoderLayer(config) for _ in range(num_layers)])
-        # Final norm on the compressor output. Each layer is pre-norm residual, so
-        # the residual stream is never normalized and its magnitude grows unbounded
-        # with depth. Normalizing here keeps the compressed tokens (which feed both
-        # the AE decoder and, downstream, the LLM) at a stable scale.
+        # Final norm on the compressor output (feeds the AE decoder and the LLM).
         self.post_layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.num_layers = num_layers
         self.compress_image_w = config.compress_image_w
         self.compress_image_h = config.compress_image_h
         self.compress_image_wh = self.compress_image_w * self.compress_image_h
-        # Small-scale init (std=0.02): a std=1 query injects a large magnitude into
-        # the residual stream from layer 0, which the pre-norm stack then amplifies.
+        # Learned query tokens (small-scale init, std=0.02).
         self.query = nn.Parameter(torch.randn(1, self.compress_image_w * self.compress_image_h, config.hidden_size) * 0.02)
         self.window_size = getattr(config, "window_size", 1)
-        self.compression_decoder = None
 
     def _build_query_rotary_pos_emb(self, w, h) -> torch.Tensor:
         return _build_2d_rotary_pos_emb(self.rotary_pos_emb, w, h)
@@ -287,16 +282,6 @@ class TransformerDecoderCompressor(nn.Module):
         query = self.post_layernorm(query)
         return query
 
-    def decode_tokens(self, compressed_tokens: torch.Tensor) -> torch.Tensor:
-        assert self.compression_decoder is not None, "compression_decoder is not defined, cannot decode tokens."
-        if compressed_tokens.dim() == 2:
-            compressed_tokens = compressed_tokens.view(-1, 1, self.compress_image_w, self.compress_image_h, self.hidden_size)
-            compressed_tokens = compressed_tokens.permute(0, 4, 1, 2, 3).contiguous() # (B, hidden_size, T, w, h)
-        assert compressed_tokens.dim() == 5, f"Expected compressed_tokens to have 5 dimensions (B, hidden_size, T, w, h), but got {compressed_tokens.shape}"
-        decoded_tokens = self.compression_decoder(compressed_tokens)
-        decoded_tokens = decoded_tokens.view(-1, self.hidden_size)
-        return decoded_tokens
-
 
 # ---------------------------------------------------------------------------
 # LocalAttnConvCompressor
@@ -367,18 +352,16 @@ class LocalAttnConvCompressor(nn.Module):
         # treating them as an unordered set.
         self.cross_rotary = VisionRotaryEmbedding(dim=head_dim)
         self.layers = nn.ModuleList([LocalAttnConvLayer(config) for _ in range(num_layers)])
-        # Final norm on the compressor output. See TransformerDecoderCompressor:
-        # the pre-norm residual stream is otherwise left unnormalized and drifts.
+        # Final norm on the compressor output (feeds the AE decoder and the LLM).
         self.post_layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.num_layers = num_layers
         self.compress_image_w = config.compress_image_w
         self.compress_image_h = config.compress_image_h
         self.compress_image_wh = self.compress_image_w * self.compress_image_h
-        # One learned query initialiser per spatial position; shared across windows and batch.
-        # Small-scale init (std=0.02): see TransformerDecoderCompressor.query.
+        # One learned query per spatial position; shared across windows and batch
+        # (small-scale init, std=0.02).
         self.query = nn.Parameter(torch.randn(1, self.compress_image_wh, config.hidden_size) * 0.02)
         self.window_size = getattr(config, "window_size", 1)
-        self.compression_decoder = None
 
     def _build_query_rotary_pos_emb(self, w, h) -> torch.Tensor:
         return _build_2d_rotary_pos_emb(self.rotary_pos_emb, w, h)
@@ -451,57 +434,110 @@ class LocalAttnConvCompressor(nn.Module):
         query = self.post_layernorm(query)
         return query
 
-    def decode_tokens(self, compressed_tokens: torch.Tensor) -> torch.Tensor:
-        assert self.compression_decoder is not None, "compression_decoder is not defined, cannot decode tokens."
-        if compressed_tokens.dim() == 2:
-            compressed_tokens = compressed_tokens.view(-1, 1, self.compress_image_w, self.compress_image_h, self.hidden_size)
-            compressed_tokens = compressed_tokens.permute(0, 4, 1, 2, 3).contiguous()
-        assert compressed_tokens.dim() == 5, (
-            f"Expected compressed_tokens with 5 dims (B, hidden_size, T, w, h), got {compressed_tokens.shape}"
-        )
-        decoded_tokens = self.compression_decoder(compressed_tokens)
-        decoded_tokens = decoded_tokens.view(-1, self.hidden_size)
-        return decoded_tokens
-
 
 class CompressorDecoderLayer(nn.Module):
     """
-    Single decoder block: non-causal spatial self-attention (per frame slot) →
-    global cross-attention to compressed tokens → MLP.  All sub-layers use
-    pre-norm + residual.  Mirrors TransformerDecoderLayer but with causal=False.
-    """
-    def __init__(self, config):
-        super().__init__()
-        self.self_attn = selfFlashAttention(
-            embed_dim=config.hidden_size,
-            n_head=config.num_attention_heads,
-            dropout=config.attention_probs_dropout_prob,
-            causal=False,
-        )
-        self.cross_attn = CrossFlashAttention2(
-            embed_dim=config.hidden_size,
-            n_head=config.num_attention_heads,
-            dropout=config.attention_probs_dropout_prob,
-            causal=False,
-        )
-        self.embed_dim = config.hidden_size
-        self.layer_norm1 = LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.layer_norm2 = LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.layer_norm3 = LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = mlp(hidden_size=config.hidden_size, intermediate_size=config.intermediate_size)
+    Conformer-style AE-decoder block.  Two pre-norm residual sub-layers:
 
-    def forward(self, q, kv, cu_seqlens_self, cu_seqlens_q_cross, cu_seqlens_kv_cross, rotary_pos_emb):
-        q = q + self.self_attn(self.layer_norm1(q), cu_seqlens_self, rotary_pos_emb)
-        q = q + self.cross_attn(self.layer_norm2(q), kv, cu_seqlens_q_cross, cu_seqlens_kv_cross)
-        q = q + self.mlp(self.layer_norm3(q))
-        return q
+        x = x  + self_attn(LN(x))            # per-frame spatial self-attention
+        x = up(x) + conv(LN(x))              # depthwise ConvTranspose3d + pointwise Conv3d
+
+    The conv sub-layer's temporal stride equals ``upsample_factor``; when it is > 1
+    the block both refines *and* upsamples in time (the ConvTranspose kernel == factor
+    so the output length is exactly ``T_in * factor``), and the residual branch is
+    upsampled in time by a simple linear layer (``T → T*factor``) so the two shapes
+    match.  When ``upsample_factor == 1`` it is a plain resolution-preserving 3-D conv
+    refinement.
+
+    There is deliberately no cross-attention and no MLP: the pointwise 1x1x1 conv
+    supplies the channel mixing an MLP would, and the compressed seed propagates
+    purely through the conv-upsample stack.  Spatial self-attention is global per
+    frame; temporal mixing is delegated to the conv kernels — the usual Conformer
+    division of labour (attention = global, conv = local).
+
+    All tensors are 5-D ``(B, dim, T, H, W)``; the self-attention sub-layer flattens
+    to frame-major ``(B*T*HW, dim)`` internally and uses the shared 2-D spatial RoPE.
+    """
+
+    def __init__(self, config, upsample_factor: int = 1):
+        super().__init__()
+        dim = config.hidden_size
+        self.embed_dim = dim
+        self.upsample_factor = upsample_factor
+
+        # ── Sub-layer 1: spatial self-attention (per frame) ──
+        self.self_attn = selfFlashAttention(
+            embed_dim=dim,
+            n_head=config.num_attention_heads,
+            dropout=config.attention_probs_dropout_prob,
+            causal=False,
+        )
+        self.layer_norm_attn = LayerNorm(dim, eps=config.layer_norm_eps)
+
+        # ── Sub-layer 2: 3-D conv, optionally temporal-upsampling ──
+        # Depthwise ConvTranspose3d: temporal stride = factor (kernel = factor so
+        # T_out == T_in * factor exactly), spatial 3x3 local mixing kept
+        # resolution-preserving via padding 1.  Pointwise 1x1x1 mixes channels.
+        self.layer_norm_conv = LayerNorm(dim, eps=config.layer_norm_eps)
+        self.depthwise = nn.ConvTranspose3d(
+            dim, dim,
+            kernel_size=(upsample_factor, 3, 3),
+            stride=(upsample_factor, 1, 1),
+            padding=(0, 1, 1),
+            groups=dim,
+        )
+        self.pointwise = nn.Conv3d(dim, dim, kernel_size=1)
+        self.act = GELUTanh()
+
+        # Residual-branch temporal upsampling (only when the conv upsamples).
+        # A simple linear layer expands each frame's channels into `factor` frames
+        # (T → T*factor) so the residual matches the conv output length.  Initialised
+        # to nearest-neighbour repeat (stacked identity blocks) so the residual is an
+        # identity highway at init and only learns to deviate from a plain copy.
+        if upsample_factor > 1:
+            self.residual_up = nn.Linear(dim, dim * upsample_factor)
+            with torch.no_grad():
+                self.residual_up.weight.copy_(torch.eye(dim).repeat(upsample_factor, 1))
+                self.residual_up.bias.zero_()
+
+    def forward(self, x: torch.Tensor, rotary_pos_emb: torch.Tensor) -> torch.Tensor:
+        # x: (B, dim, T, H, W)
+        B, dim, T, H, W = x.shape
+        HW = H * W
+        device = x.device
+
+        # ── Sub-layer 1: per-frame spatial self-attention (pre-norm residual) ──
+        # frame-major flatten: (B, dim, T, H, W) → (B*T*HW, dim)
+        tokens = x.permute(0, 2, 3, 4, 1).reshape(B * T * HW, dim)
+        cu = torch.arange(0, B * T * HW + 1, step=HW, device=device, dtype=torch.int32)
+        tokens = tokens + self.self_attn(self.layer_norm_attn(tokens), cu, rotary_pos_emb)
+        x = tokens.view(B, T, H, W, dim).permute(0, 4, 1, 2, 3).contiguous()
+
+        # ── Sub-layer 2: 3-D conv, optionally temporal-upsampling (pre-norm residual) ──
+        residual = x
+        if self.upsample_factor > 1:
+            # Learned temporal upsample (T → T*f): per-frame linear channel expansion
+            # reshaped into f new frames, ordered t*f + j to match the conv output.
+            f = self.upsample_factor
+            r = self.residual_up(x.permute(0, 2, 3, 4, 1))                  # (B, T, H, W, f*dim)
+            r = r.view(B, T, H, W, f, dim)                                  # split channels → f frames
+            r = r.permute(0, 1, 4, 2, 3, 5).reshape(B, T * f, H, W, dim)    # interleave: t*f + j
+            residual = r.permute(0, 4, 1, 2, 3).contiguous()               # (B, dim, T*f, H, W)
+        # channel-wise LayerNorm: (B, dim, T, H, W) → (B, T, H, W, dim) → norm → back.
+        h = self.layer_norm_conv(x.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3).contiguous()
+        h = self.depthwise(h)
+        h = self.pointwise(h)
+        h = self.act(h)
+        x = residual + h
+        return x
 
 
 def _temporal_factors(n: int) -> List[int]:
     """
     Decompose ``n`` into a sequence of small integer factors (>= 2) for staged
-    temporal upsampling.  Each returned factor is the per-stage stride used by
-    one ``TemporalUpsampleBlock`` and the product equals ``n``.
+    temporal upsampling.  Each returned factor becomes the temporal stride of one
+    upsampling ``CompressorDecoderLayer`` (assigned by
+    ``_distribute_upsample_factors``) and the product equals ``n``.
 
     Examples
     --------
@@ -529,68 +565,61 @@ def _temporal_factors(n: int) -> List[int]:
     return factors
 
 
-class TemporalUpsampleBlock(nn.Module):
+def _distribute_upsample_factors(num_layers: int, target_frames: int) -> List[int]:
     """
-    One stage of staged temporal upsampling.
+    Assign a temporal-upsampling stride to each of ``num_layers`` decoder layers.
 
-    Pipeline (operates on 5-D ``(B, dim, T, H, W)`` tensors):
-        1. Depthwise ``ConvTranspose3d`` — temporal stride = factor, spatial 3×3
-           local mixing.  Channel-wise to keep the parameter count small.
-        2. Pointwise ``Conv3d`` 1×1×1 — cross-channel mixing.
-        3. ``LayerNorm`` over the channel dimension.
-        4. ``GELU`` activation — gives the staged design its non-linear
-           refinement between hops.
+    Returns ``layer_factors`` of length ``num_layers`` whose product equals
+    ``target_frames``.  The "fine" factors from ``_temporal_factors(target_frames)``
+    are spread as evenly as possible across the depth; every other layer gets stride
+    1 (a plain 3-D conv refinement, no temporal change).  If there are fewer layers
+    than factors, trailing factors are merged so the count fits the depth.
+
+    Examples
+    --------
+    >>> _distribute_upsample_factors(8, 10)   # factors [2, 5] spread over 8 layers
+    [1, 1, 1, 2, 1, 1, 1, 5]
+    >>> _distribute_upsample_factors(2, 8)    # factors [2, 2, 2] merged to fit 2 layers
+    [2, 4]
+    >>> _distribute_upsample_factors(4, 1)    # target_frames == 1 → no upsampling
+    [1, 1, 1, 1]
     """
-
-    def __init__(self, dim: int, factor: int, layer_norm_eps: float = 1e-6):
-        super().__init__()
-        self.factor = factor
-        self.depthwise = nn.ConvTranspose3d(
-            dim, dim,
-            kernel_size=(factor, 3, 3),
-            stride=(factor, 1, 1),
-            padding=(0, 1, 1),
-            groups=dim,
-        )
-        self.pointwise = nn.Conv3d(dim, dim, kernel_size=1)
-        self.norm = LayerNorm(dim, eps=layer_norm_eps)
-        self.act = GELUTanh()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, dim, T_in, H, W)  →  (B, dim, T_in * factor, H, W)
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        # LayerNorm over channel dim: (B, dim, T, H, W) → (B, T, H, W, dim) → norm → back.
-        x = x.permute(0, 2, 3, 4, 1)
-        x = self.norm(x)
-        x = self.act(x)
-        x = x.permute(0, 4, 1, 2, 3).contiguous()
-        return x
+    assert num_layers >= 1, "decoder needs at least one layer"
+    factors = _temporal_factors(target_frames)  # product == target_frames
+    if not factors:                              # target_frames == 1
+        return [1] * num_layers
+    # Too many upsample stages for the available depth → merge trailing factors.
+    while len(factors) > num_layers:
+        f = factors.pop()
+        factors[-1] *= f
+    layer_factors = [1] * num_layers
+    k = len(factors)
+    for i, f in enumerate(factors):
+        # Place the k upsample layers at the end of each of k evenly-sized segments,
+        # so temporal expansion is spread through the stack instead of bunched up.
+        pos = (i + 1) * num_layers // k - 1
+        layer_factors[pos] = f
+    return layer_factors
 
 
 class CompressorDecoder(nn.Module):
     """
-    AE decoder combining attention with staged 3-D transposed convolution.
+    AE decoder: a stack of Conformer-style ``CompressorDecoderLayer`` blocks that
+    expand the single compressed frame back to ``max_output_frames`` frames.
 
-    Three-stage pipeline
-    --------------------
-    1. Pre-attention (num_layers // 2 layers):
-       Spatial self-attention + MLP operating on the B×HW compressed tokens.
-       No cross-attention — this refines the compressed representation before
-       the conv upsampling sees it.
+    Each layer applies per-frame spatial self-attention followed by a 3-D conv
+    (pre-norm residual for both).  A subset of the layers carry a temporal-upsampling
+    stride on their conv, chosen by ``_distribute_upsample_factors`` so the strides'
+    product equals ``max_output_frames`` and they are spread across the depth.
+    Temporal expansion therefore happens progressively, interleaved with attention
+    refinement — rather than in one block of stacked upsamplers in the middle.
 
-    2. Staged temporal upsampling (one ``TemporalUpsampleBlock`` per factor in
-       ``_temporal_factors(max_output_frames)``).  For ``max_output_frames=10``
-       this is two stages 1 → 2 → 10; each stage is depthwise ConvTranspose3d +
-       pointwise Conv3d + LayerNorm + GELU.  Replaces the original single-shot
-       ``1 → max_output_frames`` ConvTranspose, which created checkerboard
-       artifacts and gave the model no non-linear refinement between hops.
+    Input  : ``compressed_tokens`` (B * HW, hidden_size)   — one HW grid per sample.
+    Output : (B * max_output_frames * HW, hidden_size)     — frame-major (B, T, H, W).
 
-    3. Post-attention (remaining layers):
-       Per-frame spatial self-attention + cross-attention to the (pre-attn-refined)
-       compressed tokens + MLP.  Cross-attention ties every decoded frame back to
-       the encoder output so the reconstruction is grounded in the compressed
-       representation.
+    A final LayerNorm normalizes the decoded output.  The layers are pre-norm
+    residual, so the residual stream is otherwise never normalized; without this norm
+    training was observed to diverge (faster gradient blow-up and a U-shaped loss).
 
     Parameters
     ----------
@@ -603,54 +632,33 @@ class CompressorDecoder(nn.Module):
         H   = config.compress_image_h
         W   = config.compress_image_w
         dim = config.hidden_size
-        HW  = H * W
         head_dim = dim // config.num_attention_heads
 
-        self.hidden_size      = dim
-        self.H                = H
-        self.W                = W
-        self.HW               = HW
+        self.hidden_size       = dim
+        self.H                 = H
+        self.W                 = W
+        self.HW                = H * W
         self.max_output_frames = max_output_frames
 
         self.rotary_pos_emb = VisionRotaryEmbedding(dim=head_dim // 2)
 
-        n_pre  = config.num_layers // 2
-        n_post = config.num_layers - n_pre
-
-        # Stage 1: pre-attention layers (self-attn + MLP only)
-        self.pre_layers = nn.ModuleList([CompressorDecoderLayer(config) for _ in range(n_pre)])
-
-        # Stage 2: staged temporal upsampling.
-        #   For max_output_frames=10 → factors=[2, 5] → two blocks (1→2→10);
-        #   for max_output_frames=8  → factors=[2, 2, 2] → three blocks (1→2→4→8).
-        #   Each block is depthwise ConvTranspose3d + pointwise Conv3d + LN + GELU.
-        upsample_factors = _temporal_factors(max_output_frames)
+        # Per-layer temporal strides; product == max_output_frames, spread over depth.
+        layer_factors = _distribute_upsample_factors(config.num_layers, max_output_frames)
         prod = 1
-        for f in upsample_factors:
+        for f in layer_factors:
             prod *= f
         assert prod == max_output_frames, (
-            f"_temporal_factors({max_output_frames}) = {upsample_factors} "
-            f"has product {prod}, expected {max_output_frames}."
+            f"_distribute_upsample_factors({config.num_layers}, {max_output_frames}) "
+            f"= {layer_factors} has product {prod}, expected {max_output_frames}."
         )
-        self.upsample_factors = upsample_factors
-        self.upsample_blocks = nn.ModuleList([
-            TemporalUpsampleBlock(dim, factor=f, layer_norm_eps=config.layer_norm_eps)
-            for f in upsample_factors
+        self.layer_factors = layer_factors
+        self.layers = nn.ModuleList([
+            CompressorDecoderLayer(config, upsample_factor=f) for f in layer_factors
         ])
-
-        # Stage 3: post-attention layers (self-attn + cross-attn to compressed + MLP)
-        self.post_layers = nn.ModuleList([CompressorDecoderLayer(config) for _ in range(n_post)])
-
-        # NOTE: intentionally NO final LayerNorm on the decoded output.
-        # A LayerNorm right before the reconstruction L1 loss makes the loss
-        # invariant to the per-token mean/scale of its input (LayerNorm(c*x) ==
-        # LayerNorm(x)), turning that scale into an unconstrained "flat" direction.
-        # When it drifts toward 0 the LayerNorm input-gradient (∝ gamma / sqrt(σ²+eps))
-        # blows up, which is exactly the gradient explosion that was concentrated in
-        # `post_layers` (while this norm's own gamma/beta gradient collapsed to ~1e-8).
-        # The decoded output is left as the raw post_layers residual stream; the L1
-        # loss against the (already normalized) encoder target directly constrains its
-        # scale, so there is no flat direction to run away.
+        # Final norm on the decoded output. The pre-norm residual stream is otherwise
+        # left unnormalized; removing this norm was observed to diverge (faster
+        # gradient blow-up and a U-shaped loss).
+        self.post_layernorm = LayerNorm(dim, eps=config.layer_norm_eps)
 
     # ------------------------------------------------------------------
     def _build_spatial_rotary_pos_emb(self) -> torch.Tensor:
@@ -662,52 +670,26 @@ class CompressorDecoder(nn.Module):
         Args:
             compressed_tokens : (B * HW, hidden_size)
         Returns:
-            (B * max_output_frames * HW, hidden_size)
+            (B * max_output_frames * HW, hidden_size)  — frame-major (B, T, H, W).
         """
-        B      = compressed_tokens.shape[0] // self.HW
-        device = compressed_tokens.device
-        T      = self.max_output_frames
-        HW     = self.HW
-        dim    = self.hidden_size
+        B   = compressed_tokens.shape[0] // self.HW
+        dim = self.hidden_size
 
         rotary_pos_emb = self._build_spatial_rotary_pos_emb()
 
-        # ── Stage 1: pre-attention in compressed space ──────────────────
-        # B groups, each HW tokens
-        cu_pre = torch.arange(0, B * HW + 1, step=HW, device=device, dtype=torch.int32)
-        x = compressed_tokens
-        for _layer in self.pre_layers:
-            layer = cast(CompressorDecoderLayer, _layer)
-            # Use only self_attn + mlp (skip cross_attn for pre-layers)
-            x = x + layer.self_attn(layer.layer_norm1(x), cu_pre, rotary_pos_emb)
-            x = x + layer.mlp(layer.layer_norm3(x))
-
-        # Save the refined compressed tokens for cross-attention in stage 3.
-        compressed_refined = x  # (B * HW, dim)
-
-        # ── Stage 2: staged temporal upsampling ─────────────────────────
+        # Seed the temporal axis with the single compressed frame:
         # (B * HW, dim) → (B, H, W, dim) → (B, dim, H, W) → (B, dim, 1, H, W)
-        x_5d = x.view(B, self.H, self.W, dim).permute(0, 3, 1, 2).unsqueeze(2)
-        # Each block multiplies temporal dim by its factor, with non-linear
-        # refinement (LN + GELU) between hops.  Final shape: (B, dim, T, H, W).
-        for block in self.upsample_blocks:
-            x_5d = block(x_5d)
-        # Back to flat token sequence: (B, T, H, W, dim) → (B*T*HW, dim)
-        x = x_5d.permute(0, 2, 3, 4, 1).reshape(B * T * HW, dim)
+        x = compressed_tokens.view(B, self.H, self.W, dim).permute(0, 3, 1, 2).unsqueeze(2)
 
-        # ── Stage 3: post-attention over expanded sequence ───────────────
-        # Self-attn: per-frame HW groups (preserves 2-D spatial RoPE shape)
-        cu_self = torch.arange(0, B * T * HW + 1, step=HW, device=device, dtype=torch.int32)
-        # Cross-attn: per-batch groups
-        #   Q  group i  → T * HW tokens for batch item i
-        #   KV group i  → HW compressed_refined tokens for batch item i
-        cu_q_cross  = torch.arange(0, (B + 1) * T * HW, step=T * HW, device=device, dtype=torch.int32)
-        cu_kv_cross = torch.arange(0, (B + 1) * HW,     step=HW,     device=device, dtype=torch.int32)
+        for layer in self.layers:
+            x = layer(x, rotary_pos_emb)
 
-        for layer in self.post_layers:
-            x = layer(x, compressed_refined, cu_self, cu_q_cross, cu_kv_cross, rotary_pos_emb)
-
-        return x  # (B * T * HW, hidden_size)
+        # (B, dim, T, H, W) → frame-major (B, T, H, W, dim) → (B*T*HW, dim)
+        T = x.shape[2]
+        assert T == self.max_output_frames, (T, self.max_output_frames)
+        x = x.permute(0, 2, 3, 4, 1).reshape(B * T * self.HW, dim)
+        x = self.post_layernorm(x)
+        return x  # (B * max_output_frames * HW, hidden_size)
 
 
 from transformers import PretrainedConfig

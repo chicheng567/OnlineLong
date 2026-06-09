@@ -526,10 +526,6 @@ class CompressorAutoEncoder(nn.Module):
         #    masked positions only (MAE-style).
         decoded_4d = decoded.view(B, max_T, HW, -1)
 
-        # L1 reconstruction loss, always accumulated in fp32. L1 penalizes the large
-        # SigLIP/ViT outlier activations linearly instead of quadratically, which is
-        # far more stable than MSE on these unbounded targets; fp32 avoids bf16's
-        # 8-bit mantissa corrupting the per-element error.
         recon = torch.zeros((), device=device, dtype=torch.float32)
         offset = 0
         for b, n in enumerate(n_frames_list):
@@ -592,14 +588,9 @@ def _grad_group_key(name: str) -> str:
             return f"compressor.layer{idx}"
         return "compressor.other"
     if name.startswith("decoder."):
-        if "post_layernorm" in name:
-            return "decoder.post_ln"
-        if "pre_layers" in name:
-            return "decoder.pre_layers"
-        if "upsample_blocks" in name:
-            return "decoder.upsample"
-        if "post_layers" in name:
-            return "decoder.post_layers"
+        if ".layers." in name:
+            idx = name.split(".layers.")[1].split(".")[0]
+            return f"decoder.layer{idx}"
         return "decoder.other"
     return "other"
 
