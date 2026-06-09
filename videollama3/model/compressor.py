@@ -437,26 +437,35 @@ class LocalAttnConvCompressor(nn.Module):
 
 class CompressorDecoderLayer(nn.Module):
     """
-    Conformer-style AE-decoder block.  Two pre-norm residual sub-layers:
+    Transformer-encoder AE-decoder block, optionally followed by a temporal-
+    upsampling 3-D conv.
 
-        x = x  + self_attn(LN(x))            # per-frame spatial self-attention
+    Every layer is a standard pre-norm transformer encoder block (two residual
+    sub-layers):
+
+        x = x + self_attn(LN(x))             # per-frame spatial self-attention
+        x = x + mlp(LN(x))                   # position-wise feed-forward
+
+    On the layers selected for temporal upsampling (``upsample_factor > 1``) a third
+    pre-norm residual sub-layer is appended *after the MLP*:
+
         x = up(x) + conv(LN(x))              # depthwise ConvTranspose3d + pointwise Conv3d
 
-    The conv sub-layer's temporal stride equals ``upsample_factor``; when it is > 1
-    the block both refines *and* upsamples in time (the ConvTranspose kernel == factor
-    so the output length is exactly ``T_in * factor``), and the residual branch is
-    upsampled in time by a simple linear layer (``T → T*factor``) so the two shapes
-    match.  When ``upsample_factor == 1`` it is a plain resolution-preserving 3-D conv
-    refinement.
+    The conv's temporal stride equals ``upsample_factor`` and its kernel == factor, so
+    the output length is exactly ``T_in * factor``; the residual branch is upsampled in
+    time by a simple linear layer (``T → T*factor``, init = nearest-neighbour repeat)
+    so the two shapes match.  When ``upsample_factor == 1`` the block is a plain
+    transformer encoder layer with no conv and no temporal change (temporal mixing is
+    delegated entirely to the upsample layers' conv kernels).
 
-    There is deliberately no cross-attention and no MLP: the pointwise 1x1x1 conv
-    supplies the channel mixing an MLP would, and the compressed seed propagates
-    purely through the conv-upsample stack.  Spatial self-attention is global per
-    frame; temporal mixing is delegated to the conv kernels — the usual Conformer
-    division of labour (attention = global, conv = local).
+    ⚠️ The conv sub-layer is always run in **fp32**: 3-D (transpose-)convolutions are
+    numerically unreliable in fp16/bf16 on CUDA and were observed to cause a large
+    reconstruction-loss regression.  ``_upsample_conv_fp32`` disables autocast and
+    feeds fp32 activations; the conv params stay fp32 (AE pretraining uses AMP
+    autocast, which keeps master weights in fp32).
 
-    All tensors are 5-D ``(B, dim, T, H, W)``; the self-attention sub-layer flattens
-    to frame-major ``(B*T*HW, dim)`` internally and uses the shared 2-D spatial RoPE.
+    All tensors are 5-D ``(B, dim, T, H, W)``; the transformer sub-layers flatten to
+    frame-major ``(B*T*HW, dim)`` internally and use the shared 2-D spatial RoPE.
     """
 
     def __init__(self, config, upsample_factor: int = 1):
@@ -465,7 +474,7 @@ class CompressorDecoderLayer(nn.Module):
         self.embed_dim = dim
         self.upsample_factor = upsample_factor
 
-        # ── Sub-layer 1: spatial self-attention (per frame) ──
+        # ── Transformer encoder: per-frame spatial self-attention + MLP ──
         self.self_attn = selfFlashAttention(
             embed_dim=dim,
             n_head=config.num_attention_heads,
@@ -473,32 +482,50 @@ class CompressorDecoderLayer(nn.Module):
             causal=False,
         )
         self.layer_norm_attn = LayerNorm(dim, eps=config.layer_norm_eps)
+        self.layer_norm_mlp = LayerNorm(dim, eps=config.layer_norm_eps)
+        self.mlp = mlp(hidden_size=dim, intermediate_size=config.intermediate_size)
 
-        # ── Sub-layer 2: 3-D conv, optionally temporal-upsampling ──
+        # ── Temporal-upsampling 3-D conv sub-layer (upsample layers only) ──
         # Depthwise ConvTranspose3d: temporal stride = factor (kernel = factor so
         # T_out == T_in * factor exactly), spatial 3x3 local mixing kept
         # resolution-preserving via padding 1.  Pointwise 1x1x1 mixes channels.
-        self.layer_norm_conv = LayerNorm(dim, eps=config.layer_norm_eps)
-        self.depthwise = nn.ConvTranspose3d(
-            dim, dim,
-            kernel_size=(upsample_factor, 3, 3),
-            stride=(upsample_factor, 1, 1),
-            padding=(0, 1, 1),
-            groups=dim,
-        )
-        self.pointwise = nn.Conv3d(dim, dim, kernel_size=1)
-        self.act = GELUTanh()
-
-        # Residual-branch temporal upsampling (only when the conv upsamples).
-        # A simple linear layer expands each frame's channels into `factor` frames
-        # (T → T*factor) so the residual matches the conv output length.  Initialised
-        # to nearest-neighbour repeat (stacked identity blocks) so the residual is an
-        # identity highway at init and only learns to deviate from a plain copy.
         if upsample_factor > 1:
+            self.layer_norm_conv = LayerNorm(dim, eps=config.layer_norm_eps)
+            self.depthwise = nn.ConvTranspose3d(
+                dim, dim,
+                kernel_size=(upsample_factor, 3, 3),
+                stride=(upsample_factor, 1, 1),
+                padding=(0, 1, 1),
+                groups=dim,
+            )
+            self.pointwise = nn.Conv3d(dim, dim, kernel_size=1)
+            self.act = GELUTanh()
+
+            # Residual-branch temporal upsampling. A simple linear layer expands each
+            # frame's channels into `factor` frames (T → T*factor) so the residual
+            # matches the conv output length.  Initialised to nearest-neighbour repeat
+            # (stacked identity blocks) so the residual is an identity highway at init
+            # and only learns to deviate from a plain copy.
             self.residual_up = nn.Linear(dim, dim * upsample_factor)
             with torch.no_grad():
                 self.residual_up.weight.copy_(torch.eye(dim).repeat(upsample_factor, 1))
                 self.residual_up.bias.zero_()
+
+    def _upsample_conv_fp32(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, dim, T, H, W).  3-D (transpose-)convs are numerically unreliable in
+        # fp16/bf16 on CUDA, so the whole conv sub-layer runs in fp32: disable
+        # autocast and feed fp32 activations.  The conv params are kept in fp32 (AE
+        # pretraining uses AMP autocast, which leaves master weights in fp32), so the
+        # op runs entirely in fp32; the result is cast back to the autocast dtype.
+        out_dtype = x.dtype
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            # channel-wise LayerNorm: (B, dim, T, H, W) → (B, T, H, W, dim) → norm → back.
+            h = self.layer_norm_conv(x.permute(0, 2, 3, 4, 1).float())
+            h = h.permute(0, 4, 1, 2, 3).contiguous()
+            h = self.depthwise(h)
+            h = self.pointwise(h)
+            h = self.act(h)
+        return h.to(out_dtype)
 
     def forward(self, x: torch.Tensor, rotary_pos_emb: torch.Tensor) -> torch.Tensor:
         # x: (B, dim, T, H, W)
@@ -506,29 +533,27 @@ class CompressorDecoderLayer(nn.Module):
         HW = H * W
         device = x.device
 
-        # ── Sub-layer 1: per-frame spatial self-attention (pre-norm residual) ──
+        # ── Transformer encoder: per-frame spatial self-attention + MLP ──
         # frame-major flatten: (B, dim, T, H, W) → (B*T*HW, dim)
         tokens = x.permute(0, 2, 3, 4, 1).reshape(B * T * HW, dim)
         cu = torch.arange(0, B * T * HW + 1, step=HW, device=device, dtype=torch.int32)
         tokens = tokens + self.self_attn(self.layer_norm_attn(tokens), cu, rotary_pos_emb)
+        tokens = tokens + self.mlp(self.layer_norm_mlp(tokens))
         x = tokens.view(B, T, H, W, dim).permute(0, 4, 1, 2, 3).contiguous()
 
-        # ── Sub-layer 2: 3-D conv, optionally temporal-upsampling (pre-norm residual) ──
-        residual = x
-        if self.upsample_factor > 1:
-            # Learned temporal upsample (T → T*f): per-frame linear channel expansion
-            # reshaped into f new frames, ordered t*f + j to match the conv output.
-            f = self.upsample_factor
-            r = self.residual_up(x.permute(0, 2, 3, 4, 1))                  # (B, T, H, W, f*dim)
-            r = r.view(B, T, H, W, f, dim)                                  # split channels → f frames
-            r = r.permute(0, 1, 4, 2, 3, 5).reshape(B, T * f, H, W, dim)    # interleave: t*f + j
-            residual = r.permute(0, 4, 1, 2, 3).contiguous()               # (B, dim, T*f, H, W)
-        # channel-wise LayerNorm: (B, dim, T, H, W) → (B, T, H, W, dim) → norm → back.
-        h = self.layer_norm_conv(x.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3).contiguous()
-        h = self.depthwise(h)
-        h = self.pointwise(h)
-        h = self.act(h)
-        x = residual + h
+        if self.upsample_factor <= 1:
+            return x
+
+        # ── Temporal-upsampling 3-D conv after the MLP (pre-norm residual, fp32) ──
+        # Learned temporal upsample (T → T*f) on the residual branch: per-frame linear
+        # channel expansion reshaped into f new frames, ordered t*f + j to match the
+        # conv output.  (Run in the ambient autocast dtype — only the conv needs fp32.)
+        f = self.upsample_factor
+        r = self.residual_up(x.permute(0, 2, 3, 4, 1))                  # (B, T, H, W, f*dim)
+        r = r.view(B, T, H, W, f, dim)                                  # split channels → f frames
+        r = r.permute(0, 1, 4, 2, 3, 5).reshape(B, T * f, H, W, dim)    # interleave: t*f + j
+        residual = r.permute(0, 4, 1, 2, 3).contiguous()               # (B, dim, T*f, H, W)
+        x = residual + self._upsample_conv_fp32(x)
         return x
 
 
@@ -603,16 +628,16 @@ def _tail_upsample_factors(num_layers: int, target_frames: int) -> List[int]:
 
 class CompressorDecoder(nn.Module):
     """
-    AE decoder: a stack of Conformer-style ``CompressorDecoderLayer`` blocks that
+    AE decoder: a stack of transformer-encoder ``CompressorDecoderLayer`` blocks that
     expand the single compressed frame back to ``max_output_frames`` frames.
 
-    Each layer applies per-frame spatial self-attention followed by a 3-D conv
-    (pre-norm residual for both).  The final layers carry a temporal-upsampling
-    stride on their conv, chosen by ``_tail_upsample_factors`` so the strides'
-    product equals ``max_output_frames``.  All temporal expansion is concentrated on
-    the tail of the stack: the earlier layers are plain resolution-preserving
+    Each layer is a standard pre-norm transformer encoder block (per-frame spatial
+    self-attention + MLP).  The final layers additionally append a temporal-upsampling
+    3-D conv after their MLP, with a stride chosen by ``_tail_upsample_factors`` so the
+    strides' product equals ``max_output_frames``.  All temporal expansion is
+    concentrated on the tail of the stack: the earlier layers are plain transformer
     refinements on the single seed frame, and the last few layers progressively
-    upsample in time.
+    upsample in time (the conv always runs in fp32 — see ``CompressorDecoderLayer``).
 
     Input  : ``compressed_tokens`` (B * HW, hidden_size)   — one HW grid per sample.
     Output : (B * max_output_frames * HW, hidden_size)     — frame-major (B, T, H, W).
