@@ -537,7 +537,7 @@ def _temporal_factors(n: int) -> List[int]:
     Decompose ``n`` into a sequence of small integer factors (>= 2) for staged
     temporal upsampling.  Each returned factor becomes the temporal stride of one
     upsampling ``CompressorDecoderLayer`` (assigned by
-    ``_distribute_upsample_factors``) and the product equals ``n``.
+    ``_tail_upsample_factors``) and the product equals ``n``.
 
     Examples
     --------
@@ -565,23 +565,26 @@ def _temporal_factors(n: int) -> List[int]:
     return factors
 
 
-def _distribute_upsample_factors(num_layers: int, target_frames: int) -> List[int]:
+def _tail_upsample_factors(num_layers: int, target_frames: int) -> List[int]:
     """
-    Assign a temporal-upsampling stride to each of ``num_layers`` decoder layers.
+    Assign a temporal-upsampling stride to each of ``num_layers`` decoder layers,
+    concentrating all of the upsampling on the final layers.
 
     Returns ``layer_factors`` of length ``num_layers`` whose product equals
     ``target_frames``.  The "fine" factors from ``_temporal_factors(target_frames)``
-    are spread as evenly as possible across the depth; every other layer gets stride
-    1 (a plain 3-D conv refinement, no temporal change).  If there are fewer layers
-    than factors, trailing factors are merged so the count fits the depth.
+    are placed (in order) on the last ``len(factors)`` layers, so all temporal
+    expansion happens progressively at the tail of the stack; every earlier layer
+    gets stride 1 (a plain 3-D conv refinement, no temporal change).  If there are
+    fewer layers than factors, trailing factors are merged so the count fits the
+    depth.
 
     Examples
     --------
-    >>> _distribute_upsample_factors(8, 10)   # factors [2, 5] spread over 8 layers
-    [1, 1, 1, 2, 1, 1, 1, 5]
-    >>> _distribute_upsample_factors(2, 8)    # factors [2, 2, 2] merged to fit 2 layers
+    >>> _tail_upsample_factors(8, 10)   # factors [2, 5] on the last 2 layers
+    [1, 1, 1, 1, 1, 1, 2, 5]
+    >>> _tail_upsample_factors(2, 8)    # factors [2, 2, 2] merged to fit 2 layers
     [2, 4]
-    >>> _distribute_upsample_factors(4, 1)    # target_frames == 1 → no upsampling
+    >>> _tail_upsample_factors(4, 1)    # target_frames == 1 → no upsampling
     [1, 1, 1, 1]
     """
     assert num_layers >= 1, "decoder needs at least one layer"
@@ -593,12 +596,8 @@ def _distribute_upsample_factors(num_layers: int, target_frames: int) -> List[in
         f = factors.pop()
         factors[-1] *= f
     layer_factors = [1] * num_layers
-    k = len(factors)
-    for i, f in enumerate(factors):
-        # Place the k upsample layers at the end of each of k evenly-sized segments,
-        # so temporal expansion is spread through the stack instead of bunched up.
-        pos = (i + 1) * num_layers // k - 1
-        layer_factors[pos] = f
+    # Concentrate the k upsample stages on the final k layers, keeping their order.
+    layer_factors[num_layers - len(factors):] = factors
     return layer_factors
 
 
@@ -608,11 +607,12 @@ class CompressorDecoder(nn.Module):
     expand the single compressed frame back to ``max_output_frames`` frames.
 
     Each layer applies per-frame spatial self-attention followed by a 3-D conv
-    (pre-norm residual for both).  A subset of the layers carry a temporal-upsampling
-    stride on their conv, chosen by ``_distribute_upsample_factors`` so the strides'
-    product equals ``max_output_frames`` and they are spread across the depth.
-    Temporal expansion therefore happens progressively, interleaved with attention
-    refinement — rather than in one block of stacked upsamplers in the middle.
+    (pre-norm residual for both).  The final layers carry a temporal-upsampling
+    stride on their conv, chosen by ``_tail_upsample_factors`` so the strides'
+    product equals ``max_output_frames``.  All temporal expansion is concentrated on
+    the tail of the stack: the earlier layers are plain resolution-preserving
+    refinements on the single seed frame, and the last few layers progressively
+    upsample in time.
 
     Input  : ``compressed_tokens`` (B * HW, hidden_size)   — one HW grid per sample.
     Output : (B * max_output_frames * HW, hidden_size)     — frame-major (B, T, H, W).
@@ -642,13 +642,14 @@ class CompressorDecoder(nn.Module):
 
         self.rotary_pos_emb = VisionRotaryEmbedding(dim=head_dim // 2)
 
-        # Per-layer temporal strides; product == max_output_frames, spread over depth.
-        layer_factors = _distribute_upsample_factors(config.num_layers, max_output_frames)
+        # Per-layer temporal strides; product == max_output_frames, concentrated on
+        # the final layers.
+        layer_factors = _tail_upsample_factors(config.num_layers, max_output_frames)
         prod = 1
         for f in layer_factors:
             prod *= f
         assert prod == max_output_frames, (
-            f"_distribute_upsample_factors({config.num_layers}, {max_output_frames}) "
+            f"_tail_upsample_factors({config.num_layers}, {max_output_frames}) "
             f"= {layer_factors} has product {prod}, expected {max_output_frames}."
         )
         self.layer_factors = layer_factors
