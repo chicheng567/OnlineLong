@@ -6,7 +6,7 @@ Pipeline (no LLM required):
   2. Compressor (trainable)  → HW compressed tokens   (single window over all N frames)
   3. Decoder   (trainable)   → 10 × HW decoded tokens  (fixed 10 frame-slots)
   4. Loss: uniformly sample N frame-slot indices from [0..9],
-           L1 between sampled decoded frames and original N visual-token frames.
+           MSE between sampled decoded frames and original N visual-token frames.
 
 Spatial-token constraint:
   For LocalAttnConvCompressor the input must have exactly compress_image_wh tokens
@@ -358,6 +358,13 @@ class AEOutput(BaseModelOutput):
     recon_loss: _Optional[torch.Tensor] = None
     sem_loss: _Optional[torch.Tensor] = None
     commit_loss: _Optional[torch.Tensor] = None
+    # Collapse / scale-mismatch monitors (no grad). recon_norm/target_norm track the
+    # output scale (should approach target_norm); recon_norm_std → 0 flags norm
+    # collapse; recon_cos → 0 flags directional collapse (output ignores the input).
+    recon_norm: _Optional[torch.Tensor] = None
+    recon_norm_std: _Optional[torch.Tensor] = None
+    target_norm: _Optional[torch.Tensor] = None
+    recon_cos: _Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +534,11 @@ class CompressorAutoEncoder(nn.Module):
         decoded_4d = decoded.view(B, max_T, HW, -1)
 
         recon = torch.zeros((), device=device, dtype=torch.float32)
+        # Per-token monitors (no grad) over all sampled positions, regardless of
+        # masking — used to detect collapse / output-scale mismatch in TensorBoard.
+        mon_recon_norms: List[torch.Tensor] = []
+        mon_target_norms: List[torch.Tensor] = []
+        mon_cos: List[torch.Tensor] = []
         offset = 0
         for b, n in enumerate(n_frames_list):
             target = visual_tokens[offset : offset + n * HW].view(n, HW, -1).detach()
@@ -535,10 +547,23 @@ class CompressorAutoEncoder(nn.Module):
             sampled = decoded_4d[b, indices]  # (n, HW, hidden_size)
             if spatial_masks is not None and self.recon_masked_only:
                 m = spatial_masks[b]  # (HW,) bool — masked positions
-                recon = recon + F.l1_loss(sampled[:, m, :].float(), target[:, m, :].float())
+                recon = recon + F.mse_loss(sampled[:, m, :].float(), target[:, m, :].float())
             else:
-                recon = recon + F.l1_loss(sampled.float(), target.float())
+                recon = recon + F.mse_loss(sampled.float(), target.float())
+            with torch.no_grad():
+                s = sampled.detach().float().reshape(-1, sampled.shape[-1])
+                t = target.float().reshape(-1, target.shape[-1])
+                mon_recon_norms.append(s.norm(dim=-1))
+                mon_target_norms.append(t.norm(dim=-1))
+                mon_cos.append(F.cosine_similarity(s, t, dim=-1))
         recon = recon / B
+
+        with torch.no_grad():
+            rn = torch.cat(mon_recon_norms)
+            recon_norm = rn.mean()
+            recon_norm_std = rn.std()
+            target_norm = torch.cat(mon_target_norms).mean()
+            recon_cos = torch.cat(mon_cos).mean()
 
         # 6. Optional global semantic loss (frozen VQ-GAN → frozen IV2 cycle)
         #    and/or VQ commitment loss on the MLP projection.
@@ -564,6 +589,10 @@ class CompressorAutoEncoder(nn.Module):
             recon_loss=recon.detach(),
             sem_loss=sem.detach() if sem is not None else None,
             commit_loss=commit.detach() if commit is not None else None,
+            recon_norm=recon_norm,
+            recon_norm_std=recon_norm_std,
+            target_norm=target_norm,
+            recon_cos=recon_cos,
         )
 
 
@@ -579,8 +608,6 @@ def _grad_group_key(name: str) -> str:
     if name == "mask_token":
         return "mask_token"
     if name.startswith("compressor."):
-        if "post_layernorm" in name:
-            return "compressor.post_ln"
         if name.endswith(".query"):
             return "compressor.query"
         if ".layers." in name:
@@ -608,20 +635,14 @@ class PretrainTrainer(Trainer):
         self._aux_count: int = 0
         # Latest per-module grad norms, injected into the next self.log() call.
         self._grad_norm_logs: Dict[str, float] = {}
-        # Print the exact exploding tensor name once a single param's grad norm
-        # crosses this; tune via env if it is too chatty / too quiet.
+        # Warn with the exact tensor name when a single param's grad norm crosses this.
         self._grad_norm_warn_threshold: float = float(os.environ.get("GRAD_NORM_WARN", "100"))
 
     # ------------------------------------------------------------------
     def training_step(self, model, inputs, num_items_in_batch=None):
-        # super().training_step runs the backward pass. On the micro-batch that will
-        # actually step the optimizer, accelerator.sync_gradients is True and the
-        # gradients are fully accumulated and all-reduced but NOT yet clipped — HF's
-        # gradient clipping runs *after* training_step returns (right before
-        # optimizer.step). This is the only point where the true *pre-clip* per-module
-        # gradient magnitudes are visible. (The previous on_pre_optimizer_step callback
-        # fired *after* clipping, so every logged per-module norm was post-clip and
-        # summed in quadrature to max_grad_norm, hiding the real explosion.)
+        # Collect per-module grad norms on the optimizer-step micro-batch, where
+        # gradients are accumulated and all-reduced but not yet clipped (HF clips
+        # after training_step returns), so the logged norms are pre-clip.
         loss = super().training_step(model, inputs, num_items_in_batch)
         if self.accelerator.sync_gradients:
             self._collect_grad_norms()
@@ -630,11 +651,8 @@ class PretrainTrainer(Trainer):
     # ------------------------------------------------------------------
     def _collect_grad_norms(self):
         """Group unclipped gradient norms by module and record the single
-        largest-grad parameter, so a spike can be traced to an exact tensor.
-
-        Only runs on steps that will be logged (aligned to logging_steps) to keep
-        the per-tensor norm kernels off the hot path; set logging_steps=1 for
-        fine-grained localisation while debugging the explosion.
+        largest-grad parameter. Only runs on logged steps (aligned to
+        logging_steps) to limit the per-tensor norm computation.
         """
         log_every = int(getattr(self.args, "logging_steps", 0) or 0)
         if log_every and ((self.state.global_step + 1) % log_every != 0):
@@ -723,7 +741,8 @@ class PretrainTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(**inputs)
         loss = outputs.loss
-        for key in ("recon_loss", "sem_loss", "commit_loss"):
+        for key in ("recon_loss", "sem_loss", "commit_loss",
+                    "recon_norm", "recon_norm_std", "target_norm", "recon_cos"):
             v = getattr(outputs, key, None)
             if v is None:
                 continue

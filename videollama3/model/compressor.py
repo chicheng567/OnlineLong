@@ -202,8 +202,6 @@ class TransformerDecoderCompressor(nn.Module):
         # over the flattened T×HW token set and loses all frame ordering.
         self.cross_rotary = VisionRotaryEmbedding(dim=head_dim)
         self.layers = nn.ModuleList([TransformerDecoderLayer(config) for _ in range(num_layers)])
-        # Final norm on the compressor output (feeds the AE decoder and the LLM).
-        self.post_layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.num_layers = num_layers
         self.compress_image_w = config.compress_image_w
         self.compress_image_h = config.compress_image_h
@@ -279,7 +277,6 @@ class TransformerDecoderCompressor(nn.Module):
         for layer in self.layers:
             query = layer(query, kv, cu_seqlens_q, compression_cu_seqlens, rotary_pos_emb,
                           cross_rotary_q, cross_rotary_kv)
-        query = self.post_layernorm(query)
         return query
 
 
@@ -352,8 +349,6 @@ class LocalAttnConvCompressor(nn.Module):
         # treating them as an unordered set.
         self.cross_rotary = VisionRotaryEmbedding(dim=head_dim)
         self.layers = nn.ModuleList([LocalAttnConvLayer(config) for _ in range(num_layers)])
-        # Final norm on the compressor output (feeds the AE decoder and the LLM).
-        self.post_layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.num_layers = num_layers
         self.compress_image_w = config.compress_image_w
         self.compress_image_h = config.compress_image_h
@@ -431,7 +426,6 @@ class LocalAttnConvCompressor(nn.Module):
             query = layer(query, kv_local, cu_seqlens_q_local, cu_seqlens_kv_local, cu_seqlens_q_self, rotary_pos_emb,
                           cross_rotary_kv)
 
-        query = self.post_layernorm(query)
         return query
 
 
@@ -458,11 +452,10 @@ class CompressorDecoderLayer(nn.Module):
     transformer encoder layer with no conv and no temporal change (temporal mixing is
     delegated entirely to the upsample layers' conv kernels).
 
-    ⚠️ The conv sub-layer is always run in **fp32**: 3-D (transpose-)convolutions are
-    numerically unreliable in fp16/bf16 on CUDA and were observed to cause a large
-    reconstruction-loss regression.  ``_upsample_conv_fp32`` disables autocast and
-    feeds fp32 activations; the conv params stay fp32 (AE pretraining uses AMP
-    autocast, which keeps master weights in fp32).
+    The conv sub-layer always runs in **fp32** for numerical stability (3-D
+    (transpose-)convolutions are unreliable in fp16/bf16 on CUDA): ``_upsample_conv_fp32``
+    disables autocast and feeds fp32 activations; the conv params stay fp32 (AE
+    pretraining uses AMP autocast, which keeps master weights in fp32).
 
     All tensors are 5-D ``(B, dim, T, H, W)``; the transformer sub-layers flatten to
     frame-major ``(B*T*HW, dim)`` internally and use the shared 2-D spatial RoPE.
@@ -642,10 +635,6 @@ class CompressorDecoder(nn.Module):
     Input  : ``compressed_tokens`` (B * HW, hidden_size)   — one HW grid per sample.
     Output : (B * max_output_frames * HW, hidden_size)     — frame-major (B, T, H, W).
 
-    A final LayerNorm normalizes the decoded output.  The layers are pre-norm
-    residual, so the residual stream is otherwise never normalized; without this norm
-    training was observed to diverge (faster gradient blow-up and a U-shaped loss).
-
     Parameters
     ----------
     config : Videollama3TokenCompressorConfig
@@ -681,10 +670,6 @@ class CompressorDecoder(nn.Module):
         self.layers = nn.ModuleList([
             CompressorDecoderLayer(config, upsample_factor=f) for f in layer_factors
         ])
-        # Final norm on the decoded output. The pre-norm residual stream is otherwise
-        # left unnormalized; removing this norm was observed to diverge (faster
-        # gradient blow-up and a U-shaped loss).
-        self.post_layernorm = LayerNorm(dim, eps=config.layer_norm_eps)
 
     # ------------------------------------------------------------------
     def _build_spatial_rotary_pos_emb(self) -> torch.Tensor:
@@ -714,7 +699,6 @@ class CompressorDecoder(nn.Module):
         T = x.shape[2]
         assert T == self.max_output_frames, (T, self.max_output_frames)
         x = x.permute(0, 2, 3, 4, 1).reshape(B * T * self.HW, dim)
-        x = self.post_layernorm(x)
         return x  # (B * max_output_frames * HW, hidden_size)
 
 
