@@ -69,6 +69,10 @@ def _uniform_frame_indices(n_input: int, n_output: int = 10) -> List[int]:
     return [round(i * (n_output - 1) / (n_input - 1)) for i in range(n_input)]
 
 
+# Temporal arrangements the order-discrimination head must tell apart.
+_ORDER_CLASSES = ("original", "reversed", "permuted")
+
+
 # ---------------------------------------------------------------------------
 # Arguments
 # ---------------------------------------------------------------------------
@@ -87,11 +91,13 @@ class ModelArguments:
     compressor_layer_norm_eps: float = field(default=1e-6)
     compress_image_w: int = field(default=16)
     compress_image_h: int = field(default=16)
-    decoder_num_layers: Optional[int] = field(
-        default=None,
-        metadata={"help": "Decoder depth; defaults to compressor_num_layers."},
+    max_output_frames: int = field(
+        default=8,
+        metadata={
+            "help": "Output frame count; must be a power of two. The decoder depth is "
+            "fixed at log2(max_output_frames) — each layer doubles the temporal length."
+        },
     )
-    max_output_frames: int = field(default=10)
     # --- Global semantic loss (optional) ---
     use_semantic_loss: bool = field(
         default=False,
@@ -145,6 +151,35 @@ class ModelArguments:
                 "all positions."
             ),
         },
+    )
+    # --- Motion-weighted reconstruction ---
+    motion_loss_weight: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Weight λ on the *motion* component of the reconstruction loss. The "
+                "per-position MSE is split into a temporal-mean (static) term and a "
+                "deviation-from-mean (motion) term: recon = ‖m-m̂‖² + λ·‖δ-δ̂‖². λ=1 "
+                "reproduces plain MSE exactly; λ>1 amplifies the motion gradient to "
+                "help escape the temporal-mean collapse basin."
+            ),
+        },
+    )
+    # --- Order-discrimination auxiliary loss ---
+    use_order_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Add a classification head on the compressed tokens that must tell "
+                "apart the temporal arrangement of the input (original / reversed / "
+                "permuted), forcing the compressed feature to encode frame order "
+                "instead of collapsing to the order-invariant temporal mean."
+            ),
+        },
+    )
+    order_loss_weight: float = field(
+        default=0.1,
+        metadata={"help": "Scale for the order-discrimination cross-entropy loss."},
     )
 
 
@@ -358,6 +393,12 @@ class AEOutput(BaseModelOutput):
     recon_loss: _Optional[torch.Tensor] = None
     sem_loss: _Optional[torch.Tensor] = None
     commit_loss: _Optional[torch.Tensor] = None
+    # Static (temporal-mean) vs motion (deviation-from-mean) split of the recon loss.
+    recon_static: _Optional[torch.Tensor] = None
+    recon_motion: _Optional[torch.Tensor] = None
+    # Order-discrimination auxiliary loss and its train accuracy (chance = 1/3).
+    order_loss: _Optional[torch.Tensor] = None
+    order_acc: _Optional[torch.Tensor] = None
     # Collapse / scale-mismatch monitors (no grad). recon_norm/target_norm track the
     # output scale (should approach target_norm); recon_norm_std → 0 flags norm
     # collapse; recon_cos → 0 flags directional collapse (output ignores the input).
@@ -389,6 +430,9 @@ class CompressorAutoEncoder(nn.Module):
         use_tube_mask: bool = False,
         mask_ratio: float = 0.75,
         recon_masked_only: bool = True,
+        motion_loss_weight: float = 1.0,
+        use_order_loss: bool = False,
+        order_loss_weight: float = 0.0,
     ):
         super().__init__()
         self.vision_encoder = vision_encoder
@@ -400,6 +444,9 @@ class CompressorAutoEncoder(nn.Module):
         self.use_tube_mask = use_tube_mask
         self.mask_ratio = mask_ratio
         self.recon_masked_only = recon_masked_only
+        self.motion_loss_weight = motion_loss_weight
+        self.use_order_loss = use_order_loss
+        self.order_loss_weight = order_loss_weight
 
         # Learnable mask embedding for VideoMAE-style tube masking. Created only
         # when masking is enabled so it does not show up in the saved state dict
@@ -409,6 +456,18 @@ class CompressorAutoEncoder(nn.Module):
             hidden: int = compressor.hidden_size  # type: ignore[attr-defined]
             self.mask_token = nn.Parameter(torch.zeros(hidden))
             nn.init.normal_(self.mask_token, std=0.02)
+
+        # Order-discrimination head: a per-token 3-way classifier (original /
+        # reversed / permuted) on the compressed feature. Created only when enabled
+        # so it stays out of the saved state dict otherwise; create_optimizer routes
+        # it into the compressor LR group.
+        if use_order_loss:
+            hidden_o: int = compressor.hidden_size  # type: ignore[attr-defined]
+            self.order_head = nn.Sequential(
+                nn.Linear(hidden_o, hidden_o // 4),
+                nn.GELU(),
+                nn.Linear(hidden_o // 4, len(_ORDER_CLASSES)),
+            )
 
         # Vision encoder is always frozen.
         for p in self.vision_encoder.parameters():
@@ -422,10 +481,10 @@ class CompressorAutoEncoder(nn.Module):
         HW: int,
     ):
         """
-        VideoMAE-style temporal tube masking.
+        VideoMAE-style temporal tube masking, random.
 
-        For each sample an independent set of ``round(mask_ratio * HW)`` spatial
-        positions is chosen and masked in *every* frame (a temporal tube), so the
+        For each sample ``round(mask_ratio * HW)`` spatial positions are chosen
+        uniformly at random and masked in *every* frame (a temporal tube), so the
         same spatial columns are hidden across the whole clip. Masked tokens are
         replaced by the learnable ``mask_token``; visible tokens are untouched.
 
@@ -445,6 +504,7 @@ class CompressorAutoEncoder(nn.Module):
         token_mask_parts: List[torch.Tensor] = []
         for n in n_frames_list:
             bm = torch.zeros(HW, dtype=torch.bool, device=device)
+            # Random spatial positions, masked across all n frames (the "tube").
             idx = torch.randperm(HW, device=device)[:k]
             bm[idx] = True
             spatial_masks.append(bm)
@@ -457,6 +517,88 @@ class CompressorAutoEncoder(nn.Module):
             token_mask.unsqueeze(-1), mask_tok.unsqueeze(0), visual_tokens
         )
         return masked_tokens, spatial_masks
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _recon_static_motion(sampled: torch.Tensor, target: torch.Tensor):
+        """
+        Split the per-position reconstruction MSE into a temporal-mean (static) term
+        and a deviation-from-mean (motion) term.  ``sampled`` / ``target`` are
+        ``(n, P, hidden)`` over the n frames at P spatial positions.
+
+        Writing x = m + δ with m = mean_t x and δ = x − m (so Σ_t δ = 0), the cross
+        term vanishes and the plain MSE decomposes orthogonally:
+            mean_t ‖x − x̂‖²  =  ‖m − m̂‖²  +  mean_t ‖δ − δ̂‖²
+        Returned as (static, motion), each mean-reduced; static + 1·motion equals the
+        plain MSE exactly.
+        """
+        s_mean = sampled.mean(dim=0, keepdim=True)
+        t_mean = target.mean(dim=0, keepdim=True)
+        static = F.mse_loss(s_mean, t_mean)
+        motion = F.mse_loss(sampled - s_mean, target - t_mean)
+        return static, motion
+
+    # ------------------------------------------------------------------
+    def _order_loss(self, visual_tokens: torch.Tensor, n_frames_list: List[int], HW: int):
+        """
+        Temporal-order discrimination on the compressed feature.
+
+        For every window with >= 3 frames (so original / reversed / a non-trivial
+        permutation are all distinct) we build the three arrangements of its frozen-
+        encoder tokens, run the *trainable* compressor on all of them in one packed
+        call, and the per-token head must classify which arrangement produced each
+        compressed feature (cross-entropy, chance = 1/3).
+
+        A collapsed compressor outputs the order-invariant temporal mean, so the head
+        cannot beat chance and the gradient pushes the compressed feature to encode
+        frame order.  Returns (loss, accuracy), or None when no window is eligible.
+        """
+        device = visual_tokens.device
+        hidden = visual_tokens.shape[-1]
+
+        slices, off = [], 0
+        for n in n_frames_list:
+            if n >= 3:
+                slices.append((off, n))
+            off += n * HW
+        if not slices:
+            return None
+
+        arr_tokens: List[torch.Tensor] = []
+        cu: List[int] = [0]
+        labels: List[int] = []
+        for cls, kind in enumerate(_ORDER_CLASSES):
+            for s, n in slices:
+                frames = visual_tokens[s : s + n * HW].view(n, HW, hidden)
+                ident = torch.arange(n, device=device)
+                rev = torch.arange(n - 1, -1, -1, device=device)
+                if kind == "original":
+                    perm = ident
+                elif kind == "reversed":
+                    perm = rev
+                else:
+                    perm = torch.randperm(n, device=device)
+                    # keep the label unambiguous: a permutation must differ from both
+                    # the identity and the reverse.
+                    while torch.equal(perm, ident) or torch.equal(perm, rev):
+                        perm = torch.randperm(n, device=device)
+                arr_tokens.append(frames[perm].reshape(-1, hidden))
+                cu.append(cu[-1] + n * HW)
+                labels.append(cls)
+
+        tokens = torch.cat(arr_tokens, dim=0)
+        cu_seqlens = torch.tensor(cu, device=device, dtype=torch.int32)
+        labels_t = torch.tensor(labels, device=device, dtype=torch.long)
+
+        compressed = self.compressor(tokens, cu_seqlens)  # (num_arr * HW, hidden)
+        num_arr = labels_t.numel()
+        # Per-token logits averaged over the HW grid: an ensemble of per-position
+        # classifiers, robust to order being coded in only some spatial positions.
+        logits = self.order_head(compressed).view(num_arr, HW, -1).mean(dim=1)  # (num_arr, C)
+        loss = F.cross_entropy(logits, labels_t)
+        with torch.no_grad():
+            acc = (logits.argmax(dim=-1) == labels_t).float().mean()
+        return loss, acc
 
     # ------------------------------------------------------------------
     def forward(
@@ -534,6 +676,8 @@ class CompressorAutoEncoder(nn.Module):
         decoded_4d = decoded.view(B, max_T, HW, -1)
 
         recon = torch.zeros((), device=device, dtype=torch.float32)
+        static_sum = torch.zeros((), device=device, dtype=torch.float32)
+        motion_sum = torch.zeros((), device=device, dtype=torch.float32)
         # Per-token monitors (no grad) over all sampled positions, regardless of
         # masking — used to detect collapse / output-scale mismatch in TensorBoard.
         mon_recon_norms: List[torch.Tensor] = []
@@ -547,9 +691,15 @@ class CompressorAutoEncoder(nn.Module):
             sampled = decoded_4d[b, indices]  # (n, HW, hidden_size)
             if spatial_masks is not None and self.recon_masked_only:
                 m = spatial_masks[b]  # (HW,) bool — masked positions
-                recon = recon + F.mse_loss(sampled[:, m, :].float(), target[:, m, :].float())
+                static, motion = self._recon_static_motion(
+                    sampled[:, m, :].float(), target[:, m, :].float()
+                )
             else:
-                recon = recon + F.mse_loss(sampled.float(), target.float())
+                static, motion = self._recon_static_motion(sampled.float(), target.float())
+            # recon = ‖m-m̂‖² + λ·‖δ-δ̂‖²; λ=1 reproduces plain MSE exactly.
+            recon = recon + static + self.motion_loss_weight * motion
+            static_sum = static_sum + static.detach()
+            motion_sum = motion_sum + motion.detach()
             with torch.no_grad():
                 s = sampled.detach().float().reshape(-1, sampled.shape[-1])
                 t = target.float().reshape(-1, target.shape[-1])
@@ -557,6 +707,8 @@ class CompressorAutoEncoder(nn.Module):
                 mon_target_norms.append(t.norm(dim=-1))
                 mon_cos.append(F.cosine_similarity(s, t, dim=-1))
         recon = recon / B
+        recon_static = static_sum / B
+        recon_motion = motion_sum / B
 
         with torch.no_grad():
             rn = torch.cat(mon_recon_norms)
@@ -577,6 +729,14 @@ class CompressorAutoEncoder(nn.Module):
         if need_semantic_path:
             sem, commit = self.semantic_loss(compressed, vid_feat.to(device))
 
+        # 6b. Optional temporal-order discrimination on the compressed tokens.
+        order: Optional[torch.Tensor] = None
+        order_acc: Optional[torch.Tensor] = None
+        if self.use_order_loss and self.order_loss_weight > 0.0:
+            order_out = self._order_loss(visual_tokens, n_frames_list, HW)
+            if order_out is not None:
+                order, order_acc = order_out
+
         # Combine everything in fp32 so the optimized loss never round-trips
         # through bf16, regardless of the component dtypes.
         loss = recon
@@ -584,11 +744,17 @@ class CompressorAutoEncoder(nn.Module):
             loss = loss + self.semantic_loss_weight * sem.float()
         if commit is not None and self.commit_loss_weight > 0.0:
             loss = loss + self.commit_loss_weight * commit.float()
+        if order is not None:
+            loss = loss + self.order_loss_weight * order.float()
         return AEOutput(
             loss=loss,
             recon_loss=recon.detach(),
             sem_loss=sem.detach() if sem is not None else None,
             commit_loss=commit.detach() if commit is not None else None,
+            recon_static=recon_static,
+            recon_motion=recon_motion,
+            order_loss=order.detach() if order is not None else None,
+            order_acc=order_acc.detach() if order_acc is not None else None,
             recon_norm=recon_norm,
             recon_norm_std=recon_norm_std,
             target_norm=target_norm,
@@ -607,6 +773,8 @@ def _grad_group_key(name: str) -> str:
         return "semantic"
     if name == "mask_token":
         return "mask_token"
+    if name.startswith("order_head"):
+        return "order_head"
     if name.startswith("compressor."):
         if name.endswith(".query"):
             return "compressor.query"
@@ -712,9 +880,13 @@ class PretrainTrainer(Trainer):
         # tests against the full dotted path).
         semantic_names = {n for n, _ in trainable if n.startswith("semantic_loss.")}
         rest = [(n, p) for n, p in trainable if n not in semantic_names]
-        # The learnable mask_token lives at the AE top level (no "compressor"/
-        # "decoder" substring), so route it explicitly into the compressor group.
-        compressor_names = {n for n, _ in rest if "compressor" in n or n == "mask_token"}
+        # The learnable mask_token and the order-discrimination head live at the AE
+        # top level (no "compressor"/"decoder" substring), so route them explicitly
+        # into the compressor group.
+        compressor_names = {
+            n for n, _ in rest
+            if "compressor" in n or n == "mask_token" or n.startswith("order_head")
+        }
         decoder_names    = {n for n, _ in rest if "decoder"    in n}
 
         def _groups(names, lr):
@@ -742,6 +914,7 @@ class PretrainTrainer(Trainer):
         outputs = model(**inputs)
         loss = outputs.loss
         for key in ("recon_loss", "sem_loss", "commit_loss",
+                    "recon_static", "recon_motion", "order_loss", "order_acc",
                     "recon_norm", "recon_norm_std", "target_norm", "recon_cos"):
             v = getattr(outputs, key, None)
             if v is None:
@@ -818,12 +991,14 @@ def _build_compressor(
 
 
 def _build_decoder(model_args: ModelArguments, compressor_cfg: Videollama3TokenCompressorConfig) -> CompressorDecoder:
-    # Allow independent decoder depth; default to same as encoder.
+    # Decoder depth is not configurable: CompressorDecoder fixes it at
+    # log2(max_output_frames) (each layer doubles the temporal length). num_layers in
+    # this config carrier is unused by the decoder.
     decoder_cfg = Videollama3TokenCompressorConfig(
         compressor_type=model_args.compressor_type,
         hidden_size=compressor_cfg.hidden_size,
         intermediate_size=compressor_cfg.intermediate_size,
-        num_layers=model_args.decoder_num_layers or compressor_cfg.num_layers,
+        num_layers=compressor_cfg.num_layers,
         num_attention_heads=compressor_cfg.num_attention_heads,
         attention_probs_dropout_prob=compressor_cfg.attention_probs_dropout_prob,
         layer_norm_eps=compressor_cfg.layer_norm_eps,
@@ -880,12 +1055,18 @@ def train():
         f"heads={compressor_cfg.num_attention_heads} "
         f"HW={compressor_cfg.compress_image_w}×{compressor_cfg.compress_image_h}"
     )
-    rank0_print(f"Decoder layers={model_args.decoder_num_layers or compressor_cfg.num_layers} "
+    rank0_print(f"Decoder layers={decoder.num_layers} (=log2 max_output_frames) "
                 f"max_output_frames={model_args.max_output_frames}")
     if model_args.use_tube_mask:
         rank0_print(
             f"Tube masking enabled: mask_ratio={model_args.mask_ratio} "
             f"recon_masked_only={model_args.recon_masked_only}"
+        )
+    if model_args.motion_loss_weight != 1.0:
+        rank0_print(f"Motion-weighted recon enabled: λ={model_args.motion_loss_weight}")
+    if model_args.use_order_loss:
+        rank0_print(
+            f"Order-discrimination loss enabled: weight={model_args.order_loss_weight}"
         )
 
     # ---- Optional global semantic loss --------------------------------
@@ -933,6 +1114,9 @@ def train():
         use_tube_mask=model_args.use_tube_mask,
         mask_ratio=model_args.mask_ratio,
         recon_masked_only=model_args.recon_masked_only,
+        motion_loss_weight=model_args.motion_loss_weight,
+        use_order_loss=model_args.use_order_loss,
+        order_loss_weight=model_args.order_loss_weight,
     )
 
     # ---- Processor & Dataset -------------------------------------------
