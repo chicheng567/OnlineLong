@@ -288,10 +288,23 @@ class TransformerDecoderCompressor(nn.Module):
 # compression while preserving spatial resolution.
 #
 # Layer order per transformer block:
-#   1. Local cross-attention  (query p attends only to the T tokens at position p)
-#   2. Spatial self-attention (all H×W queries within a window communicate)
+#   1. Spatial self-attention (all H×W queries within a window communicate)
+#   2. Local cross-attention  (query p attends only to the T tokens at position p)
 #   3. MLP
 # All sub-layers use pre-norm + residual connection.
+#
+# Self-attention runs FIRST (not last) deliberately, matching TransformerDecoderLayer's
+# self-attn -> cross-attn -> mlp convention (and the standard Transformer-decoder /
+# DETR ordering). Measured (see diagnostics/query_attention_health.py): a positional
+# self-attention is an averaging/mixing operation over the H×W queries, and whichever
+# sub-layer runs LAST has the final say on cross-position diversity (MLP is position-
+# wise and can't restore it). With self-attn last, its branch output was found to
+# outscale the residual stream ~16x and homogenize all H×W outputs to near-identical
+# vectors, erasing the real per-position signal cross-attn had just injected — even
+# though the residual connection is intact. Running self-attn first (while queries are
+# still maximally diverse, straight from the learned per-position init) and cross-attn
+# last (small-magnitude, content-differentiated, residual-dominated — confirmed healthy
+# in TransformerDecoderCompressor) avoids this.
 # ---------------------------------------------------------------------------
 
 class LocalAttnConvLayer(nn.Module):
@@ -318,14 +331,18 @@ class LocalAttnConvLayer(nn.Module):
 
     def forward(self, q, kv_local, cu_seqlens_q_local, cu_seqlens_kv_local, cu_seqlens_q_self, rotary_pos_emb,
                 cross_rotary_kv=None):
-        # 1. Local cross-attention: query at position p sees only position p's T frame tokens.
+        # 1. Spatial self-attention: queries within a window exchange spatial context,
+        #    while they are still maximally differentiated (straight from the learned
+        #    per-position query init / the previous layer's cross-attn-injected content).
+        q = q + self.self_attn(self.layer_norm1(q), cu_seqlens_q_self, rotary_pos_emb)
+        # 2. Local cross-attention: query at position p sees only position p's T frame tokens.
         #    The query stays at temporal slot 0 (rotary_pos_emb_q=None → identity) while the
         #    keys carry their frame index via cross_rotary_kv, so the dot product encodes the
-        #    relative offset -t and the T frames are no longer exchangeable.
-        q = q + self.cross_attn(self.layer_norm1(q), kv_local, cu_seqlens_q_local, cu_seqlens_kv_local,
+        #    relative offset -t and the T frames are no longer exchangeable. Runs LAST (after
+        #    self-attn) so the per-position content it injects isn't mixed back across
+        #    positions by anything downstream (MLP is position-wise).
+        q = q + self.cross_attn(self.layer_norm2(q), kv_local, cu_seqlens_q_local, cu_seqlens_kv_local,
                                 None, cross_rotary_kv)
-        # 2. Spatial self-attention: queries within a window exchange spatial context.
-        q = q + self.self_attn(self.layer_norm2(q), cu_seqlens_q_self, rotary_pos_emb)
         # 3. MLP.
         q = q + self.mlp(self.layer_norm3(q))
         return q
