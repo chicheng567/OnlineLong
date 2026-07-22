@@ -815,7 +815,7 @@ class CompressorAutoEncoder(nn.Module):
                     ).to(imgs.dtype)
                     resized = normalize_for_iv2(resized)
                     video_in = resized.permute(1, 0, 2, 3).unsqueeze(0)  # (1, 3, n, H, W)
-                    feat = self.semantic_loss.iv2(video_in).squeeze(0)  # (768,)
+                    feat = self.semantic_loss.iv2_forward(video_in).squeeze(0)  # (768,)
                     a = F.normalize(feat.float(), dim=-1)
                     tgt = F.normalize(vid_feat[b].float().to(device).detach(), dim=-1)
                     sem_sum = sem_sum + (1.0 - (a * tgt).sum())

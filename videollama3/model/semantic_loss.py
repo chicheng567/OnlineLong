@@ -39,6 +39,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .internvideo2_vendor import InternVideo2L, normalize_for_iv2
 from .vqgan_vendor import VQGANDecoder
@@ -204,9 +205,21 @@ class GlobalSemanticLoss(nn.Module):
         return self.mlp(tokens)
 
     def decode_images(self, z_flat: torch.Tensor, num_images: int) -> torch.Tensor:
-        """``(num_images*HW, z_channels) -> (num_images, 3, H, W)`` in ``[-1, 1]``."""
+        """``(num_images*HW, z_channels) -> (num_images, 3, H, W)`` in ``[-1, 1]``.
+
+        Gradient-checkpointed: the VQ-GAN decoder (ResNet + attention blocks
+        across 5 resolution stages) is re-run on backward instead of keeping its
+        internal activations, since this is called once per sample in a Python
+        loop and those activations would otherwise all stay live until the
+        single backward() call at the end of the batch.
+        """
         z = self._reshape_to_latent_grid(z_flat, num_images)
-        return self.vqgan.decode_from_continuous(z)
+        return checkpoint(self.vqgan.decode_from_continuous, z, use_reentrant=False)
+
+    def iv2_forward(self, video_in: torch.Tensor) -> torch.Tensor:
+        """Gradient-checkpointed call into the frozen IV2 backbone (24
+        transformer blocks) — same rationale as ``decode_images``."""
+        return checkpoint(self.iv2, video_in, use_reentrant=False)
 
     def commit_loss(self, z_flat: torch.Tensor) -> torch.Tensor:
         return self._compute_commit_loss(z_flat)
