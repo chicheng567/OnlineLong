@@ -191,3 +191,22 @@ class GlobalSemanticLoss(nn.Module):
         cos = (a * b).sum(dim=-1)
         sem_loss = (1.0 - cos).mean()
         return sem_loss, commit_loss
+
+    # ------------------------------------------------------------------
+    # Primitives reused by callers that decode a token set other than the
+    # compressor bottleneck (e.g. per-frame decoder outputs) through the same
+    # frozen MLP → VQ-GAN cycle. ``forward()`` above composes these for the
+    # bottleneck case; ``decode_images``/``project_to_latent``/``commit_loss``
+    # let a caller do the same decode on an arbitrary number of "images".
+    # ------------------------------------------------------------------
+    def project_to_latent(self, tokens: torch.Tensor) -> torch.Tensor:
+        """``(M, compressor_hidden) -> (M, z_channels)`` via the trainable MLP."""
+        return self.mlp(tokens)
+
+    def decode_images(self, z_flat: torch.Tensor, num_images: int) -> torch.Tensor:
+        """``(num_images*HW, z_channels) -> (num_images, 3, H, W)`` in ``[-1, 1]``."""
+        z = self._reshape_to_latent_grid(z_flat, num_images)
+        return self.vqgan.decode_from_continuous(z)
+
+    def commit_loss(self, z_flat: torch.Tensor) -> torch.Tensor:
+        return self._compute_commit_loss(z_flat)

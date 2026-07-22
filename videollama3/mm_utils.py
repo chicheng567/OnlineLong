@@ -558,6 +558,15 @@ def get_frame_indices(
         #    padded_frame_indices = [frame_indices[-1]] * num_frames
         #    padded_frame_indices[:len(frame_indices)] = frame_indices
         #    frame_indices = padded_frame_indices
+    elif sample == "uniform":
+        # Deterministic and FPS-independent: always returns exactly `num_frames`
+        # indices evenly spaced across [0, vlen-1], so every video contributes the
+        # same frame count regardless of its own length/fps. Indices repeat only
+        # when the video itself has fewer raw frames than requested.
+        if vlen <= 1:
+            frame_indices = [0] * num_frames
+        else:
+            frame_indices = np.linspace(0, vlen - 1, num_frames).round().astype(int).tolist()
     elif "fps" in sample:  # fps0.5, sequentially sample frames at 0.5 fps
         output_fps = float(sample[3:])
         duration = float(vlen) / input_fps

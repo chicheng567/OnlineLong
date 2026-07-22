@@ -21,10 +21,12 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
+from PIL import Image
 from torch.utils.data import Dataset
 from transformers import Trainer
 from transformers.modeling_outputs import BaseModelOutput
@@ -39,7 +41,7 @@ from videollama3.model.compressor import (
     TransformerDecoderCompressor,
     Videollama3TokenCompressorConfig,
 )
-from videollama3.model.internvideo2_vendor import load_internvideo2_l
+from videollama3.model.internvideo2_vendor import load_internvideo2_l, normalize_for_iv2
 from videollama3.model.processor import Videollama3Processor
 from videollama3.model.semantic_loss import GlobalSemanticLoss
 from videollama3.model.vqgan_vendor import load_vqgan_decoder
@@ -67,6 +69,13 @@ def _uniform_frame_indices(n_input: int, n_output: int = 10) -> List[int]:
     if n_input == 1:
         return [n_output // 2]
     return [round(i * (n_output - 1) / (n_input - 1)) for i in range(n_input)]
+
+
+def _frame_to_vqgan_tensor(img: Image.Image, size: int) -> torch.Tensor:
+    """PIL frame -> (3, size, size) tensor in [-1, 1] (taming-transformers convention)."""
+    img = img.convert("RGB").resize((size, size), Image.Resampling.BICUBIC)
+    t = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
+    return t.permute(2, 0, 1)
 
 
 # Temporal arrangements the order-discrimination head must tell apart.
@@ -101,9 +110,28 @@ class ModelArguments:
     # --- Global semantic loss (optional) ---
     use_semantic_loss: bool = field(
         default=False,
-        metadata={"help": "Add MLP → VQ-GAN → IV2 cycle loss against cached IV2 video features."},
+        metadata={
+            "help": (
+                "Decode each decoder output frame-slot through the frozen MLP -> "
+                "VQ-GAN -> IV2 cycle (not the compressor bottleneck): restack the "
+                "decoded frames into a video and compare its IV2 feature against "
+                "the cached IV2 video feature (semantic_loss_weight), and optionally "
+                "MSE the decoded frames against the real input frames "
+                "(decoder_pixel_loss_weight)."
+            ),
+        },
     )
     semantic_loss_weight: float = field(default=0.1)
+    decoder_pixel_loss_weight: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Weight for pixel-space MSE between the VQ-GAN-decoded per-frame "
+                "images (from the decoder's output, not the bottleneck) and the "
+                "real input frames. Requires use_semantic_loss=True."
+            ),
+        },
+    )
     vqgan_state_dict: Optional[str] = field(
         default="pretrained_models/vqgan/state_dict.pt",
         metadata={"help": "Plain state-dict extracted from vqgan-f16-16384."},
@@ -149,6 +177,19 @@ class ModelArguments:
                 "When use_tube_mask is set, compute the reconstruction MSE on the "
                 "masked positions only (MAE-style).  Set False to keep the loss over "
                 "all positions."
+            ),
+        },
+    )
+    # --- Feature-space reconstruction loss weight ---
+    recon_loss_weight: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Weight on the feature-space reconstruction loss (decoder output vs. "
+                "frozen vision-encoder tokens). This is the only loss term with no "
+                "on/off flag, so it defaults to 1.0 (unweighted, previous behavior); "
+                "lower it to let semantic_loss_weight/decoder_pixel_loss_weight "
+                "dominate."
             ),
         },
     )
@@ -255,6 +296,8 @@ class VideoPretrainDataset(Dataset):
         data_root: Optional[str] = None,
         min_frames: int = 4,
         iv2_cache_dir: Optional[str] = None,
+        decode_pixel_targets: bool = False,
+        vqgan_image_size: int = 256,
     ):
         with open(data_path) as f:
             raw = json.load(f)
@@ -281,6 +324,8 @@ class VideoPretrainDataset(Dataset):
         self.data_root = data_root
         self.min_frames = min_frames
         self.iv2_cache_dir = iv2_cache_dir
+        self.decode_pixel_targets = decode_pixel_targets
+        self.vqgan_image_size = vqgan_image_size
 
         # If using cached IV2 features, drop samples that don't have a cache file.
         if iv2_cache_dir is not None:
@@ -323,12 +368,17 @@ class VideoPretrainDataset(Dataset):
             frames, _ = read_frames_decord(
                 video_path,
                 num_frames=self.max_frames,
+                sample="uniform",
                 return_timestamps=True,
             )
         except Exception as exc:
             logger.warning("Failed to load %s: %s — retrying random sample", video_path, exc)
             return self.__getitem__(random.randint(0, len(self.data) - 1))
 
+        # sample="uniform" always returns exactly self.max_frames frames (indices
+        # repeat only for pathologically short raw videos), so every sample in a
+        # batch has the same frame count. min_frames is kept only as a guard
+        # against those degenerate near-empty videos.
         n_frames = len(frames)
         if n_frames < self.min_frames:
             logger.warning(
@@ -361,6 +411,12 @@ class VideoPretrainDataset(Dataset):
             # Cached IV2 vector saved as fp16; collator/model casts later.
             vid_feat = torch.load(item["_iv2_feat_path"], map_location="cpu", weights_only=True)
             out["vid_feat"] = vid_feat.to(torch.float32)
+        if self.decode_pixel_targets:
+            # Ground truth for the decoder-end VQ-GAN pixel/semantic loss: the real
+            # frames at the VQ-GAN's own output resolution, in its [-1, 1] convention.
+            out["vqgan_target_frames"] = torch.stack(
+                [_frame_to_vqgan_tensor(f, self.vqgan_image_size) for f in frames]
+            )
         return out
 
 
@@ -377,6 +433,10 @@ class DataCollatorForPretraining:
         batch["n_frames"] = torch.stack([x["n_frames"] for x in instances])
         if "vid_feat" in instances[0]:
             batch["vid_feat"] = torch.stack([x["vid_feat"] for x in instances])
+        if "vqgan_target_frames" in instances[0]:
+            batch["vqgan_target_frames"] = torch.cat(
+                [x["vqgan_target_frames"] for x in instances], dim=0
+            )
         return batch
 
 
@@ -392,6 +452,7 @@ class AEOutput(BaseModelOutput):
     loss: _Optional[torch.Tensor] = None
     recon_loss: _Optional[torch.Tensor] = None
     sem_loss: _Optional[torch.Tensor] = None
+    pixel_loss: _Optional[torch.Tensor] = None
     commit_loss: _Optional[torch.Tensor] = None
     # Static (temporal-mean) vs motion (deviation-from-mean) split of the recon loss.
     recon_static: _Optional[torch.Tensor] = None
@@ -426,7 +487,9 @@ class CompressorAutoEncoder(nn.Module):
         decoder: CompressorDecoder,
         semantic_loss: Optional[GlobalSemanticLoss] = None,
         semantic_loss_weight: float = 0.0,
+        decoder_pixel_loss_weight: float = 0.0,
         commit_loss_weight: float = 0.0,
+        recon_loss_weight: float = 1.0,
         use_tube_mask: bool = False,
         mask_ratio: float = 0.75,
         recon_masked_only: bool = True,
@@ -440,7 +503,9 @@ class CompressorAutoEncoder(nn.Module):
         self.decoder = decoder
         self.semantic_loss = semantic_loss
         self.semantic_loss_weight = semantic_loss_weight
+        self.decoder_pixel_loss_weight = decoder_pixel_loss_weight
         self.commit_loss_weight = commit_loss_weight
+        self.recon_loss_weight = recon_loss_weight
         self.use_tube_mask = use_tube_mask
         self.mask_ratio = mask_ratio
         self.recon_masked_only = recon_masked_only
@@ -608,6 +673,7 @@ class CompressorAutoEncoder(nn.Module):
         merge_sizes: torch.Tensor,
         n_frames: torch.Tensor,
         vid_feat: Optional[torch.Tensor] = None,
+        vqgan_target_frames: Optional[torch.Tensor] = None,
         **_kwargs,
     ) -> AEOutput:
         n_frames_list: List[int] = n_frames.tolist()
@@ -683,7 +749,27 @@ class CompressorAutoEncoder(nn.Module):
         mon_recon_norms: List[torch.Tensor] = []
         mon_target_norms: List[torch.Tensor] = []
         mon_cos: List[torch.Tensor] = []
+
+        # Decoder-end semantic/pixel supervision: decode each sample's *decoder*
+        # output frame-slots (not the compressor bottleneck) through the frozen
+        # MLP -> VQ-GAN cycle, then (a) restack the decoded frames into a video and
+        # compare its IV2 feature against the cached target, and/or (b) MSE the
+        # decoded frames against the real input frames.
+        need_semantic_path = (
+            self.semantic_loss is not None
+            and vid_feat is not None
+            and (
+                self.semantic_loss_weight > 0.0
+                or self.decoder_pixel_loss_weight > 0.0
+                or self.commit_loss_weight > 0.0
+            )
+        )
+        sem_sum = torch.zeros((), device=device, dtype=torch.float32) if (need_semantic_path and self.semantic_loss_weight > 0.0) else None
+        pixel_sum = torch.zeros((), device=device, dtype=torch.float32) if (need_semantic_path and self.decoder_pixel_loss_weight > 0.0) else None
+        commit_sum = torch.zeros((), device=device, dtype=torch.float32) if (need_semantic_path and self.commit_loss_weight > 0.0) else None
+
         offset = 0
+        frame_offset = 0
         for b, n in enumerate(n_frames_list):
             target = visual_tokens[offset : offset + n * HW].view(n, HW, -1).detach()
             offset += n * HW
@@ -706,9 +792,45 @@ class CompressorAutoEncoder(nn.Module):
                 mon_recon_norms.append(s.norm(dim=-1))
                 mon_target_norms.append(t.norm(dim=-1))
                 mon_cos.append(F.cosine_similarity(s, t, dim=-1))
+
+            if need_semantic_path:
+                assert self.semantic_loss is not None and vid_feat is not None  # implied by need_semantic_path
+                z_flat = self.semantic_loss.project_to_latent(sampled.reshape(n * HW, -1))
+                need_imgs = pixel_sum is not None or sem_sum is not None
+                imgs = self.semantic_loss.decode_images(z_flat, n) if need_imgs else None
+                # (n, 3, H, W) in [-1, 1], decoded from this sample's decoder output.
+
+                if pixel_sum is not None and vqgan_target_frames is not None:
+                    assert imgs is not None  # need_imgs is True whenever pixel_sum is not None
+                    tgt_imgs = vqgan_target_frames[frame_offset : frame_offset + n]
+                    pixel_sum = pixel_sum + F.mse_loss(imgs.float(), tgt_imgs.to(device).float())
+
+                if sem_sum is not None:
+                    assert imgs is not None  # need_imgs is True whenever sem_sum is not None
+                    resized = F.interpolate(
+                        imgs.float(),
+                        size=(self.semantic_loss.iv2_image_size, self.semantic_loss.iv2_image_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).to(imgs.dtype)
+                    resized = normalize_for_iv2(resized)
+                    video_in = resized.permute(1, 0, 2, 3).unsqueeze(0)  # (1, 3, n, H, W)
+                    feat = self.semantic_loss.iv2(video_in).squeeze(0)  # (768,)
+                    a = F.normalize(feat.float(), dim=-1)
+                    tgt = F.normalize(vid_feat[b].float().to(device).detach(), dim=-1)
+                    sem_sum = sem_sum + (1.0 - (a * tgt).sum())
+
+                if commit_sum is not None:
+                    commit_sum = commit_sum + self.semantic_loss.commit_loss(z_flat)
+
+            frame_offset += n
+
         recon = recon / B
         recon_static = static_sum / B
         recon_motion = motion_sum / B
+        sem = (sem_sum / B) if sem_sum is not None else None
+        pixel = (pixel_sum / B) if pixel_sum is not None else None
+        commit = (commit_sum / B) if commit_sum is not None else None
 
         with torch.no_grad():
             rn = torch.cat(mon_recon_norms)
@@ -716,18 +838,6 @@ class CompressorAutoEncoder(nn.Module):
             recon_norm_std = rn.std()
             target_norm = torch.cat(mon_target_norms).mean()
             recon_cos = torch.cat(mon_cos).mean()
-
-        # 6. Optional global semantic loss (frozen VQ-GAN → frozen IV2 cycle)
-        #    and/or VQ commitment loss on the MLP projection.
-        sem: Optional[torch.Tensor] = None
-        commit: Optional[torch.Tensor] = None
-        need_semantic_path = (
-            self.semantic_loss is not None
-            and vid_feat is not None
-            and (self.semantic_loss_weight > 0.0 or self.commit_loss_weight > 0.0)
-        )
-        if need_semantic_path:
-            sem, commit = self.semantic_loss(compressed, vid_feat.to(device))
 
         # 6b. Optional temporal-order discrimination on the compressed tokens.
         order: Optional[torch.Tensor] = None
@@ -739,17 +849,20 @@ class CompressorAutoEncoder(nn.Module):
 
         # Combine everything in fp32 so the optimized loss never round-trips
         # through bf16, regardless of the component dtypes.
-        loss = recon
+        loss = self.recon_loss_weight * recon
         if sem is not None and self.semantic_loss_weight > 0.0:
             loss = loss + self.semantic_loss_weight * sem.float()
         if commit is not None and self.commit_loss_weight > 0.0:
             loss = loss + self.commit_loss_weight * commit.float()
         if order is not None:
             loss = loss + self.order_loss_weight * order.float()
+        if pixel is not None and self.decoder_pixel_loss_weight > 0.0:
+            loss = loss + self.decoder_pixel_loss_weight * pixel.float()
         return AEOutput(
             loss=loss,
             recon_loss=recon.detach(),
             sem_loss=sem.detach() if sem is not None else None,
+            pixel_loss=pixel.detach() if pixel is not None else None,
             commit_loss=commit.detach() if commit is not None else None,
             recon_static=recon_static,
             recon_motion=recon_motion,
@@ -913,7 +1026,7 @@ class PretrainTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(**inputs)
         loss = outputs.loss
-        for key in ("recon_loss", "sem_loss", "commit_loss",
+        for key in ("recon_loss", "sem_loss", "pixel_loss", "commit_loss",
                     "recon_static", "recon_motion", "order_loss", "order_acc",
                     "recon_norm", "recon_norm_std", "target_norm", "recon_cos"):
             v = getattr(outputs, key, None)
@@ -1033,6 +1146,12 @@ def train():
             "on the semantic-loss path."
         )
 
+    if model_args.decoder_pixel_loss_weight > 0.0 and not model_args.use_semantic_loss:
+        raise ValueError(
+            "decoder_pixel_loss_weight > 0 requires use_semantic_loss=True — the "
+            "MLP -> VQ-GAN decode it reads from only exists on the semantic-loss path."
+        )
+
     if model_args.use_tube_mask and not (0.0 < model_args.mask_ratio < 1.0):
         raise ValueError(
             f"mask_ratio must be in (0, 1) when use_tube_mask=True; "
@@ -1099,7 +1218,9 @@ def train():
             use_commit_loss=(model_args.commit_loss_weight > 0.0),
         )
         rank0_print(
-            f"Semantic loss enabled. weight={model_args.semantic_loss_weight} "
+            f"Decoder-end semantic loss enabled (reads decoder per-frame output, not "
+            f"the bottleneck). semantic_loss_weight={model_args.semantic_loss_weight} "
+            f"decoder_pixel_loss_weight={model_args.decoder_pixel_loss_weight} "
             f"trainable MLP params={sum(p.numel() for p in semantic_loss_module.mlp.parameters()):,}"
         )
 
@@ -1110,7 +1231,9 @@ def train():
         decoder=decoder,
         semantic_loss=semantic_loss_module,
         semantic_loss_weight=model_args.semantic_loss_weight,
+        decoder_pixel_loss_weight=model_args.decoder_pixel_loss_weight,
         commit_loss_weight=model_args.commit_loss_weight,
+        recon_loss_weight=model_args.recon_loss_weight,
         use_tube_mask=model_args.use_tube_mask,
         mask_ratio=model_args.mask_ratio,
         recon_masked_only=model_args.recon_masked_only,
@@ -1150,6 +1273,11 @@ def train():
         data_root=data_args.data_root,
         min_frames=data_args.min_frames,
         iv2_cache_dir=data_args.iv2_cache_dir if model_args.use_semantic_loss else None,
+        decode_pixel_targets=model_args.use_semantic_loss,
+        vqgan_image_size=(
+            semantic_loss_module.vqgan.decoder.resolution
+            if semantic_loss_module is not None else 256
+        ),
     )
     rank0_print(f"Dataset size: {len(train_dataset)}")
 
