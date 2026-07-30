@@ -107,6 +107,36 @@ class ModelArguments:
             "fixed at log2(max_output_frames) — each layer doubles the temporal length."
         },
     )
+    # --- Load a pretrained (possibly frozen) compressor ---
+    load_compressor_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to a pretrained compressor state dict to load into the "
+                "freshly-constructed compressor (must match compressor_type/layers/"
+                "heads/compress_image_w/h exactly — strict=True). Accepts either the "
+                "standalone compressor_pretrained.pt (raw keys) or a full training "
+                "checkpoint's model.safetensors/pytorch_model.bin ('compressor.' "
+                "prefixed keys, auto-stripped). Combine with --freeze_compressor to "
+                "probe how well a FROZEN bottleneck can be reconstructed by a "
+                "freshly-initialized decoder."
+            ),
+        },
+    )
+    freeze_compressor: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Freeze the compressor (requires_grad=False) so only the decoder "
+                "trains. Requires --load_compressor_path (freezing a random-init "
+                "compressor is never intended). Use with plain recon loss "
+                "(use_semantic_loss=False, the default) to test whether a fresh "
+                "decoder can reconstruct a given pretrained compressor's bottleneck — "
+                "decouples bottleneck information content from any one decoder's "
+                "co-training history."
+            ),
+        },
+    )
     # --- Global semantic loss (optional) ---
     use_semantic_loss: bool = field(
         default=False,
@@ -496,6 +526,7 @@ class CompressorAutoEncoder(nn.Module):
         motion_loss_weight: float = 1.0,
         use_order_loss: bool = False,
         order_loss_weight: float = 0.0,
+        freeze_compressor: bool = False,
     ):
         super().__init__()
         self.vision_encoder = vision_encoder
@@ -537,6 +568,11 @@ class CompressorAutoEncoder(nn.Module):
         # Vision encoder is always frozen.
         for p in self.vision_encoder.parameters():
             p.requires_grad = False
+
+        # Optionally freeze the compressor too (decoder-only probe training).
+        if freeze_compressor:
+            for p in self.compressor.parameters():
+                p.requires_grad = False
 
     # ------------------------------------------------------------------
     def _apply_tube_mask(
@@ -1103,6 +1139,19 @@ def _build_compressor(
     return compressor, cfg
 
 
+def _load_pretrained_compressor(compressor: nn.Module, path: str) -> None:
+    """Load a pretrained compressor state dict (raw or 'compressor.'-prefixed) in place."""
+    if path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state = load_file(path)
+    else:
+        state = torch.load(path, map_location="cpu", weights_only=False)
+    if any(k.startswith("compressor.") for k in state.keys()):
+        state = {k[len("compressor."):]: v for k, v in state.items() if k.startswith("compressor.")}
+    compressor.load_state_dict(state, strict=True)
+    rank0_print(f"Loaded pretrained compressor weights from {path} ({len(state)} tensors)")
+
+
 def _build_decoder(model_args: ModelArguments, compressor_cfg: Videollama3TokenCompressorConfig) -> CompressorDecoder:
     # Decoder depth is not configurable: CompressorDecoder fixes it at
     # log2(max_output_frames) (each layer doubles the temporal length). num_layers in
@@ -1158,6 +1207,12 @@ def train():
             f"got {model_args.mask_ratio}."
         )
 
+    if model_args.freeze_compressor and not model_args.load_compressor_path:
+        raise ValueError(
+            "freeze_compressor=True but load_compressor_path is not set — freezing "
+            "a randomly-initialized compressor is almost certainly not intended."
+        )
+
     # ---- Vision encoder ------------------------------------------------
     vision_encoder, _, ve_hidden_size = _load_vision_encoder(
         model_args.model_name_or_path,
@@ -1166,6 +1221,8 @@ def train():
 
     # ---- Compressor + Decoder ------------------------------------------
     compressor, compressor_cfg = _build_compressor(model_args, ve_hidden_size)
+    if model_args.load_compressor_path:
+        _load_pretrained_compressor(compressor, model_args.load_compressor_path)
     decoder = _build_decoder(model_args, compressor_cfg)
 
     rank0_print(
@@ -1174,6 +1231,12 @@ def train():
         f"heads={compressor_cfg.num_attention_heads} "
         f"HW={compressor_cfg.compress_image_w}×{compressor_cfg.compress_image_h}"
     )
+    if model_args.freeze_compressor:
+        rank0_print(
+            f"Compressor FROZEN (probe mode) — only the decoder trains. "
+            f"{sum(p.numel() for p in compressor.parameters()):,} compressor params "
+            f"excluded from the optimizer."
+        )
     rank0_print(f"Decoder layers={decoder.num_layers} (=log2 max_output_frames) "
                 f"max_output_frames={model_args.max_output_frames}")
     if model_args.use_tube_mask:
@@ -1240,6 +1303,7 @@ def train():
         motion_loss_weight=model_args.motion_loss_weight,
         use_order_loss=model_args.use_order_loss,
         order_loss_weight=model_args.order_loss_weight,
+        freeze_compressor=model_args.freeze_compressor,
     )
 
     # ---- Processor & Dataset -------------------------------------------
