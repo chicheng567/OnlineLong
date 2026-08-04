@@ -99,7 +99,27 @@ def _barrier():
 # Data loading: accept both list-of-samples and dict-of-datasets formats.
 # ---------------------------------------------------------------------------
 
-def _load_samples(data_path: str, data_root: Optional[str]) -> List[Dict]:
+_VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".webm")
+
+
+def _scan_video_root(data_root: str) -> List[Dict]:
+    """Build a sample list by recursively globbing video files under data_root
+    (same extensions/recursive convention as iterative_build_infer_dataset.py).
+    Each sample's "video" is stored relative to data_root so it round-trips
+    through the same os.path.join(root, video) logic as the JSON-driven path."""
+    root = Path(data_root)
+    items: List[Dict] = []
+    for ext in _VIDEO_EXTS:
+        for p in sorted(root.rglob(f"*{ext}")):
+            items.append({"video": str(p.relative_to(root)), "_data_root": data_root})
+    return items
+
+
+def _load_samples(data_path: Optional[str], data_root: Optional[str]) -> List[Dict]:
+    if data_path is None:
+        assert data_root, "Must pass --data_root when --data_path is omitted."
+        return _scan_video_root(data_root)
+
     with open(data_path) as f:
         raw = json.load(f)
 
@@ -236,10 +256,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", default="pretrained_models/videollama3_7b_local",
                         help="VideoLLaMA3 checkpoint dir; only the vision encoder is extracted.")
-    parser.add_argument("--data_path", required=True,
-                        help="Path to JSON: list-of-samples or dict-of-datasets.")
+    parser.add_argument("--data_path", default=None,
+                        help="Path to JSON: list-of-samples or dict-of-datasets. If omitted, "
+                             "--data_root is scanned recursively for video files instead.")
     parser.add_argument("--data_root", default=None,
-                        help="Optional prefix for video paths (overridden by per-dataset data_root).")
+                        help="Prefix for video paths named in --data_path (overridden by "
+                             "per-dataset data_root); required on its own when --data_path is omitted.")
     parser.add_argument("--output_dir", required=True)
 
     # Frame sampling hyperparameters.
@@ -272,6 +294,8 @@ def main():
                         help="Save features as (T*HW, hidden_size) instead of (T, HW, hidden_size).")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+    if args.data_path is None and not args.data_root:
+        parser.error("Must pass --data_path, --data_root, or both.")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
