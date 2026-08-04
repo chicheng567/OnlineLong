@@ -15,12 +15,34 @@ still produced near-identical images (cross-frame pixel std 0.0039 vs 0.24
 for the real frames).
 
 This script trains that MLP in isolation, directly supervised: real frame ->
-vision encoder (frozen) -> MLP (trainable) -> VQ-GAN decode (frozen) -> MSE
-against that same real frame, resized to the VQ-GAN's output resolution. No
-compressor, no decoder, no IV2, no temporal structure — every sampled frame
-is an independent training example. A constant-output shortcut cannot reduce
-pixel MSE against genuinely different target frames, so (unlike the IV2
-cosine loss) this objective cannot be satisfied by collapsing.
+vision encoder (frozen) -> MLP (trainable) -> real VQ-GAN encoder latent for
+that same frame. No compressor, no decoder, no IV2, no temporal structure —
+every sampled frame is an independent training example.
+
+Latent-space regression, computed end-to-end (no precompute/caching)
+----------------------------------------------------------------------
+This used to train against a pixel-MSE loss that decoded the MLP's output
+through the full (frozen) VQGANDecoder every step — a deep 5-resolution-stage
+ResNet+attention network, made slower still by gradient checkpointing
+(recomputes the forward pass on backward). That made the training loop very
+slow for what is, underneath, just a regression problem.
+
+diagnostics/compare_vqgan_encoder_feature_space.py measured the mapping this
+MLP has to learn (vision-encoder tokens -> real VQ-GAN encoder latent)
+directly and found it learnable: a matched-architecture (Linear->GELU->Linear)
+held-out probe reaches cosine=0.846 / R^2=0.77 against the REAL VQ-GAN encoder
+latent, confirmed via a shuffled-pairing control (cosine collapses to 0.340,
+R^2 negative) to be real signal, not a model-capacity artifact.
+
+So this script now regresses directly against the REAL VQ-GAN ENCODER latent
+instead of decoding to pixels — the frozen VQGANEncoder is run once per batch
+under torch.no_grad() (no backward pass, so no gradient checkpointing is
+needed either — that trick only pays for itself when a backward pass would
+otherwise recompute the forward pass), producing the target on the fly. The
+VQ-GAN DECODER is still never called anywhere in this script (only its
+codebook, for the cheap commitment loss). No separate precompute step, no
+cache directory to keep in sync with --max_frames — everything happens in
+this one training run.
 
 The resulting MLP weights (raw nn.Sequential state dict, unprefixed — same
 convention as compressor_pretrained.pt) can be loaded into
@@ -38,14 +60,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
-from torch.utils.checkpoint import checkpoint
 from transformers import Trainer
 from transformers.modeling_outputs import BaseModelOutput
 
 sys.path.append("./")
 
 from videollama3.model.processor import Videollama3Processor
-from videollama3.model.vqgan_vendor import load_vqgan_decoder
+from videollama3.model.vqgan_vendor import load_vqgan_decoder, load_vqgan_encoder
 from videollama3.train.videollama3_pretrain_compressor import (
     DataCollatorForPretraining,
     VideoPretrainDataset,
@@ -68,11 +89,24 @@ def rank0_print(*args):
 @dataclass
 class ModelArguments:
     model_name_or_path: str = field(default="pretrained_models/videollama3_7b_local")
-    vqgan_state_dict: str = field(default="pretrained_models/vqgan/state_dict.pt")
+    vqgan_state_dict: str = field(
+        default="pretrained_models/vqgan/state_dict.pt",
+        metadata={
+            "help": (
+                "Loads BOTH the real VQGANEncoder (to compute regression targets "
+                "on the fly, forward-only under no_grad) and VQGANDecoder's "
+                "codebook (.quantize, for the commitment loss) from this same "
+                "file. VQGANDecoder's .decoder submodule is never called."
+            ),
+        },
+    )
     semantic_mlp_hidden: Optional[int] = field(
         default=None, metadata={"help": "Hidden width of the MLP; default 2x VQ-GAN z_channels (=512)."}
     )
-    pixel_loss_weight: float = field(default=1.0)
+    latent_loss_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight on the MSE(MLP(vision_tokens), real VQ-GAN encoder latent) loss."},
+    )
     commit_loss_weight: float = field(
         default=0.25,
         metadata={
@@ -116,33 +150,43 @@ class TrainingArguments(transformers.TrainingArguments):
 # ---------------------------------------------------------------------------
 
 @dataclass
-class PixelMLPOutput(BaseModelOutput):
+class LatentMLPOutput(BaseModelOutput):
     loss: Optional[torch.Tensor] = None
-    pixel_loss: Optional[torch.Tensor] = None
+    latent_loss: Optional[torch.Tensor] = None
     commit_loss: Optional[torch.Tensor] = None
-    psnr: Optional[torch.Tensor] = None
+    latent_cosine: Optional[torch.Tensor] = None
 
 
-class PixelMLPModel(nn.Module):
-    """frozen vision_encoder -> trainable mlp -> frozen vqgan, MSE + commit loss."""
+class LatentMLPModel(nn.Module):
+    """frozen vision_encoder -> trainable mlp -> MSE against the REAL VQ-GAN
+    encoder latent, computed ON THE FLY (forward-only, no_grad, no caching)
+    every step, + commit loss. The VQ-GAN decoder is never called."""
 
-    def __init__(self, vision_encoder, vqgan, compressor_hw: int,
+    def __init__(self, vision_encoder, vqgan_encoder, vqgan_codebook_source, compressor_hw: int,
                  mlp_hidden: Optional[int] = None,
-                 pixel_loss_weight: float = 1.0, commit_loss_weight: float = 0.25):
+                 latent_loss_weight: float = 1.0, commit_loss_weight: float = 0.25):
         super().__init__()
         self.vision_encoder = vision_encoder
         for p in self.vision_encoder.parameters():
             p.requires_grad = False
 
-        self.vqgan = vqgan
-        for p in self.vqgan.parameters():
+        # Computes the regression target live, forward-only (see forward()).
+        self.vqgan_encoder = vqgan_encoder
+        for p in self.vqgan_encoder.parameters():
+            p.requires_grad = False
+
+        # Held only for its frozen codebook (.quantize); .decoder is never called.
+        self.vqgan_codebook_source = vqgan_codebook_source
+        for p in self.vqgan_codebook_source.parameters():
             p.requires_grad = False
 
         self.hw = compressor_hw
-        self.pixel_loss_weight = pixel_loss_weight
+        self.latent_size = vqgan_encoder.latent_size
+        self.z_channels = vqgan_encoder.embed_dim
+        self.latent_loss_weight = latent_loss_weight
         self.commit_loss_weight = commit_loss_weight
 
-        z_channels = vqgan.embed_dim
+        z_channels = vqgan_encoder.embed_dim
         hidden = mlp_hidden if mlp_hidden is not None else 2 * z_channels
         self.mlp = nn.Sequential(
             nn.Linear(vision_encoder.hidden_size, hidden),
@@ -153,7 +197,7 @@ class PixelMLPModel(nn.Module):
     def _commit_loss(self, z_flat: torch.Tensor) -> torch.Tensor:
         """Per-element MSE to the nearest frozen codebook entry (stop-gradient on
         the codebook side) — standard VQ-VAE commitment loss."""
-        codebook = self.vqgan.quantize.embedding.weight
+        codebook = self.vqgan_codebook_source.quantize.embedding.weight
         z_fp32 = z_flat.float()
         cb_fp32 = codebook.float()
         with torch.no_grad():
@@ -166,7 +210,7 @@ class PixelMLPModel(nn.Module):
         return F.mse_loss(z_fp32, nearest_e.float())
 
     def forward(self, pixel_values, grid_sizes, merge_sizes, n_frames,
-                vqgan_target_frames, **_kwargs) -> PixelMLPOutput:
+                vqgan_target_frames, **_kwargs) -> LatentMLPOutput:
         with torch.no_grad():
             visual_tokens = self.vision_encoder(
                 pixel_values=pixel_values, grid_sizes=grid_sizes, merge_sizes=merge_sizes,
@@ -179,31 +223,41 @@ class PixelMLPModel(nn.Module):
             "Check video_merge_size / force_image_size match compressor_hw."
         )
 
+        # Real target, computed live: forward-only through the frozen VQ-GAN
+        # encoder, no backward pass -> no gradient-checkpointing trade-off to
+        # make (that trick only pays off when a backward pass would otherwise
+        # recompute this forward pass; here there simply isn't one).
+        with torch.no_grad():
+            target = self.vqgan_encoder.encode_to_continuous(
+                vqgan_target_frames.to(
+                    device=next(self.vqgan_encoder.parameters()).device,
+                    dtype=next(self.vqgan_encoder.parameters()).dtype,
+                )
+            ).float()  # (total_frames, z_channels, latent_size, latent_size)
+
         z_flat = self.mlp(visual_tokens)  # (total_frames * HW, z_channels)
         commit_loss = self._commit_loss(z_flat)
 
         z = (
-            z_flat.view(total_frames, self.vqgan.latent_size, self.vqgan.latent_size, self.vqgan.embed_dim)
+            z_flat.view(total_frames, self.latent_size, self.latent_size, self.z_channels)
             .permute(0, 3, 1, 2)
             .contiguous()
             .float()
-        )
-        # VQ-GAN decoder is deep (ResNet + attention across 5 resolution stages);
-        # checkpoint it since it's frozen anyway (only trades compute for memory).
-        imgs = checkpoint(self.vqgan.decode_from_continuous, z, use_reentrant=False)  # (total_frames,3,H,W) in [-1,1]
+        )  # (total_frames, z_channels, latent_size, latent_size)
 
-        pixel_loss = F.mse_loss(imgs.float(), vqgan_target_frames.to(imgs.device).float())
-        loss = self.pixel_loss_weight * pixel_loss + self.commit_loss_weight * commit_loss
+        latent_loss = F.mse_loss(z, target.to(z.device))
+        loss = self.latent_loss_weight * latent_loss + self.commit_loss_weight * commit_loss
 
         with torch.no_grad():
-            # Images live in [-1, 1] (peak-to-peak range 2), so MAX_I^2 = 4.
-            psnr = 10.0 * torch.log10(4.0 / pixel_loss.clamp_min(1e-10))
+            latent_cosine = F.cosine_similarity(
+                z.flatten(1), target.to(z.device).flatten(1), dim=1
+            ).mean()
 
-        return PixelMLPOutput(
+        return LatentMLPOutput(
             loss=loss,
-            pixel_loss=pixel_loss.detach(),
+            latent_loss=latent_loss.detach(),
             commit_loss=commit_loss.detach(),
-            psnr=psnr.detach(),
+            latent_cosine=latent_cosine.detach(),
         )
 
 
@@ -211,7 +265,7 @@ class PixelMLPModel(nn.Module):
 # Trainer (just adds aux-loss averaging into the periodic log() call)
 # ---------------------------------------------------------------------------
 
-class PixelMLPTrainer(Trainer):
+class LatentMLPTrainer(Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._aux_running = {}
@@ -219,7 +273,7 @@ class PixelMLPTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(**inputs)
-        for key in ("pixel_loss", "commit_loss", "psnr"):
+        for key in ("latent_loss", "commit_loss", "latent_cosine"):
             v = getattr(outputs, key, None)
             if v is not None:
                 self._aux_running[key] = self._aux_running.get(key, 0.0) + float(v.detach().float().item())
@@ -251,8 +305,10 @@ def train():
         dtype=torch.bfloat16 if training_args.bf16 else torch.float16,
     )
 
-    rank0_print(f"Loading frozen VQ-GAN from {model_args.vqgan_state_dict}")
-    vqgan = load_vqgan_decoder(model_args.vqgan_state_dict, dtype=torch.float32)
+    rank0_print(f"Loading real VQ-GAN encoder (live targets) from {model_args.vqgan_state_dict}")
+    vqgan_encoder = load_vqgan_encoder(model_args.vqgan_state_dict, dtype=torch.float32, strict=True)
+    rank0_print(f"Loading VQ-GAN codebook/config (decoder unused) from {model_args.vqgan_state_dict}")
+    vqgan_decoder = load_vqgan_decoder(model_args.vqgan_state_dict, dtype=torch.float32)
 
     processor = Videollama3Processor.from_pretrained(model_args.model_name_or_path)
     if data_args.force_image_size is not None:
@@ -262,21 +318,29 @@ def train():
     patch_size = processor.image_processor.patch_size
     compressor_hw = (data_args.force_image_size // (patch_size * data_args.video_merge_size)) ** 2
     rank0_print(
-        f"compressor_hw={compressor_hw}  vqgan latent_size={vqgan.latent_size}  "
-        f"z_channels={vqgan.embed_dim}  vqgan_image_size={vqgan.decoder.resolution}"
+        f"compressor_hw={compressor_hw}  vqgan latent_size={vqgan_encoder.latent_size}  "
+        f"z_channels={vqgan_encoder.embed_dim}  vqgan_image_size={vqgan_decoder.decoder.resolution}"
     )
+    if compressor_hw != vqgan_encoder.latent_size ** 2:
+        rank0_print(
+            f"WARNING: compressor_hw ({compressor_hw}) != vqgan_encoder.latent_size^2 "
+            f"({vqgan_encoder.latent_size ** 2}) — the per-frame token grid and the VQ-GAN "
+            f"latent grid must have the same spatial size for the reshape in "
+            f"LatentMLPModel.forward to be meaningful."
+        )
 
-    model = PixelMLPModel(
+    model = LatentMLPModel(
         vision_encoder=vision_encoder,
-        vqgan=vqgan,
+        vqgan_encoder=vqgan_encoder,
+        vqgan_codebook_source=vqgan_decoder,
         compressor_hw=compressor_hw,
         mlp_hidden=model_args.semantic_mlp_hidden,
-        pixel_loss_weight=model_args.pixel_loss_weight,
+        latent_loss_weight=model_args.latent_loss_weight,
         commit_loss_weight=model_args.commit_loss_weight,
     )
     rank0_print(
         f"Semantic MLP: {sum(p.numel() for p in model.mlp.parameters()):,} trainable params  "
-        f"pixel_loss_weight={model_args.pixel_loss_weight} commit_loss_weight={model_args.commit_loss_weight}"
+        f"latent_loss_weight={model_args.latent_loss_weight} commit_loss_weight={model_args.commit_loss_weight}"
     )
 
     train_dataset = VideoPretrainDataset(
@@ -288,11 +352,11 @@ def train():
         min_frames=data_args.min_frames,
         iv2_cache_dir=None,
         decode_pixel_targets=True,
-        vqgan_image_size=vqgan.decoder.resolution,
+        vqgan_image_size=vqgan_decoder.decoder.resolution,
     )
     rank0_print(f"Dataset size: {len(train_dataset)}")
 
-    trainer = PixelMLPTrainer(
+    trainer = LatentMLPTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -307,8 +371,8 @@ def train():
         with open(os.path.join(out_dir, "semantic_mlp_config.json"), "w") as f:
             json.dump({
                 "compressor_hidden": ve_hidden_size,
-                "mlp_hidden": model_args.semantic_mlp_hidden or 2 * vqgan.embed_dim,
-                "z_channels": vqgan.embed_dim,
+                "mlp_hidden": model_args.semantic_mlp_hidden or 2 * vqgan_encoder.embed_dim,
+                "z_channels": vqgan_encoder.embed_dim,
             }, f, indent=2)
         rank0_print(f"MLP weights saved to {out_dir}/semantic_mlp_pretrained.pt")
 

@@ -11,7 +11,22 @@ modules required to take a *continuous* latent `z` and produce an RGB image:
       → Decoder
       → image (B, 3, H*f, W*f)
 
-Encoder / LPIPS / discriminator are intentionally excluded.
+and the mirror encode path (``VQGANEncoder`` / ``load_vqgan_encoder``):
+
+    image (B, 3, H*f, W*f)
+      → Encoder
+      → quant_conv (1×1)
+      → continuous z (B, embed_dim, H, W)   [pre-quantization]
+
+LPIPS / discriminator (training-only) are intentionally excluded. The public
+``vqgan-f16-16384`` checkpoint's on-disk state-dict already contains
+``encoder.*`` / ``quant_conv.*`` tensors (``load_vqgan_decoder`` silently
+discards them via ``strict=False``); ``load_vqgan_encoder`` loads that same
+file and keeps them instead, so no extra download is needed. Architecture
+verified against ``pretrained_models/vqgan/config.yaml``'s ``ddconfig``
+(``double_z=False, ch=128, ch_mult=[1,1,2,2,4], num_res_blocks=2,
+attn_resolutions=[16], z_channels=embed_dim=256``) and the actual
+``encoder.*`` tensor shapes in ``state_dict.pt``.
 
 Compatible with the public ``vqgan-f16-16384`` checkpoint
 (``ch=128, ch_mult=[1,1,2,2,4], attn_resolutions=[16], z_channels=embed_dim=256,
@@ -56,6 +71,17 @@ class Upsample(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        return self.conv(x)
+
+
+class Downsample(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # taming's asymmetric padding (pad right/bottom only) before the stride-2 conv.
+        x = F.pad(x, (0, 1, 0, 1), mode="constant", value=0)
         return self.conv(x)
 
 
@@ -130,6 +156,16 @@ class _UpStage(nn.Module):
         self.block = nn.ModuleList()
         self.attn = nn.ModuleList()
         self.upsample = None
+
+
+class _DownStage(nn.Module):
+    downsample: Optional[Downsample]
+
+    def __init__(self):
+        super().__init__()
+        self.block = nn.ModuleList()
+        self.attn = nn.ModuleList()
+        self.downsample = None
 
 
 class Decoder(nn.Module):
@@ -209,6 +245,82 @@ class Decoder(nn.Module):
                     h = stage.attn[i_block](h)
             if stage.upsample is not None:
                 h = stage.upsample(h)
+
+        h = self.conv_out(_nonlinearity(self.norm_out(h)))
+        return h
+
+
+class Encoder(nn.Module):
+    """
+    Mirror of taming-transformers ``Encoder`` for ``vqgan-f16-16384`` — the
+    exact reverse of ``Decoder`` above:
+      ch=128, ch_mult=(1,1,2,2,4), num_res_blocks=2, attn_resolutions=(16,),
+      in_channels=3, resolution=256, z_channels=256 (double_z=False).
+    Forward: ``image (B, in_channels, resolution, resolution)`` →
+    ``h (B, z_channels, resolution/2**(n_res-1), resolution/2**(n_res-1))``.
+    Callers apply ``quant_conv`` (see ``VQGANEncoder``) to reach the
+    continuous latent ``z`` in the same ``embed_dim`` space ``Decoder``
+    consumes via ``post_quant_conv``.
+    """
+
+    def __init__(
+        self,
+        *,
+        ch: int,
+        ch_mult: List[int],
+        num_res_blocks: int,
+        attn_resolutions: List[int],
+        dropout: float,
+        in_channels: int,
+        resolution: int,
+        z_channels: int,
+    ):
+        super().__init__()
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+
+        self.conv_in = nn.Conv2d(in_channels, ch, kernel_size=3, stride=1, padding=1)
+
+        curr_res = resolution
+        in_ch_mult = (1,) + tuple(ch_mult)
+        block_in = ch
+        self.down: nn.ModuleList = nn.ModuleList()
+        for i_level in range(self.num_resolutions):
+            stage = _DownStage()
+            block_in = ch * in_ch_mult[i_level]
+            block_out = ch * ch_mult[i_level]
+            for _ in range(self.num_res_blocks):
+                stage.block.append(ResnetBlock(block_in, block_out, dropout=dropout))
+                block_in = block_out
+                if curr_res in attn_resolutions:
+                    stage.attn.append(AttnBlock(block_in))
+            if i_level != self.num_resolutions - 1:
+                stage.downsample = Downsample(block_in)
+                curr_res //= 2
+            self.down.append(stage)
+
+        # middle (identical structure to Decoder's — reuse _Mid).
+        self.mid = _Mid(block_in, dropout)
+
+        # end
+        self.norm_out = _normalize(block_in)
+        self.conv_out = nn.Conv2d(block_in, z_channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv_in(x)
+
+        for i_level in range(self.num_resolutions):
+            stage: _DownStage = self.down[i_level]  # type: ignore[assignment]
+            for i_block in range(self.num_res_blocks):
+                h = stage.block[i_block](h)
+                if len(stage.attn) > 0:
+                    h = stage.attn[i_block](h)
+            if stage.downsample is not None:
+                h = stage.downsample(h)
+
+        h = self.mid.block_1(h)
+        h = self.mid.attn_1(h)
+        h = self.mid.block_2(h)
 
         h = self.conv_out(_nonlinearity(self.norm_out(h)))
         return h
@@ -309,6 +421,65 @@ class VQGANDecoder(nn.Module):
         z_q = self.quantize(z)
         z_q = self.post_quant_conv(z_q)
         return self.decoder(z_q)
+
+
+class VQGANEncoder(nn.Module):
+    """
+    Frozen-only wrapper exposing the path
+        image → encoder → quant_conv → continuous z (pre-quantization).
+
+    This is the REAL encoder half of the same ``vqgan-f16-16384`` checkpoint
+    ``VQGANDecoder`` loads. Use it to obtain the actual target latent a
+    semantic-loss MLP should regress to (``encode_to_continuous``), instead
+    of only supervising indirectly through ``VQGANDecoder``'s pixel output —
+    the two wrappers share the same ``embed_dim``/``z_channels``/
+    ``latent_size`` convention so a batch produced by one is directly
+    comparable to / usable with the other (e.g. ``decode_from_continuous(
+    encode_to_continuous(x))`` round-trips through the real autoencoder).
+    All parameters are set ``requires_grad=False`` after weight load.
+    """
+
+    def __init__(
+        self,
+        *,
+        embed_dim: int = 256,
+        z_channels: int = 256,
+        ch: int = 128,
+        ch_mult: Sequence[int] = (1, 1, 2, 2, 4),
+        num_res_blocks: int = 2,
+        attn_resolutions: Sequence[int] = (16,),
+        resolution: int = 256,
+        in_channels: int = 3,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.z_channels = z_channels
+        self.latent_size = resolution // 2 ** (len(ch_mult) - 1)  # 16 for default
+
+        self.encoder = Encoder(
+            ch=ch,
+            ch_mult=list(ch_mult),
+            num_res_blocks=num_res_blocks,
+            attn_resolutions=list(attn_resolutions),
+            dropout=dropout,
+            in_channels=in_channels,
+            resolution=resolution,
+            z_channels=z_channels,
+        )
+        self.quant_conv = nn.Conv2d(z_channels, embed_dim, kernel_size=1)
+
+    def encode_to_continuous(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x : (B, in_channels, resolution, resolution) in [-1, 1]
+            (taming-transformers convention, same as ``decode_from_continuous``'s
+            output — matches ``_frame_to_vqgan_tensor`` elsewhere in this repo).
+        Returns the continuous latent (B, embed_dim, latent_size, latent_size)
+        BEFORE quantization — the actual regression target for a semantic-loss
+        MLP (``VectorQuantizer2`` is only applied on the decode side).
+        """
+        h = self.encoder(x)
+        return self.quant_conv(h)
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +641,46 @@ def load_vqgan_decoder(
         raise RuntimeError(f"Unexpected missing={missing} unexpected={unexpected_keep}")
     if missing:
         raise RuntimeError(f"VQGANDecoder missing weights: {missing}")
+    for p in model.parameters():
+        p.requires_grad = False
+    model.eval()
+    if device is not None:
+        model = model.to(device=device)
+    if dtype != torch.float32:
+        model = model.to(dtype=dtype)
+    return model
+
+
+def load_vqgan_encoder(
+    state_dict_path: str,
+    *,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+    strict: bool = False,
+) -> VQGANEncoder:
+    """
+    Build a VQGANEncoder with vqgan-f16-16384 defaults and load its weights
+    from the SAME checkpoint file ``load_vqgan_decoder`` reads — the
+    ``encoder.*`` / ``quant_conv.*`` tensors it discards are exactly what
+    this function keeps. No separate download needed.
+
+    ``strict=False`` because the on-disk state-dict also contains decoder,
+    post_quant_conv and quantize tensors this wrapper does not own.
+    """
+    model = VQGANEncoder()
+    sd = _load_vqgan_state_dict(state_dict_path)
+    sd = {k: v for k, v in sd.items() if k.startswith("encoder.") or k.startswith("quant_conv.")}
+    if not sd:
+        raise RuntimeError(
+            f"No 'encoder.*'/'quant_conv.*' tensors found in {state_dict_path}. "
+            "This checkpoint may already be a decoder-only extract; use the raw "
+            "public model.ckpt (or a state_dict.pt re-extracted with the encoder kept)."
+        )
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if strict and (missing or unexpected):
+        raise RuntimeError(f"Unexpected missing={missing} unexpected={unexpected}")
+    if missing:
+        raise RuntimeError(f"VQGANEncoder missing weights: {missing}")
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
