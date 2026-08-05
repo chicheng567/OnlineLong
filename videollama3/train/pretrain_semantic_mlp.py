@@ -108,13 +108,16 @@ class ModelArguments:
         metadata={"help": "Weight on the MSE(MLP(vision_tokens), real VQ-GAN encoder latent) loss."},
     )
     commit_loss_weight: float = field(
-        default=0.25,
+        default=0.0,
         metadata={
             "help": (
-                "Weight for the VQ commitment loss ||z - sg(e_nearest)||^2, always on "
-                "(unlike the AE pretrain script, this is not optional here) — keeps the "
-                "MLP's output on the frozen VQ-GAN codebook manifold. 0.25 is the "
-                "standard VQ-VAE commitment weight."
+                "Weight for the VQ commitment loss ||z - sg(e_nearest)||^2. Off by "
+                "default now that latent_loss directly regresses to the real (already "
+                "near-codebook) VQ-GAN encoder latent, which makes this largely redundant "
+                "belt-and-suspenders regularization rather than a load-bearing signal. "
+                "Set > 0 (0.25 is the standard VQ-VAE commitment weight) if the trained "
+                "MLP's output will be quantized downstream (e.g. loaded into "
+                "GlobalSemanticLoss, which does run it through VectorQuantizer2)."
             ),
         },
     )
@@ -164,7 +167,7 @@ class LatentMLPModel(nn.Module):
 
     def __init__(self, vision_encoder, vqgan_encoder, vqgan_codebook_source, compressor_hw: int,
                  mlp_hidden: Optional[int] = None,
-                 latent_loss_weight: float = 1.0, commit_loss_weight: float = 0.25):
+                 latent_loss_weight: float = 1.0, commit_loss_weight: float = 0.0):
         super().__init__()
         self.vision_encoder = vision_encoder
         for p in self.vision_encoder.parameters():
