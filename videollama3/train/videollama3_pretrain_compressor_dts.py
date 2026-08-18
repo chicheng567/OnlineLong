@@ -84,7 +84,7 @@ from videollama3.model.compressor import (
     TransformerDecoderCompressor,
     Videollama3TokenCompressorConfig,
 )
-from videollama3.model.dts import DynamicTokenSynthesizer, SemanticGuidedMasking
+from videollama3.model.dts import DynamicTokenSynthesizer, SemanticGuidedMasking, SiglipAECompressor
 from videollama3.model.processor import Videollama3Processor
 
 logger = logging.getLogger(__name__)
@@ -340,7 +340,7 @@ class DTSCompressorAutoEncoder(nn.Module):
         vision_encoder: nn.Module,
         compressor: nn.Module,
         decoder: CompressorDecoder,
-        dts: DynamicTokenSynthesizer,
+        dts: Optional[DynamicTokenSynthesizer],
         sgm: SemanticGuidedMasking,
         num_frames: int,
         mask_ratio: float = 0.75,
@@ -406,7 +406,10 @@ class DTSCompressorAutoEncoder(nn.Module):
 
         # 3. DTS: inject the learnable per-frame temporal encoding after masking,
         #    matching SiglipAE (adds temporal_encoding unconditionally before encoding).
-        compressor_input = self.dts(masked_tokens)  # (B, T, HW, C)
+        #    Skipped when self.dts is None: compressor_type="siglip_ae" already does
+        #    this internally (see SiglipAECompressor in dts.py) — applying it here too
+        #    would add the additive bias twice.
+        compressor_input = masked_tokens if self.dts is None else self.dts(masked_tokens)
         compressor_input_flat = compressor_input.reshape(B * T * HW, C)
 
         # 4. Compress: single T*HW-token window per sample -> HW compressed tokens.
@@ -616,7 +619,7 @@ def _load_vision_encoder(model_path: str, dtype: torch.dtype = torch.bfloat16):
     return ve, ve_hidden_size
 
 
-def _build_compressor(model_args: ModelArguments, ve_hidden_size: int):
+def _build_compressor(model_args: ModelArguments, ve_hidden_size: int, num_frames: int):
     intermediate = model_args.compressor_intermediate_size or ve_hidden_size * 4
     cfg = Videollama3TokenCompressorConfig(
         compressor_type=model_args.compressor_type,
@@ -628,12 +631,18 @@ def _build_compressor(model_args: ModelArguments, ve_hidden_size: int):
         layer_norm_eps=model_args.compressor_layer_norm_eps,
         compress_image_w=model_args.compress_image_w,
         compress_image_h=model_args.compress_image_h,
+        # Only load-bearing for compressor_type="siglip_ae" (its depth is fixed at
+        # construction as log2(window_size) — see SiglipAECompressor); harmless
+        # metadata for the other two types, which handle T generically at runtime.
+        window_size=num_frames,
     )
     ct = cfg.compressor_type
     if "transformer_decoder" in ct:
         compressor: nn.Module = TransformerDecoderCompressor(config=cfg)
     elif ct == "local_attn_conv":
         compressor = LocalAttnConvCompressor(config=cfg)
+    elif ct == "siglip_ae":
+        compressor = SiglipAECompressor(config=cfg)
     else:
         raise ValueError(f"Unknown compressor_type: {ct}")
     return compressor, cfg
@@ -667,9 +676,17 @@ def train():
     )
 
     # ---- Compressor + Decoder + DTS + SGM -------------------------------
-    compressor, compressor_cfg = _build_compressor(model_args, ve_hidden_size)
+    compressor, compressor_cfg = _build_compressor(model_args, ve_hidden_size, T)
     decoder = _build_decoder(compressor_cfg, T)
-    dts = DynamicTokenSynthesizer(hidden_size=ve_hidden_size, num_frames=T)
+    # compressor_type="siglip_ae" already applies its own temporal_encoding internally
+    # (SiglipAECompressor reuses DynamicTokenSynthesizer — see dts.py); building a
+    # second, external one here and applying it before the compressor would add the
+    # additive bias TWICE. Skip it for that compressor type; DTSCompressorAutoEncoder
+    # treats dts=None as "the compressor already handles this".
+    dts = (
+        None if model_args.compressor_type == "siglip_ae"
+        else DynamicTokenSynthesizer(hidden_size=ve_hidden_size, num_frames=T)
+    )
     sgm = SemanticGuidedMasking(hidden_size=ve_hidden_size)
 
     rank0_print(

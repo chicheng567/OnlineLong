@@ -4,6 +4,7 @@ from transformers.activations import GELUTanh
 from torch import nn
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from .videollama3_encoder.modeling_videollama3_encoder import VisionRotaryEmbedding, apply_rotary_pos_emb_vision
+from .dts import SiglipAECompressor
 
 
 def _build_2d_rotary_pos_emb(rotary_pos_emb_module, w, h):
@@ -650,6 +651,12 @@ from transformers import PretrainedConfig
 class Videollama3TokenCompressorConfig(PretrainedConfig):
     model_type = "videollama3_token_compressor"
 
+    # compressor_type: "transformer_decoder" | "local_attn_conv" | "siglip_ae"
+    #   "siglip_ae" is a faithful port of Video-XL-Pro's SiglipAE (see dts.py) — unlike
+    #   the other two, its depth is fixed at construction from `window_size`
+    #   (log2(window_size) stride-2 Conv3d stages), so every compression window given
+    #   to it must contain exactly `window_size` frames; `window_size` must be set
+    #   explicitly (a power of two >= 2) when selecting this type.
     def __init__(
         self,
         compressor_type="transformer_decoder",
@@ -705,4 +712,6 @@ def build_token_compressor(config):
             return TransformerDecoderCompressor(config=compressor)
         if ct == "local_attn_conv":
             return LocalAttnConvCompressor(config=compressor)
+        if ct == "siglip_ae":
+            return SiglipAECompressor(config=compressor)
     raise ValueError(f"Unknown token compressor type: {getattr(compressor, 'compressor_type', None)}")
