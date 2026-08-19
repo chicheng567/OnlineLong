@@ -287,6 +287,22 @@ class DataArguments:
             ),
         },
     )
+    precomputed_feature_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Directory of precomputed frozen-vision-encoder features, one "
+                "<video-stem>.pt per video, each a (T, HW, hidden) tensor with "
+                "T == max_frames and HW == compress_image_w * compress_image_h. "
+                "When set, the dataset loads this cached tensor instead of decoding "
+                "video frames, and the model skips the vision_encoder forward pass "
+                "entirely (the main cost precomputing removes). Samples lacking a "
+                "cache file are dropped at dataset-load time. Incompatible with "
+                "model_args.use_semantic_loss's decoder_pixel_loss path, which needs "
+                "real frame pixels that this mode never decodes."
+            ),
+        },
+    )
 
 
 @dataclass
@@ -328,7 +344,15 @@ class VideoPretrainDataset(Dataset):
         iv2_cache_dir: Optional[str] = None,
         decode_pixel_targets: bool = False,
         vqgan_image_size: int = 256,
+        precomputed_feature_dir: Optional[str] = None,
     ):
+        if precomputed_feature_dir is not None and decode_pixel_targets:
+            raise ValueError(
+                "precomputed_feature_dir provides cached vision-encoder features only "
+                "(no raw pixels) — incompatible with decode_pixel_targets=True "
+                "(model_args.use_semantic_loss's decoder_pixel_loss path needs real "
+                "frame pixels this mode never decodes)."
+            )
         with open(data_path) as f:
             raw = json.load(f)
         # Support both list and dict-of-datasets formats.
@@ -356,6 +380,7 @@ class VideoPretrainDataset(Dataset):
         self.iv2_cache_dir = iv2_cache_dir
         self.decode_pixel_targets = decode_pixel_targets
         self.vqgan_image_size = vqgan_image_size
+        self.precomputed_feature_dir = precomputed_feature_dir
 
         # If using cached IV2 features, drop samples that don't have a cache file.
         if iv2_cache_dir is not None:
@@ -382,15 +407,43 @@ class VideoPretrainDataset(Dataset):
             if n_drop:
                 logger.warning("Dropped %d/%d samples without IV2 cache under %s",
                                n_drop, len(data), iv2_cache_dir)
-            self.data = kept
-        else:
-            self.data = data
+            data = kept
+
+        # If using precomputed vision-encoder features, drop samples without a
+        # cache file too (same pattern as the IV2 filter above).
+        if precomputed_feature_dir is not None:
+            kept = []
+            cache_root = os.path.abspath(precomputed_feature_dir)
+            for entry in data:
+                v = entry.get("video")
+                if not v:
+                    continue
+                if isinstance(v, (list, tuple)):
+                    v = v[0]
+                stem = os.path.splitext(os.path.basename(str(v)))[0]
+                feat_path = os.path.join(cache_root, f"{stem}.pt")
+                if not os.path.exists(feat_path):
+                    continue
+                entry = dict(entry)
+                entry["_precomputed_feat_path"] = feat_path
+                kept.append(entry)
+            n_drop = len(data) - len(kept)
+            if n_drop:
+                logger.warning("Dropped %d/%d samples without precomputed feature under %s",
+                               n_drop, len(data), precomputed_feature_dir)
+            data = kept
+
+        self.data = data
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, i: int) -> Dict:
         item = self.data[i]
+
+        if self.precomputed_feature_dir is not None:
+            return self._getitem_precomputed(i, item)
+
         root = item.get("_data_root", self.data_root or "")
         video_path = os.path.join(root, item["video"]) if root else item["video"]
 
@@ -449,6 +502,40 @@ class VideoPretrainDataset(Dataset):
             )
         return out
 
+    def _getitem_precomputed(self, _i: int, item: Dict) -> Dict:
+        """Load a cached (T, HW, hidden) vision-encoder feature tensor instead of
+        decoding video + running the vision encoder. See DataArguments.precomputed_feature_dir."""
+        feat_path = item["_precomputed_feat_path"]
+        try:
+            visual_tokens = torch.load(feat_path, map_location="cpu", weights_only=True)
+        except Exception as exc:
+            logger.warning("Failed to load %s: %s — retrying random sample", feat_path, exc)
+            return self.__getitem__(random.randint(0, len(self.data) - 1))
+
+        if visual_tokens.dim() != 3:
+            logger.warning(
+                "%s: expected a (T, HW, hidden) tensor, got shape %s — retrying random sample",
+                feat_path, tuple(visual_tokens.shape),
+            )
+            return self.__getitem__(random.randint(0, len(self.data) - 1))
+
+        n_frames, HW, hidden = visual_tokens.shape
+        if n_frames < self.min_frames:
+            logger.warning(
+                "Skipping %s: cached %d frames < min_frames=%d",
+                feat_path, n_frames, self.min_frames,
+            )
+            return self.__getitem__(random.randint(0, len(self.data) - 1))
+
+        out: Dict = {
+            "visual_tokens": visual_tokens.reshape(n_frames * HW, hidden),
+            "n_frames": torch.tensor(n_frames, dtype=torch.long),
+        }
+        if "_iv2_feat_path" in item:
+            vid_feat = torch.load(item["_iv2_feat_path"], map_location="cpu", weights_only=True)
+            out["vid_feat"] = vid_feat.to(torch.float32)
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Collator
@@ -457,9 +544,13 @@ class VideoPretrainDataset(Dataset):
 class DataCollatorForPretraining:
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         batch = {}
-        batch["pixel_values"] = torch.cat([x["pixel_values"] for x in instances], dim=0)
-        batch["grid_sizes"] = torch.cat([x["grid_sizes"] for x in instances], dim=0)
-        batch["merge_sizes"] = torch.cat([x["merge_sizes"] for x in instances], dim=0)
+        if "visual_tokens" in instances[0]:
+            # Precomputed-feature path: no pixels/vision-encoder inputs to batch.
+            batch["visual_tokens"] = torch.cat([x["visual_tokens"] for x in instances], dim=0)
+        else:
+            batch["pixel_values"] = torch.cat([x["pixel_values"] for x in instances], dim=0)
+            batch["grid_sizes"] = torch.cat([x["grid_sizes"] for x in instances], dim=0)
+            batch["merge_sizes"] = torch.cat([x["merge_sizes"] for x in instances], dim=0)
         batch["n_frames"] = torch.stack([x["n_frames"] for x in instances])
         if "vid_feat" in instances[0]:
             batch["vid_feat"] = torch.stack([x["vid_feat"] for x in instances])
@@ -704,12 +795,13 @@ class CompressorAutoEncoder(nn.Module):
     # ------------------------------------------------------------------
     def forward(
         self,
-        pixel_values: torch.Tensor,
-        grid_sizes: torch.Tensor,
-        merge_sizes: torch.Tensor,
-        n_frames: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        grid_sizes: Optional[torch.Tensor] = None,
+        merge_sizes: Optional[torch.Tensor] = None,
+        n_frames: torch.Tensor = None,  # type: ignore[assignment]
         vid_feat: Optional[torch.Tensor] = None,
         vqgan_target_frames: Optional[torch.Tensor] = None,
+        visual_tokens: Optional[torch.Tensor] = None,
         **_kwargs,
     ) -> AEOutput:
         n_frames_list: List[int] = n_frames.tolist()
@@ -725,24 +817,36 @@ class CompressorAutoEncoder(nn.Module):
             f"got n_frames={n_frames_list}. Lower data_args.max_frames or raise "
             f"model_args.max_output_frames."
         )
-        device = pixel_values.device
 
-        # 1. Vision encoder (no grad).
-        with torch.no_grad():
-            visual_tokens = self.vision_encoder(
-                pixel_values=pixel_values,
-                grid_sizes=grid_sizes,
-                merge_sizes=merge_sizes,
+        if visual_tokens is not None:
+            # Precomputed-feature path (data_args.precomputed_feature_dir): the
+            # vision_encoder forward pass — the expensive, per-step-repeated part
+            # this mode exists to skip — is bypassed entirely.
+            device = visual_tokens.device
+        else:
+            assert pixel_values is not None, (
+                "forward() needs either pixel_values (+ grid_sizes/merge_sizes) or "
+                "visual_tokens (precomputed-feature path)."
             )
+            device = pixel_values.device
+            # 1. Vision encoder (no grad).
+            with torch.no_grad():
+                visual_tokens = self.vision_encoder(
+                    pixel_values=pixel_values,
+                    grid_sizes=grid_sizes,
+                    merge_sizes=merge_sizes,
+                )
+        assert visual_tokens is not None
         # visual_tokens: (total_tokens, hidden_size)  total = sum(n_i * HW)
 
         # Validate spatial token count per frame matches compressor expectation.
         expected_total = sum(n * HW for n in n_frames_list)
         if visual_tokens.shape[0] != expected_total:
             raise ValueError(
-                f"Vision encoder output {visual_tokens.shape[0]} tokens, "
+                f"Got {visual_tokens.shape[0]} visual tokens, "
                 f"expected {expected_total} (sum of n_i * HW={HW}). "
-                "Check video_merge_size matches compress_image_w/h."
+                "Check video_merge_size matches compress_image_w/h (pixel path) or "
+                "that the cached (T, HW, hidden) feature's HW matches (precomputed path)."
             )
 
         # 1b. Optional VideoMAE-style temporal tube masking. A random subset of
@@ -1201,6 +1305,14 @@ def train():
             "MLP -> VQ-GAN decode it reads from only exists on the semantic-loss path."
         )
 
+    if data_args.precomputed_feature_dir is not None and model_args.decoder_pixel_loss_weight > 0.0:
+        raise ValueError(
+            "data_args.precomputed_feature_dir provides cached vision-encoder "
+            "features only (no raw pixels) — incompatible with "
+            "decoder_pixel_loss_weight > 0, which needs real frame pixels "
+            "(data_args.decode_pixel_targets can't produce them in this mode)."
+        )
+
     if model_args.use_tube_mask and not (0.0 < model_args.mask_ratio < 1.0):
         raise ValueError(
             f"mask_ratio must be in (0, 1) when use_tube_mask=True; "
@@ -1337,11 +1449,14 @@ def train():
         data_root=data_args.data_root,
         min_frames=data_args.min_frames,
         iv2_cache_dir=data_args.iv2_cache_dir if model_args.use_semantic_loss else None,
-        decode_pixel_targets=model_args.use_semantic_loss,
+        decode_pixel_targets=(
+            model_args.use_semantic_loss and data_args.precomputed_feature_dir is None
+        ),
         vqgan_image_size=(
             semantic_loss_module.vqgan.decoder.resolution
             if semantic_loss_module is not None else 256
         ),
+        precomputed_feature_dir=data_args.precomputed_feature_dir,
     )
     rank0_print(f"Dataset size: {len(train_dataset)}")
 
