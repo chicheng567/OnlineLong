@@ -66,6 +66,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -94,6 +95,17 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(" ".join(str(a) for a in args))
+
+
+def _uniform_downsample_indices(n_available: int, n_keep: int) -> np.ndarray:
+    """
+    Return n_keep indices uniformly spread over [0, n_available-1] (n_available > n_keep).
+
+    Same algorithm as mm_utils.get_frame_indices's sample="uniform" branch, so a
+    precomputed-feature cache with more frames than fixed_frames is downsampled the
+    same way read_frames_decord(sample="uniform") would have sampled the raw video.
+    """
+    return np.linspace(0, n_available - 1, n_keep).round().astype(int)
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +180,24 @@ class DataArguments:
             ),
         },
     )
+    precomputed_feature_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Directory of precomputed frozen-vision-encoder features, one "
+                "<video-stem>.pt per video, each a (T, HW, hidden) tensor with "
+                "HW == compress_image_w * compress_image_h. T must be >= fixed_frames; "
+                "if T > fixed_frames the cached frames are uniformly downsampled to "
+                "exactly fixed_frames (same sampling as the raw-video path's "
+                "read_frames_decord(sample='uniform')) since siglip_ae's depth is "
+                "fixed at construction and every window must have exactly "
+                "fixed_frames frames. T < fixed_frames is still rejected (dropped). "
+                "When set, the dataset loads this cached tensor instead of decoding "
+                "video frames, and the model skips the vision_encoder forward pass "
+                "entirely. Samples lacking a cache file are dropped at dataset-load time."
+            ),
+        },
+    )
 
 
 @dataclass
@@ -227,6 +257,7 @@ class VideoPretrainDatasetDTS(Dataset):
         num_frames: int,
         merge_size: int = 2,
         data_root: Optional[str] = None,
+        precomputed_feature_dir: Optional[str] = None,
     ):
         with open(data_path) as f:
             raw = json.load(f)
@@ -246,17 +277,47 @@ class VideoPretrainDatasetDTS(Dataset):
         else:
             data = raw
 
-        self.data = data
         self.processor = processor
         self.num_frames = num_frames
         self.merge_size = merge_size
         self.data_root = data_root
+        self.precomputed_feature_dir = precomputed_feature_dir
+
+        # If using precomputed vision-encoder features, drop samples without a
+        # cache file (same pattern as videollama3_pretrain_compressor.py).
+        if precomputed_feature_dir is not None:
+            kept: List[Dict] = []
+            cache_root = os.path.abspath(precomputed_feature_dir)
+            for entry in data:
+                v = entry.get("video")
+                if not v:
+                    continue
+                if isinstance(v, (list, tuple)):
+                    v = v[0]
+                stem = os.path.splitext(os.path.basename(str(v)))[0]
+                feat_path = os.path.join(cache_root, f"{stem}.pt")
+                if not os.path.exists(feat_path):
+                    continue
+                entry = dict(entry)
+                entry["_precomputed_feat_path"] = feat_path
+                kept.append(entry)
+            n_drop = len(data) - len(kept)
+            if n_drop:
+                logger.warning("Dropped %d/%d samples without precomputed feature under %s",
+                               n_drop, len(data), precomputed_feature_dir)
+            data = kept
+
+        self.data = data
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, i: int) -> Dict:
         item = self.data[i]
+
+        if self.precomputed_feature_dir is not None:
+            return self._getitem_precomputed(i, item)
+
         root = item.get("_data_root", self.data_root or "")
         video_path = os.path.join(root, item["video"]) if root else item["video"]
 
@@ -297,9 +358,48 @@ class VideoPretrainDatasetDTS(Dataset):
             "n_frames": torch.tensor(self.num_frames, dtype=torch.long),
         }
 
+    def _getitem_precomputed(self, _i: int, item: Dict) -> Dict:
+        """Load a cached (T, HW, hidden) vision-encoder feature tensor instead of
+        decoding video + running the vision encoder. See DataArguments.precomputed_feature_dir."""
+        feat_path = item["_precomputed_feat_path"]
+        try:
+            visual_tokens = torch.load(feat_path, map_location="cpu", weights_only=True)
+        except Exception as exc:
+            logger.warning("Failed to load %s: %s — retrying random sample", feat_path, exc)
+            return self.__getitem__(random.randint(0, len(self.data) - 1))
+
+        if visual_tokens.dim() != 3 or visual_tokens.shape[0] < self.num_frames:
+            logger.warning(
+                "%s: expected a (T>=%d, HW, hidden) tensor (fixed_frames=%d), got shape %s "
+                "— retrying random sample",
+                feat_path, self.num_frames, self.num_frames, tuple(visual_tokens.shape),
+            )
+            return self.__getitem__(random.randint(0, len(self.data) - 1))
+
+        # siglip_ae's depth is fixed at construction, so every window must have
+        # exactly fixed_frames frames. A cache built with a larger frame count is
+        # uniformly downsampled to fixed_frames (mirrors the raw-video path, which
+        # caps at fixed_frames via read_frames_decord(sample="uniform")); a cache
+        # with fewer frames than fixed_frames is rejected above since there is no
+        # equivalent "uniform" way to synthesize the missing frames.
+        if visual_tokens.shape[0] > self.num_frames:
+            idx = _uniform_downsample_indices(visual_tokens.shape[0], self.num_frames)
+            visual_tokens = visual_tokens[idx]
+
+        n_frames, HW, hidden = visual_tokens.shape
+        return {
+            "visual_tokens": visual_tokens.reshape(n_frames * HW, hidden),
+            "n_frames": torch.tensor(n_frames, dtype=torch.long),
+        }
+
 
 class DataCollatorForDTSPretraining:
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        if "visual_tokens" in instances[0]:
+            return {
+                "visual_tokens": torch.cat([x["visual_tokens"] for x in instances], dim=0),
+                "n_frames": torch.stack([x["n_frames"] for x in instances]),
+            }
         return {
             "pixel_values": torch.cat([x["pixel_values"] for x in instances], dim=0),
             "grid_sizes": torch.cat([x["grid_sizes"] for x in instances], dim=0),
@@ -363,10 +463,11 @@ class DTSCompressorAutoEncoder(nn.Module):
 
     def forward(
         self,
-        pixel_values: torch.Tensor,
-        grid_sizes: torch.Tensor,
-        merge_sizes: torch.Tensor,
-        n_frames: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        grid_sizes: Optional[torch.Tensor] = None,
+        merge_sizes: Optional[torch.Tensor] = None,
+        n_frames: torch.Tensor = None,  # type: ignore[assignment]
+        visual_tokens: Optional[torch.Tensor] = None,
         **_kwargs,
     ) -> DTSOutput:
         n_frames_list: List[int] = n_frames.tolist()
@@ -377,19 +478,29 @@ class DTSCompressorAutoEncoder(nn.Module):
             f"DTS pretrain requires every sample to have exactly fixed_frames={T} "
             f"frames; got n_frames={n_frames_list}."
         )
-        device = pixel_values.device
 
-        # 1. Vision encoder (no grad).
-        with torch.no_grad():
-            visual_tokens = self.vision_encoder(
-                pixel_values=pixel_values,
-                grid_sizes=grid_sizes,
-                merge_sizes=merge_sizes,
+        if visual_tokens is not None:
+            # Precomputed-feature path (data_args.precomputed_feature_dir): the
+            # vision_encoder forward pass is bypassed entirely.
+            device = visual_tokens.device
+        else:
+            assert pixel_values is not None, (
+                "forward() needs either pixel_values (+ grid_sizes/merge_sizes) or "
+                "visual_tokens (precomputed-feature path)."
             )
+            device = pixel_values.device
+            # 1. Vision encoder (no grad).
+            with torch.no_grad():
+                visual_tokens = self.vision_encoder(
+                    pixel_values=pixel_values,
+                    grid_sizes=grid_sizes,
+                    merge_sizes=merge_sizes,
+                )
+        assert visual_tokens is not None
         expected_total = B * T * HW
         if visual_tokens.shape[0] != expected_total:
             raise ValueError(
-                f"Vision encoder output {visual_tokens.shape[0]} tokens, expected "
+                f"Got {visual_tokens.shape[0]} visual tokens, expected "
                 f"{expected_total} (= B={B} * T={T} * HW={HW}). Check video_merge_size "
                 "matches compress_image_w/h."
             )
@@ -738,6 +849,7 @@ def train():
         num_frames=T,
         merge_size=data_args.video_merge_size,
         data_root=data_args.data_root,
+        precomputed_feature_dir=data_args.precomputed_feature_dir,
     )
     rank0_print(f"Dataset size: {len(train_dataset)}")
 

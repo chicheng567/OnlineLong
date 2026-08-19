@@ -71,6 +71,17 @@ def _uniform_frame_indices(n_input: int, n_output: int = 10) -> List[int]:
     return [round(i * (n_output - 1) / (n_input - 1)) for i in range(n_input)]
 
 
+def _uniform_downsample_indices(n_available: int, n_keep: int) -> np.ndarray:
+    """
+    Return n_keep indices uniformly spread over [0, n_available-1] (n_available > n_keep).
+
+    Same algorithm as mm_utils.get_frame_indices's sample="uniform" branch, so a
+    precomputed-feature cache with more frames than max_frames is downsampled the
+    same way read_frames_decord(sample="uniform") would have sampled the raw video.
+    """
+    return np.linspace(0, n_available - 1, n_keep).round().astype(int)
+
+
 def _frame_to_vqgan_tensor(img: Image.Image, size: int) -> torch.Tensor:
     """PIL frame -> (3, size, size) tensor in [-1, 1] (taming-transformers convention)."""
     img = img.convert("RGB").resize((size, size), Image.Resampling.BICUBIC)
@@ -293,13 +304,16 @@ class DataArguments:
             "help": (
                 "Directory of precomputed frozen-vision-encoder features, one "
                 "<video-stem>.pt per video, each a (T, HW, hidden) tensor with "
-                "T == max_frames and HW == compress_image_w * compress_image_h. "
-                "When set, the dataset loads this cached tensor instead of decoding "
-                "video frames, and the model skips the vision_encoder forward pass "
-                "entirely (the main cost precomputing removes). Samples lacking a "
-                "cache file are dropped at dataset-load time. Incompatible with "
-                "model_args.use_semantic_loss's decoder_pixel_loss path, which needs "
-                "real frame pixels that this mode never decodes."
+                "HW == compress_image_w * compress_image_h. T may be any value >= "
+                "min_frames; if T > max_frames the cached frames are uniformly "
+                "downsampled to max_frames (same sampling as the raw-video path's "
+                "read_frames_decord(sample='uniform')). When set, the dataset loads "
+                "this cached tensor instead of decoding video frames, and the model "
+                "skips the vision_encoder forward pass entirely (the main cost "
+                "precomputing removes). Samples lacking a cache file are dropped at "
+                "dataset-load time. Incompatible with model_args.use_semantic_loss's "
+                "decoder_pixel_loss path, which needs real frame pixels that this "
+                "mode never decodes."
             ),
         },
     )
@@ -526,6 +540,15 @@ class VideoPretrainDataset(Dataset):
                 feat_path, n_frames, self.min_frames,
             )
             return self.__getitem__(random.randint(0, len(self.data) - 1))
+
+        # Cached feature may have been extracted with a different (larger) frame
+        # count than this run's max_frames. Mirror the raw-video path — which caps
+        # at max_frames via read_frames_decord(sample="uniform") — by uniformly
+        # downsampling along T instead of feeding every cached frame through.
+        if n_frames > self.max_frames:
+            idx = _uniform_downsample_indices(n_frames, self.max_frames)
+            visual_tokens = visual_tokens[idx]
+            n_frames = self.max_frames
 
         out: Dict = {
             "visual_tokens": visual_tokens.reshape(n_frames * HW, hidden),
