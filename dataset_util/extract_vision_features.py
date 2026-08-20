@@ -2,10 +2,17 @@
 """
 Extract per-video VideoLLaMA3 vision-encoder features for a dataset.
 
-For every sample in --data_path, decode ``max_frames`` frames, run them through
-the frozen VideoLLaMA3 vision encoder (SigLIP-NaViT, extracted from the model
-checkpoint at --model_path), and save the resulting token features as a .pt
-file under ``--output_dir/{video_stem}.pt``.
+For every sample in --data_path, decode frames at a fixed 1 FPS, run them
+through the frozen VideoLLaMA3 vision encoder (SigLIP-NaViT, extracted from the
+model checkpoint at --model_path), and save the resulting token features as a
+.pt file under ``--output_dir/{video_stem}.pt``.
+
+Frame sampling is hard-wired to ``sample="fps1"``: one frame per second of
+video, so T tracks the real video duration. Only when a video is long enough
+that 1 FPS would yield more than ``--max_frames`` frames are those 1-FPS indices
+uniformly subsampled down to exactly ``--max_frames``. Videos shorter than
+``--max_frames`` seconds therefore produce fewer than ``--max_frames`` frames
+(no padding); ``--min_frames`` still filters out the very short ones.
 
 This mirrors dataset_util/precompute_iv2_video_feat.py but targets the video
 model's own vision encoder instead of InternVideo2-L, using the same
@@ -15,7 +22,8 @@ Videollama3ImageProcessor -> Videollama3VisionEncoderModel.
 
 Each saved feature tensor has shape (T, HW, hidden_size) in frame-major order
 (or (T*HW, hidden_size) with --flatten), where T is the number of decoded
-frames and HW = (force_image_size // (patch_size * video_merge_size)) ** 2.
+frames (``min(ceil(duration_sec), max_frames)``, i.e. variable across videos)
+and HW = (force_image_size // (patch_size * video_merge_size)) ** 2.
 
 The script is resume-safe (cached samples are skipped unless --overwrite).
 Multi-GPU sharding via torchrun is supported — each rank processes a strided
@@ -174,7 +182,6 @@ class _VideoFrameDataset(Dataset):
         output_dir: Path,
         image_processor: Videollama3ImageProcessor,
         max_frames: int,
-        sample_mode: str,
         min_frames: int,
         merge_size: int,
         overwrite: bool,
@@ -183,7 +190,6 @@ class _VideoFrameDataset(Dataset):
         self.output_dir = output_dir
         self.image_processor = image_processor
         self.max_frames = max_frames
-        self.sample_mode = sample_mode
         self.min_frames = min_frames
         self.merge_size = merge_size
         self.overwrite = overwrite
@@ -210,8 +216,14 @@ class _VideoFrameDataset(Dataset):
             return result
 
         try:
+            # Fixed 1-FPS sampling; get_frame_indices only falls back to a
+            # uniform subsample of those 1-FPS indices when the video is long
+            # enough to exceed max_frames.
             frames = read_frames_decord(
-                video_path, num_frames=self.max_frames, sample=self.sample_mode
+                video_path,
+                num_frames=self.max_frames,
+                sample="fps1",
+                max_num_frames=self.max_frames,
             )
             assert isinstance(frames, list) and len(frames) > 0
         except Exception as exc:
@@ -264,13 +276,12 @@ def main():
                              "per-dataset data_root); required on its own when --data_path is omitted.")
     parser.add_argument("--output_dir", required=True)
 
-    # Frame sampling hyperparameters.
+    # Frame sampling hyperparameters. Sampling itself is fixed at 1 FPS.
     parser.add_argument("--max_frames", type=int, default=10,
-                        help="Frames decoded per video (== T in the saved (T, HW, hidden) tensor).")
-    parser.add_argument("--sample", default="uniform",
-                        choices=["uniform", "rand", "middle", "fps"],
-                        help="Frame sampling strategy passed to read_frames_decord. "
-                             "'uniform' (default) matches AE-pretrain: deterministic, FPS-independent.")
+                        help="Upper bound on frames decoded per video (== T in the saved "
+                             "(T, HW, hidden) tensor). Videos are sampled at 1 FPS; only when "
+                             "that yields more than this many frames are the 1-FPS indices "
+                             "uniformly subsampled down to exactly max_frames.")
     parser.add_argument("--min_frames", type=int, default=4,
                         help="Skip videos that decode to fewer than this many frames.")
 
@@ -330,7 +341,6 @@ def main():
     dataset = _VideoFrameDataset(
         shard, output_dir, image_processor,
         max_frames=args.max_frames,
-        sample_mode=args.sample,
         min_frames=args.min_frames,
         merge_size=args.video_merge_size,
         overwrite=args.overwrite,
