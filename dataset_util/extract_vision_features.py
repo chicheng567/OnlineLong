@@ -25,6 +25,23 @@ Each saved feature tensor has shape (T, HW, hidden_size) in frame-major order
 frames (``min(ceil(duration_sec), max_frames)``, i.e. variable across videos)
 and HW = (force_image_size // (patch_size * video_merge_size)) ** 2.
 
+Frame timestamps
+----------------
+The .pt tensors carry no time axis, so the exact wall-clock second of every
+saved frame is recorded in the output meta instead (``frame_timestamps``, one
+float per row of the T dimension, plus ``video_duration`` / ``video_fps`` /
+``num_frames``). Downstream consumers must read these rather than re-deriving a
+grid: 1-FPS sampling puts frame i at ``i + 0.5`` seconds -- NOT at ``i`` -- and
+for videos longer than max_frames seconds those 1-FPS indices are uniformly
+subsampled, so the spacing is no longer 1 second either. Both regimes are
+already baked into what is written here.
+
+For samples whose feature file is reused from an earlier run (resume without
+--overwrite) no frames are decoded, so the timestamps are recomputed from
+decord *metadata only* (container fps + frame count), replaying the very same
+get_frame_indices() call. If the video file is gone the entry gets
+``frame_timestamps: null`` and is counted in the run summary.
+
 The script is resume-safe (cached samples are skipped unless --overwrite).
 Multi-GPU sharding via torchrun is supported — each rank processes a strided
 shard samples[rank::world_size].
@@ -45,7 +62,12 @@ Output layout
 -------------
     vision_feat_cache/
       {video_stem}.pt              # (T, HW, hidden_size) or (T*HW, hidden_size), fp16
-      meta_with_vision_feat.json   # input meta + 'vision_feat_path' per sample
+      meta_with_vision_feat.json   # input meta + per sample:
+                                   #   vision_feat_path : str
+                                   #   frame_timestamps : [float] | null  (seconds, len == T)
+                                   #   num_frames       : int   | null
+                                   #   video_duration   : float | null    (seconds)
+                                   #   video_fps        : float | null    (container avg fps)
 """
 from __future__ import annotations
 
@@ -66,12 +88,16 @@ from tqdm import tqdm
 
 sys.path.append("./")
 
-from videollama3.mm_utils import read_frames_decord
+from videollama3.mm_utils import get_frame_indices, read_frames_decord
 from videollama3.model import Videollama3Qwen2ForCausalLM
 from videollama3.model.videollama3_encoder import Videollama3ImageProcessor
 
 
 logger = logging.getLogger(__name__)
+
+
+# Meta keys this script adds on top of whatever the input annotation carried.
+TIME_META_KEYS = ("frame_timestamps", "num_frames", "video_duration", "video_fps")
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +174,34 @@ def _load_samples(data_path: Optional[str], data_root: Optional[str]) -> List[Di
 
 
 # ---------------------------------------------------------------------------
+# Frame timestamps
+# ---------------------------------------------------------------------------
+
+def _probe_frame_times(video_path: str, max_frames: int) -> Dict:
+    """Recover the sampled frame times without decoding a single frame.
+
+    Mirrors read_frames_decord(sample="fps1", ...) exactly: same get_frame_indices
+    call, same `round(idx / fps, 1)` timestamps. Only the container header is
+    read, so this is cheap enough to run for every cached sample on a resume.
+    """
+    from decord import VideoReader
+
+    vr = VideoReader(video_path, num_threads=1)
+    vlen, fps = len(vr), float(vr.get_avg_fps())
+    if vlen == 0 or fps <= 0:
+        raise ValueError(f"unusable video metadata (vlen={vlen}, fps={fps})")
+    frame_indices = get_frame_indices(
+        max_frames, vlen, sample="fps1", input_fps=fps, max_num_frames=max_frames
+    )
+    return {
+        "frame_timestamps": [round(idx / fps, 1) for idx in frame_indices],
+        "num_frames": len(frame_indices),
+        "video_duration": round(vlen / fps, 2),
+        "video_fps": round(fps, 3),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Vision encoder loading (same pattern as
 # videollama3_pretrain_compressor.py::_load_vision_encoder): load the full
 # checkpoint just to extract the vision tower, then drop the LLM weights.
@@ -212,20 +266,32 @@ class _VideoFrameDataset(Dataset):
         result: Dict = {"sample": out_sample, "out_path": str(out_path)}
 
         if out_path.exists() and not self.overwrite:
+            # The features are reused as-is, but the meta still has to describe
+            # them, so recover the frame times from the container header alone.
             result["status"] = "cached"
+            try:
+                result["time_meta"] = _probe_frame_times(video_path, self.max_frames)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("No frame timestamps for cached %s: %s", video_path, exc)
+                result["time_meta"] = None
             return result
 
         try:
             # Fixed 1-FPS sampling; get_frame_indices only falls back to a
             # uniform subsample of those 1-FPS indices when the video is long
-            # enough to exceed max_frames.
-            frames = read_frames_decord(
+            # enough to exceed max_frames. return_timestamps gives us the exact
+            # second of each kept frame for free -- same decord read, no extra IO.
+            decoded = read_frames_decord(
                 video_path,
                 num_frames=self.max_frames,
                 sample="fps1",
                 max_num_frames=self.max_frames,
+                return_timestamps=True,
             )
+            assert isinstance(decoded, tuple) and len(decoded) == 2
+            frames, timestamps = decoded
             assert isinstance(frames, list) and len(frames) > 0
+            assert len(timestamps) == len(frames)
         except Exception as exc:
             logger.warning("decord failed on %s: %s", video_path, exc)
             result["status"] = "fail"
@@ -248,10 +314,34 @@ class _VideoFrameDataset(Dataset):
             result["status"] = "fail"
             return result
 
+        # `timestamps` came out of the real decode, so it is authoritative. The
+        # header-only probe is run alongside it purely to keep duration/fps in
+        # the meta and to assert that the probe -- which is all the cached path
+        # on a resume has to go on -- reproduces the decode exactly.
+        time_meta = {
+            "frame_timestamps": [float(x) for x in timestamps],
+            "num_frames": len(frames),
+            "video_duration": None,
+            "video_fps": None,
+        }
+        try:
+            probed = _probe_frame_times(video_path, self.max_frames)
+            time_meta["video_duration"] = probed["video_duration"]
+            time_meta["video_fps"] = probed["video_fps"]
+            if probed["frame_timestamps"] != time_meta["frame_timestamps"]:
+                logger.warning(
+                    "Timestamp probe disagrees with the decode on %s (probe=%s, decode=%s); "
+                    "a resumed run would record the probe's values for this video.",
+                    video_path, probed["frame_timestamps"], time_meta["frame_timestamps"],
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Duration/fps probe failed on %s: %s", video_path, exc)
+
         result["pixel_values"] = data_dict["pixel_values"]    # (patches, patch_dim)
         result["grid_sizes"] = data_dict["grid_sizes"]         # (1, 3) = [t, h, w] pre-merge
         result["merge_sizes"] = data_dict["merge_sizes"]       # (1,)
         result["n_frames"] = len(frames)
+        result["time_meta"] = time_meta
         result["status"] = "ok"
         return result
 
@@ -355,6 +445,7 @@ def main():
 
     processed: List[Dict] = []
     n_fail = 0
+    n_no_ts = 0
     with tqdm(total=len(shard), desc=f"[rank {rank}]", disable=(rank != 0)) as pbar:
         for batch in loader:
             to_run = [r for r in batch if r["status"] == "ok"]
@@ -393,10 +484,23 @@ def main():
                     continue
                 s = dict(r["sample"])
                 s["vision_feat_path"] = r["out_path"]
+                # Overwrites any same-named field from the source annotation on
+                # purpose: these describe the frames actually saved in the .pt,
+                # which is what downstream consumers need to align against.
+                time_meta = r.get("time_meta")
+                if time_meta is None:
+                    n_no_ts += 1
+                    time_meta = {k: None for k in TIME_META_KEYS}
+                s.update(time_meta)
                 processed.append(s)
             pbar.update(len(batch))
     if n_fail:
         logger.warning("rank %d: %d samples failed to decode/process and were skipped", rank, n_fail)
+    if n_no_ts:
+        logger.warning(
+            "rank %d: %d samples have no frame_timestamps (video unreadable); downstream "
+            "timestamp_mode=meta will fall back for those.", rank, n_no_ts,
+        )
 
     # Write per-rank partial meta; rank 0 merges.
     partial_path = output_dir / f".meta_partial_rank{rank}.json"
