@@ -91,6 +91,7 @@ every rank a near-identical length distribution):
 from __future__ import annotations
 
 import argparse
+import gc
 import inspect
 import json
 import logging
@@ -110,6 +111,7 @@ from transformers import Qwen2Config, Qwen2ForCausalLM
 
 sys.path.append("./")
 
+from videollama3.constants import DEFAULT_IMAGE_TOKEN
 from videollama3.model import Videollama3Qwen2ForCausalLM
 from videollama3.model.processor import DEFAULT_CHAT_TEMPLATE, Videollama3Processor
 from videollama3.model.projector import build_vision_projector
@@ -443,6 +445,10 @@ def _build_prompt_ids(
     side = int(round(math.sqrt(tokens_per_frame)))
     if side * side != tokens_per_frame:
         raise ValueError(f"tokens_per_frame={tokens_per_frame} is not a perfect square.")
+    # merge_size cancels out of the expansion (process_text built the grid as
+    # side*merge_size and then divided it back out), so it is kept only as a
+    # documented record of how the features were extracted.
+    del merge_size
 
     content: List[Dict] = [{"type": "video", "num_frames": num_frames}]
     if timestamps is not None:
@@ -453,14 +459,15 @@ def _build_prompt_ids(
     text = processor.tokenizer.apply_chat_template(
         conversation, tokenize=False, add_generation_prompt=True, add_system_prompt=True
     )
-    # process_text expands each <image> into grid_size.prod() image tokens.
-    grid_sizes = torch.tensor([[num_frames, side * merge_size, side * merge_size]])
-    merge_sizes = torch.tensor([merge_size])
-    text_inputs = processor.process_text(
-        [text],
-        {"grid_sizes": grid_sizes, "merge_sizes": merge_sizes},
-        return_tensors="pt",
-    )
+    # process_text expands each <image> into grid_size.prod() image tokens, but it
+    # does so one frame at a time with a count-limited str.replace inside a
+    # `while "<image>" in text` loop -- O(T^2) bytes copied, ~60 MB of transient
+    # 0.5 MB strings per sample at T=256, in every DataLoader worker. Here every
+    # frame shares the same grid, so a single uncounted replace produces the exact
+    # same string (str.replace never rescans what it just inserted); verified
+    # token-for-token identical against process_text at T=4/37/128.
+    text = text.replace(DEFAULT_IMAGE_TOKEN, DEFAULT_IMAGE_TOKEN * tokens_per_frame)
+    text_inputs = processor.tokenizer([text], return_tensors="pt")
     return text_inputs["input_ids"][0]
 
 
@@ -586,6 +593,36 @@ def _pack_batches(
 def _identity_collate(batch):
     """The dataset already yields a whole batch; DataLoader must not re-collate."""
     return batch
+
+
+# The only `raw` fields _FeatureBatchDataset ever reads. Everything else in a meta
+# entry -- most of all `conversations`, which carries the source annotation's full
+# text -- is dead weight from the workers' point of view, and only rank 0 needs it
+# at the very end for --annotation_out.
+_WORKER_RAW_KEYS = ("frame_timestamps", "num_frames", "video_duration", "_data_root")
+
+
+def _slim_sample(sample: Dict, duration_key: str) -> Dict:
+    raw = sample["raw"]
+    keys = (*_WORKER_RAW_KEYS, duration_key)
+    return {
+        "video": sample["video"],
+        "feat_path": sample["feat_path"],
+        "video_id": sample["video_id"],
+        "raw": {k: raw[k] for k in keys if k in raw},
+    }
+
+
+def _rss_mb() -> float:
+    """Current resident set size, MB. Cheap enough to call once per batch."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return float("nan")
 
 
 class _FeatureBatchDataset(Dataset):
@@ -784,6 +821,15 @@ def main():
                              "131072 suits an 80 GB card; use ~32768 on 24 GB.")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader workers prefetching features / building prompt ids.")
+    parser.add_argument("--prefetch_factor", type=int, default=1,
+                        help="Batches each worker keeps queued ahead of the loop. Host RAM holds "
+                             "num_workers x prefetch_factor whole batches of fp16 features, so "
+                             "this is the CPU-memory knob the way --max_batch_tokens is the VRAM "
+                             "one. Prep is much cheaper than generate(), so 1 keeps the GPU fed.")
+    parser.add_argument("--log_rss_every", type=int, default=0,
+                        help="Log this rank's resident set size every N batches (0 = off). Use it "
+                             "to tell a real leak from the bounded steady state of the prefetch "
+                             "queue -- RSS should flatten within the first few batches.")
     parser.add_argument("--no_sort_by_length", action="store_true",
                         help="Process in meta order instead of longest-first. Sorting keeps a "
                              "batch from being padded out to its longest member (cached T ranges "
@@ -891,6 +937,27 @@ def main():
                 sum(sizes) / len(sizes), args.max_batch_tokens,
             )
 
+    # --- Shrink the resident work list before anything forks -------------------
+    # Everything below keeps host RSS flat over a long run:
+    #   * the DataLoader gets slimmed samples, so the source annotations (whole
+    #     `conversations` blocks) are neither held by the workers nor pickled back
+    #     through the result queue once per batch;
+    #   * `items`/`shard`/`todo`/`done` are dropped -- `batches` is the only view
+    #     of the work list the loop still needs;
+    #   * non-zero ranks drop `samples` entirely: only rank 0 reads it again, at
+    #     the very end, to build --annotation_out.
+    batches = [
+        [{"sample": _slim_sample(it["sample"], args.duration_key), "est_len": it["est_len"]}
+         for it in batch]
+        for batch in batches
+    ]
+    n_shard = len(shard)
+    del items, shard, todo, done
+    if rank != 0:
+        samples = None
+    gc.collect()
+    logger.info("rank %d: work list ready, RSS %.0f MB", rank, _rss_mb())
+
     model, projector, embed_tokens, generate_fn = _load_model(
         args.model_path, dtype, args.attn_implementation, args.llm_impl
     )
@@ -937,16 +1004,29 @@ def main():
     n_no_ts = 0
     n_fake_ts = 0
     fout = open(rank_file, "a", encoding="utf-8")
+
+    # DataLoader workers are forked, so they start out sharing the parent's pages.
+    # CPython dirties those pages just by *reading* them (every incref writes into
+    # the object header) and a single full gc pass touches every tracked object at
+    # once -- measured on a 300k-entry work list: +129 MB private per worker after
+    # one gc.collect(), climbing steadily as the worker walks its shard. Freezing
+    # moves everything alive right now into a permanent generation the collector
+    # never visits, which takes that to +0 MB. Nothing here needs those objects
+    # collected: the process exits when the run does.
+    gc.freeze()
     loader = DataLoader(
         _FeatureBatchDataset(batches, processor, args, video_root, prompt),
         batch_size=None,                 # the dataset already yields whole batches
         shuffle=False,
         num_workers=args.num_workers,
-        prefetch_factor=2 if args.num_workers > 0 else None,
+        # num_workers x prefetch_factor whole batches of fp16 features sit in RAM
+        # at once. Prep is far cheaper than generate(), so 1 already keeps the GPU
+        # fed; 2 just doubles the resident feature bytes for nothing.
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
         collate_fn=_identity_collate,
     )
-    pbar = tqdm(total=len(shard), desc=f"[rank {rank}] captioning", disable=(rank != 0))
-    for prepared in loader:
+    pbar = tqdm(total=n_shard, desc=f"[rank {rank}] captioning", disable=(rank != 0))
+    for n_batch, prepared in enumerate(loader, 1):
         embeds_list, metas = [], []
 
         for item in prepared:
@@ -971,12 +1051,18 @@ def main():
                                   image_token_id, device, dtype)
                 )
                 metas.append((sample, item["t"], item["timestamps"], item["ts_synthetic"]))
+                # The projected copy lives on the GPU now, so drop the host-side
+                # (T, HW, C) fp16 tensor here instead of letting the whole batch of
+                # them survive generate() -- the longest step in the iteration.
+                del feat
+                item["feat"] = None
             except Exception as exc:  # noqa: BLE001
                 n_fail += 1
                 logger.warning("Skipping %s: %s", sample["video_id"], exc)
 
         if not embeds_list:
             pbar.update(len(prepared))
+            del prepared
             continue
 
         inputs_embeds, attention_mask = _left_pad(embeds_list, pad_embed)
@@ -987,7 +1073,7 @@ def main():
                 **generation_kwargs,
             )
         captions = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-        del inputs_embeds, attention_mask, embeds_list
+        del inputs_embeds, attention_mask, embeds_list, output_ids
 
         for (sample, t, timestamps, ts_synthetic), caption in zip(metas, captions):
             record = {
@@ -1005,6 +1091,12 @@ def main():
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
         fout.flush()
         pbar.update(len(prepared))
+        # `prepared` is the last holder of this batch's worker-side objects (the
+        # shared-memory feature storages among them); without this it stays alive
+        # until the loader hands over the next batch.
+        del prepared, metas, captions
+        if args.log_rss_every and n_batch % args.log_rss_every == 0:
+            logger.info("rank %d: batch %d, RSS %.0f MB", rank, n_batch, _rss_mb())
 
     pbar.close()
     fout.close()
