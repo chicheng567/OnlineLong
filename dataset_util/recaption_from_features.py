@@ -21,11 +21,28 @@ features into the text embedding sequence at every <image> token. Since the
 cached .pt files already hold the vision_encoder output, this script replays
 only the second half of that pipeline (mm_projector + scatter) and calls the
 plain Qwen2 generate() on the resulting inputs_embeds. The vision encoder is
-never run -- and by default is dropped from memory right after load.
+never run: --llm_impl stock never constructs one, and --llm_impl vendored drops
+it from memory right after load.
 
-NOTE: the model's own `generate()` refuses `inputs_embeds`, so we deliberately
-bypass it via `super(Videollama3Qwen2ForCausalLM, model).generate(...)`, which
-lands on the vanilla HF generation loop.
+NOTE: the multimodal `generate()` refuses `inputs_embeds`. By default
+(--llm_impl stock) the LLM is loaded as a plain `transformers.Qwen2ForCausalLM`
+alongside a standalone mm_projector, so `model.generate()` is the vanilla HF
+loop already; --llm_impl vendored restores the repo's `qwen2/` copy and reaches
+the same loop via `super(Videollama3Qwen2ForCausalLM, model).generate(...)`.
+The two backends were verified bitwise identical (teacher-forced, cache off, on
+real features: max|dlogit| == 0 across every caption position); stock is kept as
+the default only because it decodes ~1.35x faster at batch 1 and ~2.25x faster
+at batch 4.
+
+Throughput
+----------
+Generation is ~90% decode, which is memory-bandwidth bound, so batching is
+close to free while prefill is already compute-saturated and gains nothing from
+it. Samples are ordered longest-first and packed under --max_batch_tokens, a
+*padded*-token budget (batch_size x longest member) that predicts peak VRAM far
+better than --batch_size does. Note that batching -- and any change in batch
+composition, including a resume -- perturbs bf16 logits enough to flip near-ties,
+so greedy captions are not reproducible token-for-token across runs.
 
 Timestamps
 ----------
@@ -67,8 +84,9 @@ Single GPU:
         --output_file recaption/detail_captions.jsonl \
         --annotation_out anno_online/detail_caption_recap.json
 
-Multi-GPU (samples are sharded rank::world_size, same as the extractor):
-    torchrun --nproc_per_node=2 dataset_util/recaption_from_features.py ...
+Multi-GPU (the work list is sorted, then sharded rank::world_size, which hands
+every rank a near-identical length distribution):
+    torchrun --nproc_per_node=4 dataset_util/recaption_from_features.py ...
 """
 from __future__ import annotations
 
@@ -81,16 +99,20 @@ import os
 import sys
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+from transformers import Qwen2Config, Qwen2ForCausalLM
 
 sys.path.append("./")
 
 from videollama3.model import Videollama3Qwen2ForCausalLM
 from videollama3.model.processor import DEFAULT_CHAT_TEMPLATE, Videollama3Processor
+from videollama3.model.projector import build_vision_projector
 
 
 logger = logging.getLogger(__name__)
@@ -444,7 +466,8 @@ def _build_prompt_ids(
 
 @torch.no_grad()
 def _embed_sample(
-    model: Videollama3Qwen2ForCausalLM,
+    embed_tokens: torch.nn.Module,
+    projector: torch.nn.Module,
     input_ids: torch.Tensor,
     feat: torch.Tensor,
     image_token_id: int,
@@ -454,10 +477,10 @@ def _embed_sample(
     """Text embeddings with the projected vision features scattered into the
     <image> slots -- the inputs_embeds half of prepare_inputs_labels_for_multimodal."""
     input_ids = input_ids.to(device)
-    inputs_embeds = model.get_model().embed_tokens(input_ids).clone()
+    inputs_embeds = embed_tokens(input_ids).clone()
 
     flat = feat.reshape(-1, feat.shape[-1]).to(device=device, dtype=dtype)
-    mm_features = model.get_model().mm_projector(flat)
+    mm_features = projector(flat)
 
     image_selected = input_ids == image_token_id
     n_slots = int(image_selected.sum().item())
@@ -488,24 +511,215 @@ def _left_pad(
 
 
 # ---------------------------------------------------------------------------
+# Length estimation, ordering and token-budget batching
+# ---------------------------------------------------------------------------
+
+# The prompt is overwhelmingly image tokens (T * tokens_per_frame); the rest is
+# the chat template plus one "Time X.0s:" run per frame. Measured overhead was
+# 12.0-12.8 tokens/frame, so these deliberately over-estimate -- a batch planned
+# on them never exceeds --max_batch_tokens once the real ids are built.
+_TEXT_TOKENS_PER_FRAME = 20
+_TEXT_TOKENS_FIXED = 256
+
+
+def _probe_num_frames(sample: Dict, tokens_per_frame: int, max_frames: int) -> int:
+    """Frames this sample will contribute, without reading the feature payload.
+
+    Prefers the extractor's `num_frames`; otherwise reads only the .pt header
+    (~1 ms) via a meta-device load.
+    """
+    t = sample["raw"].get("num_frames")
+    if not isinstance(t, int) or t <= 0:
+        try:
+            obj = torch.load(sample["feat_path"], map_location="meta", weights_only=True, mmap=True)
+            shape = tuple(obj.shape)
+            t = shape[0] if len(shape) == 3 else max(1, shape[0] // tokens_per_frame)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("frame probe failed on %s (%s); assuming 1 frame.", sample["video_id"], exc)
+            t = 1
+    if max_frames > 0:
+        t = min(t, max_frames)
+    return int(t)
+
+
+def _estimate_seq_len(num_frames: int, tokens_per_frame: int) -> int:
+    return num_frames * tokens_per_frame + _TEXT_TOKENS_PER_FRAME * num_frames + _TEXT_TOKENS_FIXED
+
+
+def _pack_batches(
+    items: List[Dict], max_batch_tokens: int, max_batch_size: int
+) -> List[List[Dict]]:
+    """Group a length-ordered list into batches under a *padded*-token budget.
+
+    Peak VRAM tracks padded tokens (batch_size x longest member), not batch size:
+    measured 4x8514 and 2x16994 both peaked at the same 22.1 GB. So the budget,
+    not --batch_size, is the real memory knob; --batch_size only caps the
+    per-sample Python overhead on very short videos.
+    """
+    batches: List[List[Dict]] = []
+    cur: List[Dict] = []
+    cur_max = 0
+    for item in items:
+        nxt_max = max(cur_max, item["est_len"])
+        if cur and (len(cur) + 1) * nxt_max > max_batch_tokens:
+            batches.append(cur)
+            cur, cur_max = [], 0
+            nxt_max = item["est_len"]
+        cur.append(item)
+        cur_max = nxt_max
+        if len(cur) >= max_batch_size:
+            batches.append(cur)
+            cur, cur_max = [], 0
+    if cur:
+        batches.append(cur)
+
+    over = [b for b in batches if len(b) == 1 and b[0]["est_len"] > max_batch_tokens]
+    if over:
+        logger.warning(
+            "%d sample(s) exceed --max_batch_tokens on their own (longest %d tokens) and run "
+            "unbatched; raise the budget or lower --max_frames if they OOM.",
+            len(over), max(b[0]["est_len"] for b in over),
+        )
+    return batches
+
+
+def _identity_collate(batch):
+    """The dataset already yields a whole batch; DataLoader must not re-collate."""
+    return batch
+
+
+class _FeatureBatchDataset(Dataset):
+    """Does the CPU-side prep (torch.load + timestamps + prompt ids) off the main
+    process so it overlaps with generate() instead of stalling the GPU."""
+
+    def __init__(self, batches, processor, args, video_root, prompt):
+        self.batches = batches
+        self.processor = processor
+        self.args = args
+        self.video_root = video_root
+        self.prompt = prompt
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+    def __getitem__(self, idx: int) -> List[Dict]:
+        a = self.args
+        out = []
+        for item in self.batches[idx]:
+            sample = item["sample"]
+            try:
+                feat, t, hw, kept = _load_feature(sample["feat_path"], a.tokens_per_frame, a.max_frames)
+                if hw != a.tokens_per_frame:
+                    raise ValueError(
+                        f"cached tokens/frame {hw} != --tokens_per_frame {a.tokens_per_frame}"
+                    )
+                timestamps, ts_synthetic = _build_timestamps(
+                    sample, t, a.timestamp_mode, self.video_root, a.duration_key, kept, a.fake_fps,
+                )
+                input_ids = _build_prompt_ids(
+                    self.processor, t, hw, a.merge_size, timestamps, self.prompt
+                )
+                out.append({
+                    "sample": sample, "feat": feat, "t": t, "input_ids": input_ids,
+                    "timestamps": timestamps, "ts_synthetic": ts_synthetic, "error": None,
+                })
+            except Exception as exc:  # noqa: BLE001
+                out.append({"sample": sample, "error": str(exc)})
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
-def _load_model(model_path: str, dtype: torch.dtype, attn_impl: str, drop_vision_encoder: bool):
-    logger.info("Loading %s ...", model_path)
-    model = Videollama3Qwen2ForCausalLM.from_pretrained(
-        model_path,
-        dtype=dtype,
-        attn_implementation=attn_impl,
-        low_cpu_mem_usage=True,
+def _load_mm_projector(model_path: str, dtype: torch.dtype) -> torch.nn.Module:
+    """Rebuild just `model.mm_projector` from the checkpoint, without the LLM.
+
+    Only four tensors (mlp2x_gelu: 1152->3584->3584, ~30 MB), so this is read
+    straight out of the shard rather than through from_pretrained.
+    """
+    with open(os.path.join(model_path, "config.json")) as f:
+        raw_cfg = json.load(f)
+    mm_hidden = raw_cfg["vision_encoder_config"]["hidden_size"]
+
+    state = {}
+    prefix = "model.mm_projector."
+    shards = sorted(Path(model_path).glob("*.safetensors"))
+    if shards:
+        from safetensors.torch import load_file
+
+        for shard in shards:
+            for k, v in load_file(str(shard)).items():
+                if k.startswith(prefix):
+                    state[k[len(prefix):]] = v
+    else:
+        # mmap keeps this from paging in the whole (30 GB, fp32) single-file checkpoint.
+        full = torch.load(
+            os.path.join(model_path, "pytorch_model.bin"),
+            map_location="cpu", weights_only=True, mmap=True,
+        )
+        state = {k[len(prefix):]: v for k, v in full.items() if k.startswith(prefix)}
+    if not state:
+        raise RuntimeError(f"{model_path}: no '{prefix}*' weights found.")
+
+    projector = build_vision_projector(
+        SimpleNamespace(
+            hidden_size=raw_cfg["hidden_size"],
+            mm_projector_type=raw_cfg.get("mm_projector_type", "mlp2x_gelu"),
+        ),
+        mm_hidden,
     )
-    if drop_vision_encoder and getattr(model.get_model(), "vision_encoder", None) is not None:
-        # Never invoked here: the features are already encoded.
-        model.get_model().vision_encoder = None
-        logger.info("Dropped the vision encoder (features are pre-extracted).")
+    projector.load_state_dict({k: v.to(torch.float32) for k, v in state.items()}, strict=True)
+    return projector.to(dtype).eval()
+
+
+def _load_model(model_path: str, dtype: torch.dtype, attn_impl: str, llm_impl: str):
+    """Returns (model, projector, embed_tokens, generate_fn).
+
+    llm_impl="stock" loads the LLM as a plain `transformers.Qwen2ForCausalLM`
+    instead of the repo's vendored `qwen2/` copy. The two were verified to be
+    *bitwise* identical (teacher-forced, cache disabled, real features:
+    max|dlogit| == 0 over every caption position), but the vendored copy -- a
+    transformers-4.46.3-era snapshot kept only because the trainable-compressor
+    training path subclasses it -- decodes ~1.35x slower at batch 1 and ~2.25x
+    slower at batch 4. Nothing here needs the multimodal subclass: the features
+    are pre-encoded, so only the mm_projector and the plain LLM are ever run.
+
+    Greedy captions still will not match a vendored run token-for-token, but that
+    is bf16 KV-cache rounding, not an implementation difference -- the vendored
+    model does not reproduce its own cache-free output either, and every observed
+    divergence sat on a top-2 logit margin at or below bf16 resolution.
+    """
+    logger.info("Loading %s (llm_impl=%s) ...", model_path, llm_impl)
+
+    if llm_impl == "vendored":
+        model = Videollama3Qwen2ForCausalLM.from_pretrained(
+            model_path, dtype=dtype, attn_implementation=attn_impl, low_cpu_mem_usage=True,
+        )
+        if getattr(model.get_model(), "vision_encoder", None) is not None:
+            # Never invoked here: the features are already encoded.
+            model.get_model().vision_encoder = None
+            logger.info("Dropped the vision encoder (features are pre-extracted).")
+        if model.config.use_cache is None:
+            model.config.use_cache = True
+        model = model.eval()
+        projector = model.get_model().mm_projector
+        embed_tokens = model.get_model().embed_tokens
+        # The multimodal generate() rejects inputs_embeds; go straight to the
+        # vanilla HF generation loop on the parent class.
+        def generate_fn(**kwargs):
+            return super(Videollama3Qwen2ForCausalLM, model).generate(**kwargs)
+        return model, projector, embed_tokens, generate_fn
+
+    config = Qwen2Config.from_pretrained(model_path)
+    model = Qwen2ForCausalLM.from_pretrained(
+        model_path, config=config, dtype=dtype,
+        attn_implementation=attn_impl, low_cpu_mem_usage=True,
+    ).eval()
     if model.config.use_cache is None:
         model.config.use_cache = True
-    return model.eval()
+    projector = _load_mm_projector(model_path, dtype)
+    return model, projector, model.get_input_embeddings(), model.generate
 
 
 # ---------------------------------------------------------------------------
@@ -556,14 +770,35 @@ def main():
     parser.add_argument("--duration_key", default="duration",
                         help="Meta field holding video duration in seconds.")
 
-    parser.add_argument("--batch_size", type=int, default=1,
-                        help="Videos per generate() call. >1 is faster, but bf16 batched matmuls "
-                             "shift logits slightly, so greedy captions are no longer reproducible "
-                             "token-for-token against a batch_size=1 run.")
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Hard cap on videos per generate() call. The real memory knob is "
+                             "--max_batch_tokens; this only bounds the per-sample Python overhead "
+                             "on very short videos. NOTE: bf16 batched matmuls shift logits "
+                             "slightly, so greedy captions are not reproducible token-for-token "
+                             "against a batch_size=1 run (neither is a rerun with a different "
+                             "batch composition).")
+    parser.add_argument("--max_batch_tokens", type=int, default=131072,
+                        help="Padded-token budget per generate() call -- batch_size x the longest "
+                             "member. This, not --batch_size, predicts peak VRAM: measured ~199 KB "
+                             "per padded token on top of the weights, consistently across shapes. "
+                             "131072 suits an 80 GB card; use ~32768 on 24 GB.")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader workers prefetching features / building prompt ids.")
+    parser.add_argument("--no_sort_by_length", action="store_true",
+                        help="Process in meta order instead of longest-first. Sorting keeps a "
+                             "batch from being padded out to its longest member (cached T ranges "
+                             "4..100 frames), and longest-first makes an over-budget run OOM in "
+                             "the first minute rather than hours in.")
+    parser.add_argument("--llm_impl", choices=["stock", "vendored"], default="stock",
+                        help="Which Qwen2 implementation runs the LLM. 'stock' uses "
+                             "transformers.Qwen2ForCausalLM plus a standalone mm_projector; it is "
+                             "bitwise identical to 'vendored' (verified teacher-forced with the "
+                             "cache off) but decodes ~1.35x faster at batch 1 and ~2.25x faster at "
+                             "batch 4. 'vendored' restores the repo's qwen2/ copy.")
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--do_sample", action="store_true")
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--top_k", type=int, default=50)
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--repetition_penalty", type=float, default=1.1,
@@ -575,8 +810,6 @@ def main():
 
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--attn_implementation", default="flash_attention_2")
-    parser.add_argument("--keep_vision_encoder", action="store_true",
-                        help="Keep the (unused) vision encoder in memory.")
     parser.add_argument("--limit", type=int, default=0, help="Only process the first N samples.")
     parser.add_argument("--overwrite", action="store_true",
                         help="Ignore existing results instead of resuming.")
@@ -630,15 +863,39 @@ def main():
         samples = samples[: args.limit]
     done = set() if args.overwrite else _load_done_ids(output_file)
     todo = [s for s in samples if s["video_id"] not in done]
-    shard = todo[rank::world_size]
+
+    items = [
+        {"sample": s, "est_len": _estimate_seq_len(
+            _probe_num_frames(s, args.tokens_per_frame, args.max_frames), args.tokens_per_frame)}
+        for s in todo
+    ]
+    if not args.no_sort_by_length:
+        # Sort the whole list *before* sharding: round-robin over a sorted list
+        # hands every rank a near-identical length distribution for free, which
+        # sharding first and sorting second only achieves by luck.
+        items.sort(key=lambda it: -it["est_len"])
+    shard = items[rank::world_size]
+    batches = _pack_batches(shard, args.max_batch_tokens, args.batch_size)
     if rank == 0:
+        lens = [it["est_len"] for it in items]
+        sizes = [len(b) for b in batches]
         logger.info(
             "Samples: %d total | %d already captioned | %d to do | %d on this rank",
             len(samples), len(samples) - len(todo), len(todo), len(shard),
         )
+        if shard:
+            logger.info(
+                "Est. seq len %d..%d tokens | %d batches on this rank, size %d..%d (mean %.1f) "
+                "under a %d-token budget",
+                min(lens), max(lens), len(batches), min(sizes), max(sizes),
+                sum(sizes) / len(sizes), args.max_batch_tokens,
+            )
 
-    model = _load_model(args.model_path, dtype, args.attn_implementation, not args.keep_vision_encoder)
+    model, projector, embed_tokens, generate_fn = _load_model(
+        args.model_path, dtype, args.attn_implementation, args.llm_impl
+    )
     model.to(device)
+    projector.to(device)
 
     processor = Videollama3Processor.from_pretrained(args.model_path)
     # from_pretrained loads the checkpoint's chat_template.jinja, which references an
@@ -649,9 +906,7 @@ def main():
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
     with torch.no_grad():
-        pad_embed = model.get_model().embed_tokens(
-            torch.tensor([pad_token_id], device=device)
-        )[0]
+        pad_embed = embed_tokens(torch.tensor([pad_token_id], device=device))[0]
 
     generation_kwargs = dict(
         max_new_tokens=args.max_new_tokens,
@@ -664,73 +919,75 @@ def main():
     )
     if args.do_sample:
         generation_kwargs.update(temperature=args.temperature, top_p=args.top_p, top_k=args.top_k)
-    # The model's forward defaults to num_logits_to_keep=0, i.e. it runs lm_head over
-    # the *whole* prefill sequence (vocab is ~152k, so that is GBs once a video
-    # contributes tens of thousands of image tokens). Only the last position matters
-    # for generation. HF 4.57 only auto-fills the newer `logits_to_keep` name, which
-    # this forward does not declare, so pass it explicitly.
+    # Without this the forward runs lm_head over the *whole* prefill sequence (vocab
+    # is ~152k, so that is GBs once a video contributes tens of thousands of image
+    # tokens); only the last position matters for generation. Stock Qwen2 declares
+    # the newer `logits_to_keep` name and HF 4.57 auto-fills it to 1, but the
+    # vendored copy still spells it `num_logits_to_keep`, which nothing auto-fills.
     if "num_logits_to_keep" in inspect.signature(model.forward).parameters:
         generation_kwargs["num_logits_to_keep"] = 1
 
-    expected_dim = getattr(model.config, "mm_hidden_size", None)
+    # The projector's input width is the vision encoder's hidden size, and it is
+    # present under both backends (stock's Qwen2Config has no mm_hidden_size).
+    first_linear = next(m for m in projector.modules() if isinstance(m, torch.nn.Linear))
+    expected_dim = first_linear.in_features
     video_root = args.video_root or args.data_root
 
     n_fail = 0
     n_no_ts = 0
     n_fake_ts = 0
     fout = open(rank_file, "a", encoding="utf-8")
+    loader = DataLoader(
+        _FeatureBatchDataset(batches, processor, args, video_root, prompt),
+        batch_size=None,                 # the dataset already yields whole batches
+        shuffle=False,
+        num_workers=args.num_workers,
+        prefetch_factor=2 if args.num_workers > 0 else None,
+        collate_fn=_identity_collate,
+    )
     pbar = tqdm(total=len(shard), desc=f"[rank {rank}] captioning", disable=(rank != 0))
-    for start in range(0, len(shard), args.batch_size):
-        batch = shard[start : start + args.batch_size]
+    for prepared in loader:
         embeds_list, metas = [], []
 
-        for sample in batch:
+        for item in prepared:
+            sample = item["sample"]
+            if item["error"] is not None:
+                n_fail += 1
+                logger.warning("Skipping %s: %s", sample["video_id"], item["error"])
+                continue
             try:
-                feat, t, hw, kept = _load_feature(
-                    sample["feat_path"], args.tokens_per_frame, args.max_frames
-                )
-                if expected_dim is not None and feat.shape[-1] != expected_dim:
+                feat = item["feat"]
+                if feat.shape[-1] != expected_dim:
                     raise ValueError(
-                        f"feature dim {feat.shape[-1]} != model mm_hidden_size {expected_dim}; "
+                        f"feature dim {feat.shape[-1]} != projector input width {expected_dim}; "
                         f"features were extracted with a different vision encoder."
                     )
-                if hw != args.tokens_per_frame:
-                    raise ValueError(
-                        f"cached tokens/frame {hw} != --tokens_per_frame {args.tokens_per_frame}"
-                    )
-                timestamps, ts_synthetic = _build_timestamps(
-                    sample, t, args.timestamp_mode, video_root, args.duration_key, kept,
-                    args.fake_fps,
-                )
-                if timestamps is None:
+                if item["timestamps"] is None:
                     n_no_ts += 1
-                elif ts_synthetic:
+                elif item["ts_synthetic"]:
                     n_fake_ts += 1
-                input_ids = _build_prompt_ids(
-                    processor, t, hw, args.merge_size, timestamps, prompt
-                )
                 embeds_list.append(
-                    _embed_sample(model, input_ids, feat, image_token_id, device, dtype)
+                    _embed_sample(embed_tokens, projector, item["input_ids"], feat,
+                                  image_token_id, device, dtype)
                 )
-                metas.append((sample, t, timestamps, ts_synthetic))
+                metas.append((sample, item["t"], item["timestamps"], item["ts_synthetic"]))
             except Exception as exc:  # noqa: BLE001
                 n_fail += 1
                 logger.warning("Skipping %s: %s", sample["video_id"], exc)
 
         if not embeds_list:
-            pbar.update(len(batch))
+            pbar.update(len(prepared))
             continue
 
         inputs_embeds, attention_mask = _left_pad(embeds_list, pad_embed)
         with torch.no_grad():
-            # The model's own generate() rejects inputs_embeds; go straight to the
-            # vanilla Qwen2/HF generation loop.
-            output_ids = super(Videollama3Qwen2ForCausalLM, model).generate(
+            output_ids = generate_fn(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 **generation_kwargs,
             )
         captions = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        del inputs_embeds, attention_mask, embeds_list
 
         for (sample, t, timestamps, ts_synthetic), caption in zip(metas, captions):
             record = {
@@ -747,7 +1004,7 @@ def main():
             }
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
         fout.flush()
-        pbar.update(len(batch))
+        pbar.update(len(prepared))
 
     pbar.close()
     fout.close()
