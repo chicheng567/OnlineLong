@@ -312,8 +312,14 @@ class SamePadConv3d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out_dtype = x.dtype
+        # Run in the conv's OWN parameter dtype, not unconditionally in fp32: AE
+        # pretraining keeps these weights in fp32 under AMP autocast (so this stays the
+        # fp32 path the docstring describes), while compressor finetuning casts the
+        # whole compressor to bf16 -- feeding an fp32 input to bf16 weights raised
+        # "Input type (float) and bias type (c10::BFloat16) should be the same".
+        compute_dtype = self.conv.weight.dtype
         with torch.autocast(device_type=x.device.type, enabled=False):
-            x_padded = F.pad(x.float(), self.pad_input, mode=self.padding_type)
+            x_padded = F.pad(x.to(compute_dtype), self.pad_input, mode=self.padding_type)
             out = self.conv(x_padded)
         return out.to(out_dtype)
 
