@@ -35,11 +35,14 @@ encoder's output, so the vision encoder is replaced by an identity stand-in and 
 runs; everything downstream (compressor -> mm_projector -> LLM) is unchanged. The cache
 must have been extracted with the same geometry the compressor expects
 (``VIDEO_MERGE_SIZE=2 FORCE_IMAGE_SIZE=448`` -> HW=256 == compress_image_w x _h), and
-``--fps`` / ``--max_frames`` no longer apply (the cache is fixed at 1 FPS); use
-``--fixed_frames`` to bound T.
+``--fps`` no longer applies (the cache is fixed at 1 FPS). ``--max_frames`` /
+``--fixed_frames`` still bound T: they are applied to the cached frame axis, so a
+100-frame cache entry can be fed as 60 frames without re-extracting.
 
-``--fixed_frames N`` resamples every video to exactly N frames before the encoder
-(uniform subsample when longer, last frame repeated when shorter). It is optional for
+``--max_frames N`` caps T at N (uniform subsample when the cache/video is longer,
+shorter clips untouched); ``--fixed_frames N`` resamples every video to exactly N
+frames before the encoder (uniform subsample when longer, last frame repeated when
+shorter) and takes precedence over ``--max_frames``. ``fixed_frames`` is optional for
 ``transformer_decoder`` / ``local_attn_conv``, which take any T at runtime, and
 **required (a power of two) for ``siglip_ae``**: its ``log2(N)`` stride-2 Conv3d
 stages are built at construction time, and while the convs themselves accept any T,
@@ -285,7 +288,8 @@ class CachedFeatureDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, meta_path: str, vlprocessor, merge_size: int, tokens_per_frame: int,
-                 fixed_frames: int = 0, dtype: torch.dtype = torch.bfloat16):
+                 fixed_frames: int = 0, max_frames: Optional[int] = None,
+                 dtype: torch.dtype = torch.bfloat16):
         self.meta_path = meta_path
         self._warned_synthetic = False
         self.samples = json.loads(open(meta_path).read())
@@ -296,6 +300,7 @@ class CachedFeatureDataset(torch.utils.data.Dataset):
         self.merge_size = merge_size
         self.tokens_per_frame = tokens_per_frame
         self.fixed_frames = fixed_frames
+        self.max_frames = max_frames if max_frames and max_frames > 0 else None
         self.dtype = dtype
         side = int(round(tokens_per_frame ** 0.5))
         assert side * side == tokens_per_frame, f"HW={tokens_per_frame} is not a perfect square."
@@ -304,10 +309,24 @@ class CachedFeatureDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def _target_frames(self, num_frames: int) -> int:
+        """How many of the cached frames this sample is fed with.
+
+        `fixed_frames` pins T exactly (padding short clips), so it wins when set;
+        otherwise `max_frames` only caps long clips and leaves shorter ones alone.
+        Nothing here depends on the cache's own frame rate -- the cached frame axis is
+        subsampled just like decoded frames would be.
+        """
+        if self.fixed_frames > 0:
+            return self.fixed_frames
+        if self.max_frames is not None:
+            return min(num_frames, self.max_frames)
+        return num_frames
+
     @property
     def lengths(self):
         return [
-            (self.fixed_frames or int(s.get("num_frames") or 0)) * self.tokens_per_frame
+            self._target_frames(int(s.get("num_frames") or 0)) * self.tokens_per_frame
             + sum(len(c["value"].split()) for c in s.get("conversations", []))
             for s in self.samples
         ]
@@ -331,8 +350,9 @@ class CachedFeatureDataset(torch.utils.data.Dataset):
             assert len(timestamps) == feat.shape[0], (
                 f"Sample {i}: {len(timestamps)} timestamps for {feat.shape[0]} cached frames."
             )
-            if self.fixed_frames > 0:
-                idx = resample_indices(feat.shape[0], self.fixed_frames)
+            target = self._target_frames(feat.shape[0])
+            if target != feat.shape[0]:
+                idx = resample_indices(feat.shape[0], target)
                 feat = feat[torch.as_tensor(idx)]
                 timestamps = [float(timestamps[j]) for j in idx]
             num_frames = feat.shape[0]
@@ -458,7 +478,12 @@ class DataArguments:
     data_path: List[str] = field(default=None)
     data_folder: Optional[str] = field(default=None)
     fps: Optional[int] = field(default=None)
-    max_frames: Optional[int_with_none] = field(default=200)
+    max_frames: Optional[int_with_none] = field(
+        default=200,
+        metadata={"help": "Upper bound on frames per sample (uniform subsample when longer, "
+                          "shorter clips untouched). Applies to decoded video and to the cached "
+                          "frame axis under --feat_meta alike. Overridden by --fixed_frames."},
+    )
     multi_dataset: bool = field(default=False)
     image_merge_size: Optional[int] = field(default=1)
     video_merge_size: Optional[int] = field(default=1)
@@ -519,6 +544,7 @@ def make_global_compressor_data_module(
             merge_size=data_args.video_merge_size,
             tokens_per_frame=tokens_per_frame,
             fixed_frames=data_args.fixed_frames,
+            max_frames=data_args.max_frames,
             dtype=dtype,
         )
     elif data_args.multi_dataset:
@@ -807,7 +833,8 @@ def train(attn_implementation=None):
         f"[INFO] Whole-video compression: 1 window per sample -> "
         f"{model_args.compress_image_w * model_args.compress_image_h} tokens "
         f"(compressor_type={model_args.compressor_type}, "
-        f"input={'cached features' if data_args.feat_meta else 'video @ max_frames=' + str(data_args.max_frames)}, "
+        f"input={'cached features' if data_args.feat_meta else 'video'} @ "
+        f"max_frames={data_args.max_frames}, "
         f"fixed_frames={data_args.fixed_frames or 'off'})"
     )
 
