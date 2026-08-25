@@ -1493,7 +1493,16 @@ def train():
         data_collator=collator,
     )
 
-    trainer.train()
+    # Auto-resume: pick up the newest checkpoint-* already in output_dir
+    # (HF Trainer never reads args.resume_from_checkpoint on its own).
+    from transformers.trainer_utils import get_last_checkpoint
+
+    resume_ckpt = None
+    if os.path.isdir(training_args.output_dir):
+        resume_ckpt = get_last_checkpoint(training_args.output_dir)
+    if resume_ckpt is not None:
+        rank0_print(f"Resuming from checkpoint: {resume_ckpt}")
+    trainer.train(resume_from_checkpoint=resume_ckpt)
 
     # Save only compressor weights (decoder is a pretraining artifact).
     # Use the global process rank (not local_rank) so that on multi-node runs
