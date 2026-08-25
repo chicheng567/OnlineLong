@@ -25,21 +25,27 @@ its frame count.
   ``preprocess_videollama3`` splits into one block per user turn) is out of scope and
   is skipped.
 
-``--feat_meta`` switches the input from raw video to the **precomputed vision-encoder
-features** written by ``dataset_util/extract_vision_features.py``: it takes that run's
-``meta_with_vision_feat.json`` (each entry = the original annotation plus
-``vision_feat_path`` / ``frame_timestamps`` / ``num_frames``) and reads the cached
-``(T, HW, C)`` tensors instead of decoding video. Entries without
-``frame_timestamps`` get a fabricated 1-FPS grid (see ``fake_fps1_timestamps``). The cached tokens ARE the frozen
-encoder's output, so the vision encoder is replaced by an identity stand-in and never
-runs; everything downstream (compressor -> mm_projector -> LLM) is unchanged. The cache
-must have been extracted with the same geometry the compressor expects
-(``VIDEO_MERGE_SIZE=2 FORCE_IMAGE_SIZE=448`` -> HW=256 == compress_image_w x _h), and
-``--fps`` no longer applies (the cache is fixed at 1 FPS). ``--max_frames`` /
-``--fixed_frames`` still bound T: they are applied to the cached frame axis, so a
-100-frame cache entry can be fed as 60 frames without re-extracting.
+Cached vision features are chosen **per sample, from the annotation itself** -- there
+is no flag. A sample whose ``video`` field names a ``.pt`` file (or that carries a
+``vision_feat_path``, which ``dataset_util/extract_vision_features.py`` writes next to
+every entry) is read from that cache instead of being decoded: the saved
+``(T, HW, C)`` tensor IS the frozen encoder's output, so the encoder hands it back
+untouched (``enable_cached_feature_passthrough``) and everything downstream
+(compressor -> mm_projector -> LLM) is unchanged. Video and cached entries may share
+one annotation. The cache must have been extracted with the same geometry the
+compressor expects (``VIDEO_MERGE_SIZE=2 FORCE_IMAGE_SIZE=448`` -> HW=256 ==
+compress_image_w x _h). ``--fps`` has no effect on such a sample (the cache is written
+at a fixed 1 FPS), but ``--max_frames`` / ``--fixed_frames`` do: they subsample the
+cached frame axis, so a 100-frame cache entry can be trained on as 60 frames without
+re-extracting.
 
-``--max_frames N`` caps T at N (uniform subsample when the cache/video is longer,
+A cached sample's per-frame timestamps must be in its annotation
+(``frame_timestamps``, or ``timestamps``) -- ``extract_vision_features.py`` records
+them for exactly this reason, and a sample without them is an error rather than being
+given a fabricated grid, since 1-FPS sampling is capped and then uniformly subsampled
+above ``max_frames`` and no grid can be re-derived from the frame count alone.
+
+``--max_frames N`` caps T at N (uniform subsample when the video/cache is longer,
 shorter clips untouched); ``--fixed_frames N`` resamples every video to exactly N
 frames before the encoder (uniform subsample when longer, last frame repeated when
 shorter) and takes precedence over ``--max_frames``. ``fixed_frames`` is optional for
@@ -66,11 +72,9 @@ import sys
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
-import torch.nn as nn
 import transformers
 from packaging import version
 
-import torch.utils.data
 sys.path.append("./")
 
 from videollama3.constants import (  # noqa: E402
@@ -189,27 +193,39 @@ def build_range_ts_info(content: Dict, tokenizer) -> List[Tuple[int, List[int]]]
 
 
 # ---------------------------------------------------------------------------
-# Precomputed-feature path (--feat_meta)
+# Cached vision features (annotation entries whose video is a .pt file)
 # ---------------------------------------------------------------------------
 
-class CachedFeatureEncoder(nn.Module):
-    """Stands in for the SigLIP encoder when the features are already extracted.
+FEATURE_SUFFIX = ".pt"
 
-    ``forward`` returns the cached tokens untouched (they are exactly what the real
-    encoder would have produced, pre-mm_projector), while the attributes ``train()``
-    reads off the encoder are carried over from the real one so the rest of the setup
-    needs no branching.
+
+def enable_cached_feature_passthrough(vision_encoder) -> None:
+    """Let the frozen encoder hand back tokens it already produced.
+
+    Samples read from a ``.pt`` cache feed the encoder its own saved output instead of
+    pixel patches, so ``forward`` must return them untouched; anything else is encoded
+    normally, which is what keeps mixed video / cached annotations working. The two
+    are told apart by the feature dim -- pixel patches are ``3 * patch_size**2`` wide,
+    encoder output ``hidden_size`` -- checked for ambiguity once here rather than at
+    every call. Patching the bound method instead of wrapping the module leaves the
+    state-dict keys untouched, so checkpoints stay loadable by stock code.
     """
+    hidden_size = int(vision_encoder.hidden_size)
+    patch_dim = 3 * int(vision_encoder.image_processor.patch_size) ** 2
+    assert hidden_size != patch_dim, (
+        f"Cached features and pixel patches are both {hidden_size}-dim for this encoder, "
+        f"so they cannot be told apart."
+    )
+    encoder_forward = vision_encoder.forward
 
-    def __init__(self, encoder):
-        super().__init__()
-        self.hidden_size = encoder.hidden_size
-        self.image_size = encoder.image_size
-        self.num_patches_per_side = encoder.num_patches_per_side
-        self.image_processor = encoder.image_processor
+    def forward(pixel_values, grid_sizes=None, merge_sizes=None, **kwargs):
+        if pixel_values.shape[-1] == hidden_size:
+            return pixel_values
+        return encoder_forward(
+            pixel_values=pixel_values, grid_sizes=grid_sizes, merge_sizes=merge_sizes, **kwargs
+        )
 
-    def forward(self, pixel_values, grid_sizes=None, merge_sizes=None, **kwargs):
-        return pixel_values
+    vision_encoder.forward = forward
 
 
 def load_cached_feature(path: str, tokens_per_frame: int) -> torch.Tensor:
@@ -234,18 +250,28 @@ def load_cached_feature(path: str, tokens_per_frame: int) -> torch.Tensor:
     return obj
 
 
-def fake_fps1_timestamps(num_frames: int) -> List[float]:
-    """The timestamps extract_vision_features.py would have written at 1 FPS.
+def annotation_timestamps(sample: Dict, num_frames: int, path: str) -> List[float]:
+    """The per-frame seconds of a cached-feature sample, read from its annotation.
 
-    Same convention as ``recaption_from_features.fake_fps_meta``: frame i stands for
-    the clip [i, i+1), so its timestamp is that clip's midpoint i + 0.5. Used whenever
-    a meta entry carries no ``frame_timestamps``. It is a deliberate lie about wall
-    clock -- the extractor caps its output at max_frames, so a longer video's frames
-    are spread over its whole runtime rather than the num_frames seconds claimed here.
-    Fine while only frame order matters, wrong for second-referencing annotation
-    (temporal grounding, dense captioning).
+    ``extract_vision_features.py`` records the exact second of every row of the .pt as
+    ``frame_timestamps``; ``timestamps`` is accepted as an alias. Missing timestamps
+    are an error on purpose -- the cache is sampled at 1 FPS only up to max_frames and
+    uniformly subsampled above it, so a grid reconstructed from the frame count would
+    silently mislabel every long video.
     """
-    return [round(i + 0.5, 1) for i in range(num_frames)]
+    for key in ("frame_timestamps", "timestamps"):
+        stamps = sample.get(key)
+        if not stamps:
+            continue
+        assert len(stamps) == num_frames, (
+            f"{path}: annotation has {len(stamps)} '{key}' entries for {num_frames} cached frames."
+        )
+        return [float(t) for t in stamps]
+    raise ValueError(
+        f"{path}: cached-feature sample carries no 'frame_timestamps'. Train on the "
+        f"meta_with_vision_feat.json written by dataset_util/extract_vision_features.py, "
+        f"which records one timestamp per saved frame -- they cannot be re-derived here."
+    )
 
 
 def messages_from_conversations(conversations: List[Dict], num_frames: int, timestamps: List[float]) -> List[Dict]:
@@ -278,142 +304,123 @@ def messages_from_conversations(conversations: List[Dict], num_frames: int, time
     return messages
 
 
-class CachedFeatureDataset(torch.utils.data.Dataset):
-    """Samples from extract_vision_features.py's meta_with_vision_feat.json.
+class GlobalCompressorLazySupervisedDataset(LazySupervisedDataset):
+    """Dataset that marks each sample's whole video for a single compression pass.
 
-    Emits the same fields as the video-decoding dataset, except that `pixel_values`
-    carries the cached vision tokens -- which is exactly what the model hands to
-    `CachedFeatureEncoder`, so `DataCollatorWithCompressor` and the model forward are
-    reused unchanged.
+    The input is chosen per sample from the annotation itself: a sample whose video
+    field names a ``.pt`` file is read from that cache -- the frozen encoder's own
+    output, written by ``dataset_util/extract_vision_features.py``, which the encoder
+    then passes through untouched -- while anything else is decoded as usual. Both
+    kinds may sit in the same annotation; everything after the input (message
+    assembly, frame budget, compression part, range timestamp, length check) is
+    shared.
     """
 
-    def __init__(self, meta_path: str, vlprocessor, merge_size: int, tokens_per_frame: int,
-                 fixed_frames: int = 0, max_frames: Optional[int] = None,
-                 dtype: torch.dtype = torch.bfloat16):
-        self.meta_path = meta_path
-        self._warned_synthetic = False
-        self.samples = json.loads(open(meta_path).read())
-        assert isinstance(self.samples, list), (
-            f"{meta_path}: expected extract_vision_features.py's meta list, got {type(self.samples)}."
-        )
-        self.vlprocessor = vlprocessor
-        self.merge_size = merge_size
-        self.tokens_per_frame = tokens_per_frame
+    def __init__(self, *args, fixed_frames: int = 0, tokens_per_frame: int = 256,
+                 dtype: torch.dtype = torch.bfloat16, **kwargs):
+        super().__init__(*args, **kwargs)
         self.fixed_frames = fixed_frames
-        self.max_frames = max_frames if max_frames and max_frames > 0 else None
+        self.tokens_per_frame = tokens_per_frame
         self.dtype = dtype
         side = int(round(tokens_per_frame ** 0.5))
         assert side * side == tokens_per_frame, f"HW={tokens_per_frame} is not a perfect square."
         self.side = side
 
-    def __len__(self):
-        return len(self.samples)
+    def _feature_path(self, sample: Dict) -> Optional[str]:
+        """The .pt this sample is read from, or None to decode its video as usual.
+
+        ``vision_feat_path`` (written by extract_vision_features.py next to the entry
+        it came from) wins when present; otherwise the video field is resolved against
+        the dataset root exactly like a video file would be, and taken as a cache
+        entry when it ends in ``.pt``.
+        """
+        path = sample.get("vision_feat_path")
+        if path is None:
+            video = sample.get("video")
+            if isinstance(video, (list, tuple)):
+                video = video[0] if len(video) == 1 else None
+            if not isinstance(video, str) or not video.endswith(FEATURE_SUFFIX):
+                return None
+            root = self.dataset_root or self.data_args.data_folder or ""
+            path = os.path.join(root, video) if root else video
+        return str(path)
 
     def _target_frames(self, num_frames: int) -> int:
         """How many of the cached frames this sample is fed with.
 
         `fixed_frames` pins T exactly (padding short clips), so it wins when set;
-        otherwise `max_frames` only caps long clips and leaves shorter ones alone.
-        Nothing here depends on the cache's own frame rate -- the cached frame axis is
-        subsampled just like decoded frames would be.
+        otherwise `max_frames` only caps long clips and leaves shorter ones alone --
+        the same budget the decoder applies on the video path, applied to the cached
+        frame axis instead.
         """
         if self.fixed_frames > 0:
             return self.fixed_frames
-        if self.max_frames is not None:
-            return min(num_frames, self.max_frames)
+        max_frames = self.data_args.max_frames
+        if max_frames:
+            return min(num_frames, max_frames)
         return num_frames
 
-    @property
-    def lengths(self):
-        return [
-            self._target_frames(int(s.get("num_frames") or 0)) * self.tokens_per_frame
-            + sum(len(c["value"].split()) for c in s.get("conversations", []))
-            for s in self.samples
-        ]
+    def _convert_feature(self, sample: Dict, feat_path: str):
+        """The cached-feature twin of `_convert_normal`: same 4-tuple, no pixels."""
+        feat = load_cached_feature(feat_path, self.tokens_per_frame)
+        timestamps = annotation_timestamps(sample, feat.shape[0], feat_path)
+        target = self._target_frames(feat.shape[0])
+        if target != feat.shape[0]:
+            idx = resample_indices(feat.shape[0], target)
+            feat = feat[torch.as_tensor(idx)]
+            timestamps = [timestamps[j] for j in idx]
+        messages = messages_from_conversations(sample["conversations"], feat.shape[0], timestamps)
+        return "video", feat, messages, self.data_args.video_merge_size
 
-    # every sample is a video, so grouped sampling sees positive lengths only
-    modality_lengths = lengths
+    def _process_feature(self, feat: torch.Tensor, messages: List[Dict], merge_size: int) -> Dict:
+        """`self.vlprocessor(...)`'s text half; the cached tokens ARE the pixel_values.
 
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        try:
-            sample = self.samples[i]
-            feat = load_cached_feature(sample["vision_feat_path"], self.tokens_per_frame)
-            timestamps = sample.get("frame_timestamps") or None
-            if timestamps is None:
-                timestamps = fake_fps1_timestamps(feat.shape[0])
-                if not self._warned_synthetic:
-                    self._warned_synthetic = True
-                    logger.warning(
-                        "No frame_timestamps in %s (first hit: sample %s); falling back to a "
-                        "fabricated 1-FPS grid for every such entry.", self.meta_path, i,
-                    )
-            assert len(timestamps) == feat.shape[0], (
-                f"Sample {i}: {len(timestamps)} timestamps for {feat.shape[0]} cached frames."
-            )
-            target = self._target_frames(feat.shape[0])
-            if target != feat.shape[0]:
-                idx = resample_indices(feat.shape[0], target)
-                feat = feat[torch.as_tensor(idx)]
-                timestamps = [float(timestamps[j]) for j in idx]
-            num_frames = feat.shape[0]
-
-            messages = messages_from_conversations(sample["conversations"], num_frames, timestamps)
-            content = get_video_content(messages)
-            # process_text() only ever reads grid_sizes/merge_sizes, never pixels, so the
-            # cached features skip the image processor entirely.
-            grid_sizes = torch.tensor([[num_frames, self.side * self.merge_size, self.side * self.merge_size]])
-            merge_sizes = torch.tensor([self.merge_size])
-            data_dict = self.vlprocessor.process_text(
-                messages,
-                {"grid_sizes": grid_sizes, "merge_sizes": merge_sizes},
-                return_labels=True,
-                return_tensors="pt",
-            )
-
-            total_vision_tokens = num_frames * self.tokens_per_frame
-            data_dict["pixel_values"] = feat.reshape(total_vision_tokens, -1).to(self.dtype)
-            data_dict["grid_sizes"] = grid_sizes
-            data_dict["merge_sizes"] = merge_sizes
-            data_dict["modals"] = ["video"]
-            data_dict["compression_parts"] = [[0, total_vision_tokens]]
-            data_dict["compression_ts_info"] = build_range_ts_info(content, self.vlprocessor.tokenizer)
-        except Exception:
-            backup_idx = random.randint(0, len(self.samples) - 1)
-            logger.exception("Failed to process sample %s. Fallback index: %s.", i, backup_idx)
-            return self.__getitem__(backup_idx)
+        process_text() only ever reads grid_sizes/merge_sizes, never pixels, so the
+        cached features skip the image processor entirely.
+        """
+        num_frames = int(feat.shape[0])
+        grid_sizes = torch.tensor([[num_frames, self.side * merge_size, self.side * merge_size]])
+        merge_sizes = torch.tensor([merge_size])
+        data_dict = self.vlprocessor.process_text(
+            messages,
+            {"grid_sizes": grid_sizes, "merge_sizes": merge_sizes},
+            return_labels=self.return_label,
+            return_tensors="pt",
+        )
+        data_dict["pixel_values"] = feat.reshape(num_frames * self.tokens_per_frame, -1).to(self.dtype)
+        data_dict["grid_sizes"] = grid_sizes
+        data_dict["merge_sizes"] = merge_sizes
+        data_dict["modals"] = ["video"]
         return data_dict
-
-
-class GlobalCompressorLazySupervisedDataset(LazySupervisedDataset):
-    """Dataset that marks each sample's whole video for a single compression pass."""
-
-    def __init__(self, *args, fixed_frames: int = 0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.fixed_frames = fixed_frames
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         try:
             sample = self.list_data_dict[i]
-            if self.online_mode:
-                modal, images, messages, merge_size = self._convert_online_video(sample)
+            feat_path = self._feature_path(sample)
+            if feat_path is not None:
+                modal, feat, messages, merge_size = self._convert_feature(sample, feat_path)
+                content = get_video_content(messages)
+                data_dict = self._process_feature(feat, messages, merge_size)
             else:
-                modal, images, messages, merge_size = self._convert_normal(sample)
-            assert modal == "video", "Compressor training currently only supports video data."
+                if self.online_mode:
+                    modal, images, messages, merge_size = self._convert_online_video(sample)
+                else:
+                    modal, images, messages, merge_size = self._convert_normal(sample)
+                assert modal == "video", "Compressor training currently only supports video data."
+                content = get_video_content(messages)
+                if self.fixed_frames > 0:
+                    images = resample_video_frames(images, content, self.fixed_frames)
+                data_dict = self.vlprocessor(
+                    images=images,
+                    text=messages,
+                    merge_size=merge_size,
+                    return_labels=self.return_label,
+                    return_tensors="pt",
+                )
+                data_dict["modals"] = [modal] * len(images)
 
-            content = get_video_content(messages)
-            if self.fixed_frames > 0:
-                images = resample_video_frames(images, content, self.fixed_frames)
             total_frames = int(content["num_frames"])
             assert total_frames > 0, f"Sample {i} has no frames."
-
-            data_dict = self.vlprocessor(
-                images=images,
-                text=messages,
-                merge_size=merge_size,
-                return_labels=self.return_label,
-                return_tensors="pt",
-            )
-            data_dict["modals"] = [modal] * len(images)
 
             # The sequence still carries the UNCOMPRESSED T x HW image tokens here
             # (compression happens inside the model), so it has to survive the
@@ -481,8 +488,8 @@ class DataArguments:
     max_frames: Optional[int_with_none] = field(
         default=200,
         metadata={"help": "Upper bound on frames per sample (uniform subsample when longer, "
-                          "shorter clips untouched). Applies to decoded video and to the cached "
-                          "frame axis under --feat_meta alike. Overridden by --fixed_frames."},
+                          "shorter clips untouched). Applies to decoded video and to a cached "
+                          ".pt's frame axis alike. Overridden by --fixed_frames."},
     )
     multi_dataset: bool = field(default=False)
     image_merge_size: Optional[int] = field(default=1)
@@ -492,11 +499,6 @@ class DataArguments:
     use_batch_flattening: bool = field(default=True)
     dataset_cache_dir: Optional[str] = field(default=None)
     force_image_size: Optional[int] = field(default=None)
-    feat_meta: Optional[str] = field(
-        default=None,
-        metadata={"help": "extract_vision_features.py's meta_with_vision_feat.json. When set, the cached "
-                          "vision-encoder features are used instead of decoding video."},
-    )
     fixed_frames: int = field(
         default=0,
         metadata={"help": "Resample every video to exactly this many frames (0 = keep as decoded). "
@@ -537,17 +539,7 @@ def make_global_compressor_data_module(
     tokens_per_frame: int = 256,
     dtype: torch.dtype = torch.bfloat16,
 ) -> Dict:
-    if data_args.feat_meta:
-        train_dataset = CachedFeatureDataset(
-            meta_path=data_args.feat_meta,
-            vlprocessor=vlprocessor,
-            merge_size=data_args.video_merge_size,
-            tokens_per_frame=tokens_per_frame,
-            fixed_frames=data_args.fixed_frames,
-            max_frames=data_args.max_frames,
-            dtype=dtype,
-        )
-    elif data_args.multi_dataset:
+    if data_args.multi_dataset:
         rank0_print("Use meta file to control datasets loading. Data path will use as meta path")
         ds_collection = json.loads(open(data_args.data_path[0]).read())
         collected_datasets = [
@@ -560,6 +552,8 @@ def make_global_compressor_data_module(
                 online_mode=dataset_cfg["online_mode"],
                 prefix_captioning=dataset_cfg.get("prefix_captioning", False),
                 fixed_frames=data_args.fixed_frames,
+                tokens_per_frame=tokens_per_frame,
+                dtype=dtype,
             )
             for dataset_name, dataset_cfg in ds_collection.items()
         ]
@@ -570,6 +564,8 @@ def make_global_compressor_data_module(
             data_path=data_args.data_path,
             data_args=data_args,
             fixed_frames=data_args.fixed_frames,
+            tokens_per_frame=tokens_per_frame,
+            dtype=dtype,
         )
 
     if data_args.validation_split_rate > 0:
@@ -581,7 +577,7 @@ def make_global_compressor_data_module(
         original_dataset = train_dataset
         eval_dataset = SubsetWithLengths(train_dataset, val_indices)
         train_dataset = SubsetWithLengths(train_dataset, indices[:n_total - n_val])
-        if output_dir is not None and local_rank in (0, -1) and not data_args.feat_meta:
+        if output_dir is not None and local_rank in (0, -1):
             val_paths = _collect_val_video_paths(original_dataset, val_indices)
             os.makedirs(output_dir, exist_ok=True)
             out_path = os.path.join(output_dir, "val_video_paths.txt")
@@ -708,14 +704,10 @@ def train(attn_implementation=None):
 
     model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
     vision_encoder = model.get_vision_encoder()
-    if data_args.feat_meta:
-        # Features are precomputed: swap in a stand-in that returns them unchanged, so
-        # the SigLIP weights never run and never reach the GPU.
-        model.get_model().vision_encoder = CachedFeatureEncoder(vision_encoder)
-        vision_encoder = model.get_vision_encoder()
-        rank0_print(f"[INFO] Reading cached vision features from {data_args.feat_meta} (vision encoder disabled)")
-    else:
-        vision_encoder.to(dtype=compute_dtype, device=training_args.device)
+    vision_encoder.to(dtype=compute_dtype, device=training_args.device)
+    # Samples read from a .pt cache hand the encoder its own saved output; it returns
+    # those untouched and encodes real pixels as usual (see the dataset's _feature_path).
+    enable_cached_feature_passthrough(vision_encoder)
 
     mm_projector = model.get_mm_projector()
     mm_projector.to(dtype=compute_dtype if training_args.bf16 else torch.float16, device=training_args.device)
@@ -833,7 +825,6 @@ def train(attn_implementation=None):
         f"[INFO] Whole-video compression: 1 window per sample -> "
         f"{model_args.compress_image_w * model_args.compress_image_h} tokens "
         f"(compressor_type={model_args.compressor_type}, "
-        f"input={'cached features' if data_args.feat_meta else 'video'} @ "
         f"max_frames={data_args.max_frames}, "
         f"fixed_frames={data_args.fixed_frames or 'off'})"
     )
