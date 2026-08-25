@@ -1,17 +1,36 @@
 #!/usr/bin/env python3
 """
-Re-annotate a video dataset with detailed captions, starting from *pre-extracted*
-vision features instead of raw video.
+Re-annotate a video dataset with detailed captions from the frozen, pretrained
+VideoLLaMA3.
 
-Input  : the .pt feature files written by dataset_util/extract_vision_features.py
-         -- shape (T, HW, hidden_size) or (T*HW, hidden_size), i.e. exactly the
-         frozen vision-encoder output *before* the mm_projector.
-Output : one detailed caption per video, as JSONL (streamed, resume-safe) plus a
-         merged conversation-format JSON that can be dropped straight into
-         anno_online/ and referenced from an anno_data/*.json registry.
+Output is always text: one caption per video as JSONL (streamed, resume-safe),
+plus a merged conversation-format JSON that drops straight into anno_online/ and,
+with --meta_out, an anno_data/*.json registry over it.
 
-Why this works without touching pixels
---------------------------------------
+This file absorbed the former `precompute_teacher_gt.py`: both scripts ran the
+same frozen model over the same datasets and differed only in where the pixels
+came from, so they are now one batched pipeline whose input side is decided per
+sample. (Its logit-cache half is gone -- this is a captioning tool.)
+
+Input, decided per sample (annotation-driven, not a global flag)
+---------------------------------------------------------------
+  cached features  a .pt written by dataset_util/extract_vision_features.py --
+                   located via the entry's `vision_feat_path`, a `video` field
+                   that already names a .pt, or {--feat_dir}/{video_stem}.pt.
+                   Shape (T, HW, hidden) or (T*HW, hidden): exactly the frozen
+                   vision-encoder output *before* the mm_projector. No decode.
+  raw video        needs --decode_video. Frames are decoded and pushed through
+                   the frozen vision encoder here, at the extractor's exact
+                   settings (1 FPS sampling, --force_image_size, --merge_size),
+                   so a decoded run and an extract-then-caption run see the same
+                   features. Costs a vision-encoder load and ~90% of the wall
+                   time; pre-extracting wins as soon as a dataset is captioned
+                   more than once.
+  images           needs --decode_video, for `image` entries. Same encoder path,
+                   every image treated as one frame, no timestamps.
+
+Why the cached path works without touching pixels
+-------------------------------------------------
 Videollama3MetaForCausalLM.encode_images() is just
 
     vision_encoder(pixels) -> [optional compressor] -> mm_projector
@@ -20,9 +39,7 @@ and prepare_inputs_labels_for_multimodal() then scatters those projected
 features into the text embedding sequence at every <image> token. Since the
 cached .pt files already hold the vision_encoder output, this script replays
 only the second half of that pipeline (mm_projector + scatter) and calls the
-plain Qwen2 generate() on the resulting inputs_embeds. The vision encoder is
-never run: --llm_impl stock never constructs one, and --llm_impl vendored drops
-it from memory right after load.
+plain Qwen2 generate() on the resulting inputs_embeds.
 
 NOTE: the multimodal `generate()` refuses `inputs_embeds`. By default
 (--llm_impl stock) the LLM is loaded as a plain `transformers.Qwen2ForCausalLM`
@@ -32,7 +49,28 @@ the same loop via `super(Videollama3Qwen2ForCausalLM, model).generate(...)`.
 The two backends were verified bitwise identical (teacher-forced, cache off, on
 real features: max|dlogit| == 0 across every caption position); stock is kept as
 the default only because it decodes ~1.35x faster at batch 1 and ~2.25x faster
-at batch 4.
+at batch 4. With --decode_video, 'stock' loads the vision encoder separately
+(one extra checkpoint read, freed immediately) while 'vendored' reuses the one
+already inside the multimodal model.
+
+Prompts
+-------
+With NO --prompt and NO --prompt_file, every sample draws its own prompt from a
+pool (--prompt_pool, default: baseline_default, scene_shift, motion_scene,
+state_change, timed_segments -- see dataset_util/prompts/README.md). The draw is
+per SAMPLE, not per run, so one pass over a dataset produces a mix of caption
+styles rather than one voice repeated N times, and the JSONL / --annotation_out
+entries record which style each caption is in as `prompt_name`.
+
+The draw is a hash of the video id and --seed rather than a running RNG, so a
+video keeps its prompt across a resume, a different --num_workers, and a
+different GPU count; --seed reshuffles the whole dataset.
+
+--prompt or --prompt_file pins one prompt for every sample instead.
+--prompt_source annotation overrides both and takes each sample's own user turn
+(assistant/system turns are always dropped, so the model never sees the GT it is
+re-annotating), falling back to that sample's pool draw when an entry has none --
+the behaviour the old precompute_teacher_gt.py had.
 
 Throughput
 ----------
@@ -48,10 +86,10 @@ Timestamps
 ----------
 Feature files carry no time information, but the chat template wants a
 "Time X.0s:" prefix per frame. --timestamp_mode controls where those come from:
-  auto     (default) meta 'frame_timestamps' -> duration field -> video
-           metadata -> fabricated --fake_fps grid
-  meta     ONLY the 'frame_timestamps' extract_vision_features.py recorded
-           (fails loudly-ish rather than falling back to a guessed grid)
+  auto     (default) frames decoded here -> meta 'frame_timestamps' -> duration
+           field -> video metadata -> fabricated --fake_fps grid
+  meta     ONLY the 'frame_timestamps' extract_vision_features.py recorded (or,
+           for --decode_video samples, the times of the frames just decoded)
   video    read fps/frame-count via decord from --video_root/<video> (metadata
            only, no decoding) and replay the 'uniform' sampling grid
   duration use meta's --duration_key and spread T frames evenly over it
@@ -78,11 +116,23 @@ timestamps at all when no real source is available.
 
 Usage
 -----
-Single GPU:
+Caption from a feature cache, one prompt drawn per sample (single GPU):
     /miniconda/envs/video/bin/python dataset_util/recaption_from_features.py \
         --feat_dir vision_feat_cache \
         --output_file recaption/detail_captions.jsonl \
         --annotation_out anno_online/detail_caption_recap.json
+
+The same, pinned to one style:
+    ... --prompt_file dataset_util/prompts/scene_shift.txt
+
+Re-annotate an anno_data registry in place of its own captions, decoding the
+videos that have no feature cache (this is the old precompute_teacher_gt.py
+invocation):
+    torchrun --nproc_per_node=4 dataset_util/recaption_from_features.py \
+        --model_path pretrained_models/videollama3_7b_local \
+        --meta_path anno_data/finetune_online.json --decode_video \
+        --output_file recaption/online.jsonl \
+        --meta_out recaption/meta_recaption.json
 
 Multi-GPU (the work list is sorted, then sharded rank::world_size, which hands
 every rank a near-identical length distribution):
@@ -92,6 +142,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import inspect
 import json
 import logging
@@ -111,10 +162,12 @@ from transformers import Qwen2Config, Qwen2ForCausalLM
 
 sys.path.append("./")
 
-from videollama3.constants import DEFAULT_IMAGE_TOKEN
+from videollama3.constants import DEFAULT_IMAGE_TOKEN, DEFAULT_VIDEO_TOKEN
+from videollama3.mm_utils import get_frame_indices, load_images, read_frames_decord
 from videollama3.model import Videollama3Qwen2ForCausalLM
 from videollama3.model.processor import DEFAULT_CHAT_TEMPLATE, Videollama3Processor
 from videollama3.model.projector import build_vision_projector
+from videollama3.model.videollama3_encoder import Videollama3ImageProcessor
 
 
 logger = logging.getLogger(__name__)
@@ -126,7 +179,76 @@ DEFAULT_PROMPT = (
     "Write one coherent, factual paragraph and do not speculate about what is not shown."
 )
 
-_INTERNAL_KEYS = ("_data_root", "vision_feat_path")
+# Keys this script adds to a meta entry for its own bookkeeping; stripped again
+# before an entry is written to --annotation_out.
+_INTERNAL_KEYS = ("_data_root", "_dataset", "_prompt", "_prompt_name", "_source",
+                  "vision_feat_path")
+
+_PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
+
+# The prompt pool. With neither --prompt nor --prompt_file given, every sample
+# draws one of these, so a dataset captioned in a single run carries several
+# caption styles instead of one voice repeated N times. Members are the four
+# measured dynamics/scene prompts plus the plain baseline -- see
+# dataset_util/prompts/README.md for what each one does and the numbers behind
+# the selection. Override the membership with --prompt_pool.
+DEFAULT_PROMPT_POOL = (
+    "baseline_default",
+    "scene_shift",
+    "motion_scene",
+    "state_change",
+    "timed_segments",
+)
+
+# Same extensions / recursive convention as extract_vision_features.py.
+_VIDEO_EXTS = (".mp4", ".avi", ".mkv", ".mov", ".webm", ".m4v", ".flv")
+
+
+# ---------------------------------------------------------------------------
+# Prompt pool
+# ---------------------------------------------------------------------------
+
+def _load_prompt_pool(names: List[str]) -> List[Tuple[str, str]]:
+    """[(name, text), ...] for each pool member.
+
+    A bare name resolves against dataset_util/prompts/<name>.txt (next to this
+    file, so it works from any cwd); anything with a suffix or a separator is
+    read as a path.
+    """
+    pool: List[Tuple[str, str]] = []
+    for name in names:
+        name = name.strip()
+        if not name:
+            continue
+        path = Path(name)
+        if not path.suffix and os.sep not in name:
+            path = _PROMPT_DIR / f"{name}.txt"
+        try:
+            text = path.read_text().strip()
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("Prompt %s is unreadable (%s); dropped from the pool.", path, exc)
+            continue
+        if text:
+            pool.append((path.stem, text))
+    if not pool:
+        # Never caption with nothing: a missing prompts/ directory degrades to the
+        # built-in baseline rather than killing the run.
+        logger.warning("No prompt in the pool could be read; falling back to the built-in prompt.")
+        pool = [("builtin_default", DEFAULT_PROMPT)]
+    return pool
+
+
+def _pick_prompt(pool: List[Tuple[str, str]], video_id: str, seed: int) -> Tuple[str, str]:
+    """This sample's prompt, drawn per sample rather than per run.
+
+    Keyed on a hash of the video id instead of a running RNG so the assignment is
+    a property of the sample, not of the order it was reached in: a resume, a
+    different --num_workers, a different GPU count and the longest-first sort all
+    leave every video on the prompt it had before. Change --seed to reshuffle the
+    whole dataset.
+    """
+    digest = hashlib.blake2b(f"{seed}:{video_id}".encode(), digest_size=8).digest()
+    return pool[int.from_bytes(digest, "big") % len(pool)]
 
 
 # ---------------------------------------------------------------------------
@@ -169,58 +291,210 @@ def _feat_path_for(stem: str, feat_dir: Optional[Path]) -> Optional[Path]:
     return p if p.exists() else None
 
 
+def _entry_media(entry: Dict) -> Tuple[Optional[str], List[str]]:
+    """(video field, image files) of a meta entry, both normalised to str."""
+    video = entry.get("video")
+    if isinstance(video, (list, tuple)):
+        video = video[0] if video else None
+    images = entry.get("image")
+    if images is None:
+        images = []
+    elif not isinstance(images, (list, tuple)):
+        images = [images]
+    return (str(video) if video is not None else None), [str(i) for i in images]
+
+
+def _resolve_path(entry: Dict, rel: str, data_root: Optional[str]) -> str:
+    if os.path.isabs(rel):
+        return rel
+    root = entry.get("_data_root") or data_root or ""
+    return os.path.join(root, rel) if root else rel
+
+
+def _sample_prompt(entry: Dict, default_prompt: str, prompt_source: str) -> str:
+    """The user turn this sample is captioned with.
+
+    --prompt_source annotation reads the entry's own user text and drops every
+    assistant/gpt/system turn, so the model never sees the GT it is supposed
+    to be replacing; entries without usable user text fall back to --prompt.
+    """
+    if prompt_source != "annotation":
+        return default_prompt
+    texts: List[str] = []
+    for turn in entry.get("conversations") or []:
+        role = turn.get("role") or turn.get("from", "")
+        if role not in ("human", "user"):
+            continue
+        text = str(turn.get("value", turn.get("content", "")))
+        text = text.replace(DEFAULT_VIDEO_TOKEN, "").replace(DEFAULT_IMAGE_TOKEN, "").strip()
+        if text:
+            texts.append(text)
+    return "\n".join(texts) if texts else default_prompt
+
+
+def _scan_unannotated(
+    entries: List[Dict], registry: Dict, data_root: Optional[str]
+) -> List[Dict]:
+    """Synthetic entries for videos on disk that the annotation never mentions
+    (precompute_teacher_gt.py's --annotate_unannotated). They carry no
+    conversations, so they always caption with --prompt.
+    """
+    known = set()
+    for entry in entries:
+        video, images = _entry_media(entry)
+        for media in ([video] if video else []) + images:
+            known.add(Path(media).stem)
+
+    roots: List[Tuple[str, Optional[str]]] = []
+    if registry:
+        for ds_name, ds_cfg in registry.items():
+            root = ds_cfg.get("data_root") or data_root
+            if root:
+                roots.append((root, ds_name))
+    elif data_root:
+        roots.append((data_root, None))
+
+    extra: List[Dict] = []
+    for root, ds_name in roots:
+        if not os.path.isdir(root):
+            logger.warning("--annotate_unannotated: %s is not a directory.", root)
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()  # deterministic walk: the shard split depends on the order
+            for filename in sorted(filenames):
+                if os.path.splitext(filename)[1].lower() not in _VIDEO_EXTS:
+                    continue
+                stem = Path(filename).stem
+                if stem in known:
+                    continue
+                known.add(stem)
+                entry = {
+                    "video": os.path.relpath(os.path.join(dirpath, filename), root),
+                    "_data_root": root,
+                    "_unannotated": True,
+                }
+                if ds_name:
+                    entry["_dataset"] = ds_name
+                extra.append(entry)
+    if extra:
+        logger.info(
+            "--annotate_unannotated: %d video(s) on disk are not referenced by the "
+            "annotation; captioning them too.", len(extra),
+        )
+    return extra
+
+
 def _load_samples(
     meta_path: Optional[str],
     feat_dir: Optional[Path],
     data_root: Optional[str],
-) -> List[Dict]:
-    """Build the work list. Every item is
-    {"video": <relative path or stem>, "feat_path": str, "video_id": stem, "raw": {...}}."""
+    decode_video: bool = False,
+    annotate_unannotated: bool = False,
+    prompt: str = "",
+    prompt_source: str = "fixed",
+    prompt_pool: Optional[List[Tuple[str, str]]] = None,
+    seed: int = 0,
+) -> Tuple[List[Dict], Dict]:
+    """Build the work list, plus the anno_data registry it came from (empty when
+    --meta_path was a plain list) so --meta_out can be written in that shape.
+
+    Every item is {"video": <relative path or stem>, "feat_path": str | None,
+    "video_id": stem, "source": "feat"|"video"|"image", "prompt": str,
+    "images": [...], "raw": {...}}.
+    """
     samples: List[Dict] = []
+    registry: Dict = {}
 
     if meta_path is None:
         assert feat_dir is not None, "Need --meta_path or --feat_dir."
-        for p in sorted(feat_dir.glob("*.pt")):
-            samples.append(
-                {"video": p.stem, "feat_path": str(p), "video_id": p.stem, "raw": {"video": p.stem}}
-            )
-        return samples
+        entries = [
+            {"video": p.stem, "vision_feat_path": str(p)} for p in sorted(feat_dir.glob("*.pt"))
+        ]
+    else:
+        with open(meta_path) as f:
+            raw = json.load(f)
+        # dict-of-datasets registry (anno_data/*.json) -> flatten the annotations,
+        # tagging each entry with the dataset it came from.
+        if isinstance(raw, dict):
+            registry = raw
+            entries = []
+            for ds_name, ds_cfg in raw.items():
+                with open(ds_cfg["annotation"]) as fa:
+                    ann = json.load(fa)
+                for entry in ann:
+                    entry = dict(entry)
+                    entry.setdefault("_data_root", ds_cfg.get("data_root", data_root or ""))
+                    entry["_dataset"] = ds_name
+                    entries.append(entry)
+        else:
+            entries = [dict(e) for e in raw]
 
-    with open(meta_path) as f:
-        raw = json.load(f)
-
-    # dict-of-datasets registry (anno_data/*.json) -> flatten the annotations
-    if isinstance(raw, dict):
-        entries: List[Dict] = []
-        for _, ds_cfg in raw.items():
-            with open(ds_cfg["annotation"]) as fa:
-                ann = json.load(fa)
-            for entry in ann:
-                entry = dict(entry)
-                entry.setdefault("_data_root", ds_cfg.get("data_root", data_root or ""))
-                entries.append(entry)
-        raw = entries
+    if annotate_unannotated:
+        entries = entries + _scan_unannotated(entries, registry, data_root)
 
     seen = set()
-    for entry in raw:
-        video_field = entry.get("video")
-        if isinstance(video_field, (list, tuple)):
-            video_field = video_field[0]
-        if video_field is None:
+    n_no_input = 0
+    for entry in entries:
+        video_field, image_files = _entry_media(entry)
+        if video_field is None and not image_files:
             continue
-        stem = Path(str(video_field)).stem
+        key = video_field if video_field is not None else image_files[0]
+        stem = Path(key).stem
         if stem in seen:  # one caption per video, even if the meta has many turns
             continue
         seen.add(stem)
 
-        feat = entry.get("vision_feat_path") or _feat_path_for(stem, feat_dir)
-        if feat is None or not Path(feat).exists():
-            logger.warning("No feature file for %s -- skipped.", video_field)
+        feat = entry.get("vision_feat_path")
+        if feat is None and video_field is not None and video_field.endswith(".pt"):
+            # A `video` field naming a .pt IS the cache (same convention as
+            # compressor_pretrain_with_videollama3.py).
+            feat = _resolve_path(entry, video_field, data_root)
+        if feat is None:
+            cached = _feat_path_for(stem, feat_dir)
+            feat = str(cached) if cached is not None else None
+
+        if feat is not None and Path(feat).exists():
+            source = "feat"
+        elif not decode_video:
+            n_no_input += 1
+            logger.warning(
+                "No feature file for %s -- skipped (pass --decode_video to decode and "
+                "encode it in this run).", key,
+            )
             continue
-        samples.append(
-            {"video": str(video_field), "feat_path": str(feat), "video_id": stem, "raw": entry}
-        )
-    return samples
+        elif image_files:
+            source, feat = "image", None
+        else:
+            path = _resolve_path(entry, video_field, data_root)
+            if not os.path.exists(path):
+                n_no_input += 1
+                logger.warning("Neither a cached feature nor a readable video for %s -- skipped.", key)
+                continue
+            source, feat = "video", None
+
+        if prompt_pool is not None:
+            prompt_name, sample_default = _pick_prompt(prompt_pool, stem, seed)
+        else:
+            prompt_name, sample_default = "fixed", prompt
+        entry["_prompt"] = _sample_prompt(entry, sample_default, prompt_source)
+        # An annotation-sourced turn is not one of the pool's styles, so do not
+        # label it with the prompt that merely stood by as the fallback.
+        entry["_prompt_name"] = prompt_name if entry["_prompt"] == sample_default else "annotation"
+        entry["_source"] = source
+        samples.append({
+            "video": key,
+            "feat_path": feat,
+            "video_id": stem,
+            "source": source,
+            "prompt": entry["_prompt"],
+            "prompt_name": entry["_prompt_name"],
+            "images": image_files,
+            "raw": entry,
+        })
+
+    if n_no_input:
+        logger.warning("%d sample(s) had no usable input and were dropped.", n_no_input)
+    return samples, registry
 
 
 def _load_done_ids(output_file: Path) -> set:
@@ -332,10 +606,16 @@ def _build_timestamps(
     duration_key: str,
     kept_indices: Optional[List[int]] = None,
     fake_fps: float = 0.0,
+    decoded_ts: Optional[List[float]] = None,
 ) -> Tuple[Optional[List[float]], bool]:
     """Returns (timestamps, is_synthetic)."""
     if mode == "none":
         return None, False
+
+    # --decode_video read these frames a moment ago, so their times are exact --
+    # better even than a cached meta, which can go stale against its .pt.
+    if decoded_ts is not None and len(decoded_ts) == num_frames and mode != "fake":
+        return [float(x) for x in decoded_ts], False
 
     # 'fake' skips every real source on purpose: it exists to force a chosen
     # frame rate onto features whose true timing is known but unwanted.
@@ -430,6 +710,35 @@ def _load_feature(
     return obj, t, hw, kept
 
 
+def _decode_media(
+    sample: Dict, source: str, data_root: Optional[str], max_frames: int
+) -> Tuple[List, Optional[List[float]]]:
+    """Decode a --decode_video sample into frames (+ their exact times).
+
+    Video sampling is `sample="fps1"` capped at `max_frames`, i.e. byte-for-byte
+    the grid dataset_util/extract_vision_features.py caches, so decoding here and
+    captioning from a cache see the same frames.
+    """
+    raw = sample["raw"]
+    if source == "image":
+        paths = [_resolve_path(raw, f, data_root) for f in (sample.get("images") or [])]
+        if not paths:
+            raise ValueError("image sample with no image files")
+        return load_images(paths), None
+
+    path = _resolve_path(raw, str(sample["video"]), data_root)
+    frames, timestamps = read_frames_decord(
+        path,
+        num_frames=max_frames,
+        sample="fps1",
+        max_num_frames=max_frames,
+        return_timestamps=True,
+    )
+    if not frames:
+        raise ValueError(f"decoded 0 frames from {path}")
+    return frames, [float(x) for x in timestamps]
+
+
 # ---------------------------------------------------------------------------
 # Prompt / embedding assembly
 # ---------------------------------------------------------------------------
@@ -441,6 +750,7 @@ def _build_prompt_ids(
     merge_size: int,
     timestamps: Optional[List[float]],
     prompt: str,
+    modal: str = "video",
 ) -> torch.Tensor:
     side = int(round(math.sqrt(tokens_per_frame)))
     if side * side != tokens_per_frame:
@@ -450,9 +760,13 @@ def _build_prompt_ids(
     # documented record of how the features were extracted.
     del merge_size
 
-    content: List[Dict] = [{"type": "video", "num_frames": num_frames}]
-    if timestamps is not None:
-        content[0]["timestamps"] = [float(t) for t in timestamps]
+    if modal == "image":
+        # Image samples carry no time axis; the template emits one <image> per block.
+        content: List[Dict] = [{"type": "image"} for _ in range(num_frames)]
+    else:
+        content = [{"type": "video", "num_frames": num_frames}]
+        if timestamps is not None:
+            content[0]["timestamps"] = [float(t) for t in timestamps]
     content.append({"type": "text", "text": prompt})
     conversation = [{"role": "user", "content": content}]
 
@@ -528,29 +842,93 @@ def _left_pad(
 _TEXT_TOKENS_PER_FRAME = 20
 _TEXT_TOKENS_FIXED = 256
 
+# --decode_video only: patches per vision-encoder forward. A caption batch can hold
+# far more frames than extract_vision_features.py ever puts in one encoder call, so
+# the encode is chunked independently of --max_batch_tokens. 448px frames patchify
+# to 1024 patches each, i.e. ~256 frames per forward.
+_ENCODE_MAX_PATCHES = 1 << 18
 
-def _probe_num_frames(sample: Dict, tokens_per_frame: int, max_frames: int) -> int:
-    """Frames this sample will contribute, without reading the feature payload.
 
-    Prefers the extractor's `num_frames`; otherwise reads only the .pt header
-    (~1 ms) via a meta-device load.
+def _probe_video_frames(path: str, cap: int) -> int:
+    """Frames a `sample="fps1"` decode would yield, from the container header only."""
+    from decord import VideoReader
+
+    vr = VideoReader(path, num_threads=1)
+    vlen, fps = len(vr), float(vr.get_avg_fps())
+    if vlen <= 0 or fps <= 0:
+        raise ValueError(f"unusable video metadata (vlen={vlen}, fps={fps})")
+    return len(get_frame_indices(cap, vlen, sample="fps1", input_fps=fps, max_num_frames=cap))
+
+
+def _probe_num_frames(
+    sample: Dict,
+    tokens_per_frame: int,
+    max_frames: int,
+    decode_max_frames: int = 0,
+    duration_key: str = "duration",
+) -> int:
+    """Frames this sample will contribute, without reading any pixel/feature payload.
+
+    Cached samples prefer the extractor's `num_frames` and otherwise read only the
+    .pt header (~1 ms) via a meta-device load. Decoded samples prefer `num_frames`,
+    then a duration field (1 FPS => ceil(seconds) frames), and only fall back to a
+    decord header open -- this runs for every sample on every rank, so the cheap
+    sources matter.
     """
-    t = sample["raw"].get("num_frames")
-    if not isinstance(t, int) or t <= 0:
-        try:
-            obj = torch.load(sample["feat_path"], map_location="meta", weights_only=True, mmap=True)
-            shape = tuple(obj.shape)
-            t = shape[0] if len(shape) == 3 else max(1, shape[0] // tokens_per_frame)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("frame probe failed on %s (%s); assuming 1 frame.", sample["video_id"], exc)
-            t = 1
+    raw = sample["raw"]
+    source = sample.get("source", "feat")
+
+    if source == "image":
+        t = max(1, len(sample.get("images") or []))
+    elif source == "video":
+        t = raw.get("num_frames")
+        if not isinstance(t, int) or t <= 0:
+            duration = raw.get(duration_key)
+            if not isinstance(duration, (int, float)):
+                duration = raw.get("video_duration")
+            if isinstance(duration, (int, float)) and duration > 0:
+                t = max(1, math.ceil(float(duration)))
+            else:
+                try:
+                    t = _probe_video_frames(
+                        _resolve_path(raw, str(sample["video"]), None), decode_max_frames
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "frame probe failed on %s (%s); assuming the full cap.",
+                        sample["video_id"], exc,
+                    )
+                    t = decode_max_frames
+        if decode_max_frames > 0:
+            t = min(t, decode_max_frames)
+    else:
+        t = raw.get("num_frames")
+        if not isinstance(t, int) or t <= 0:
+            try:
+                obj = torch.load(sample["feat_path"], map_location="meta", weights_only=True, mmap=True)
+                shape = tuple(obj.shape)
+                t = shape[0] if len(shape) == 3 else max(1, shape[0] // tokens_per_frame)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("frame probe failed on %s (%s); assuming 1 frame.", sample["video_id"], exc)
+                t = 1
     if max_frames > 0:
         t = min(t, max_frames)
-    return int(t)
+    return max(1, int(t))
 
 
-def _estimate_seq_len(num_frames: int, tokens_per_frame: int) -> int:
-    return num_frames * tokens_per_frame + _TEXT_TOKENS_PER_FRAME * num_frames + _TEXT_TOKENS_FIXED
+def _estimate_seq_len(num_frames: int, tokens_per_frame: int, prompt_tokens: int = 0) -> int:
+    return (num_frames * tokens_per_frame + _TEXT_TOKENS_PER_FRAME * num_frames
+            + _TEXT_TOKENS_FIXED + prompt_tokens)
+
+
+def _estimate_prompt_tokens(prompts: List[str]) -> int:
+    """Upper bound on the instruction text, in tokens.
+
+    _TEXT_TOKENS_FIXED covers the chat template only; the pool's prompts run to a
+    couple of hundred tokens and differ per sample, so the batch planner has to
+    budget for the longest one or a batch of short videos can overshoot.
+    """
+    return max((int(len(t.split()) * 1.6) + 8 for t in prompts), default=0)
 
 
 def _pack_batches(
@@ -599,7 +977,7 @@ def _identity_collate(batch):
 # entry -- most of all `conversations`, which carries the source annotation's full
 # text -- is dead weight from the workers' point of view, and only rank 0 needs it
 # at the very end for --annotation_out.
-_WORKER_RAW_KEYS = ("frame_timestamps", "num_frames", "video_duration", "_data_root")
+_WORKER_RAW_KEYS = ("frame_timestamps", "num_frames", "video_duration", "_data_root", "_dataset")
 
 
 def _slim_sample(sample: Dict, duration_key: str) -> Dict:
@@ -609,6 +987,10 @@ def _slim_sample(sample: Dict, duration_key: str) -> Dict:
         "video": sample["video"],
         "feat_path": sample["feat_path"],
         "video_id": sample["video_id"],
+        "source": sample.get("source", "feat"),
+        "prompt": sample.get("prompt", ""),
+        "prompt_name": sample.get("prompt_name", "fixed"),
+        "images": sample.get("images") or [],
         "raw": {k: raw[k] for k in keys if k in raw},
     }
 
@@ -626,40 +1008,80 @@ def _rss_mb() -> float:
 
 
 class _FeatureBatchDataset(Dataset):
-    """Does the CPU-side prep (torch.load + timestamps + prompt ids) off the main
-    process so it overlaps with generate() instead of stalling the GPU."""
+    """Does the CPU-side prep (feature load or frame decode + patchify, timestamps,
+    prompt ids) off the main process so it overlaps with generate() instead of
+    stalling the GPU.
 
-    def __init__(self, batches, processor, args, video_root, prompt):
+    Cached samples come back with a ready `feat`; --decode_video samples come back
+    with `pixels` (patchified frames) for the main loop to push through the vision
+    encoder on the GPU -- the encoder forward is batched there exactly the way
+    extract_vision_features.py batches it.
+    """
+
+    def __init__(self, batches, processor, image_processor, args, video_root):
         self.batches = batches
         self.processor = processor
+        self.image_processor = image_processor
         self.args = args
         self.video_root = video_root
-        self.prompt = prompt
 
     def __len__(self) -> int:
         return len(self.batches)
 
-    def __getitem__(self, idx: int) -> List[Dict]:
+    def _prepare(self, sample: Dict) -> Dict:
         a = self.args
+        source = sample.get("source", "feat")
+        feat = pixels = None
+        kept = decoded_ts = None
+
+        if source == "feat":
+            feat, t, hw, kept = _load_feature(sample["feat_path"], a.tokens_per_frame, a.max_frames)
+            if hw != a.tokens_per_frame:
+                raise ValueError(
+                    f"cached tokens/frame {hw} != --tokens_per_frame {a.tokens_per_frame}"
+                )
+        else:
+            cap = a.decode_max_frames
+            if a.max_frames > 0:
+                cap = min(cap, a.max_frames)
+            frames, decoded_ts = _decode_media(
+                sample, source, a.data_root or self.video_root, cap
+            )
+            pixels = self.image_processor(
+                images=[frames], merge_size=a.merge_size, return_tensors="pt"
+            )
+            grid = pixels["grid_sizes"][0].tolist()
+            t = int(grid[0])
+            hw = (int(grid[1]) // a.merge_size) * (int(grid[2]) // a.merge_size)
+            if hw != a.tokens_per_frame:
+                raise ValueError(
+                    f"decoded {hw} tokens/frame != --tokens_per_frame {a.tokens_per_frame}; "
+                    f"--force_image_size / --merge_size must match the geometry the prompt "
+                    f"is built for"
+                )
+
+        if source == "image":
+            timestamps, ts_synthetic = None, False
+        else:
+            timestamps, ts_synthetic = _build_timestamps(
+                sample, t, a.timestamp_mode, self.video_root, a.duration_key, kept, a.fake_fps,
+                decoded_ts,
+            )
+        input_ids = _build_prompt_ids(
+            self.processor, t, hw, a.merge_size, timestamps, sample["prompt"],
+            "image" if source == "image" else "video",
+        )
+        return {
+            "sample": sample, "feat": feat, "pixels": pixels, "t": t, "input_ids": input_ids,
+            "timestamps": timestamps, "ts_synthetic": ts_synthetic, "error": None,
+        }
+
+    def __getitem__(self, idx: int) -> List[Dict]:
         out = []
         for item in self.batches[idx]:
             sample = item["sample"]
             try:
-                feat, t, hw, kept = _load_feature(sample["feat_path"], a.tokens_per_frame, a.max_frames)
-                if hw != a.tokens_per_frame:
-                    raise ValueError(
-                        f"cached tokens/frame {hw} != --tokens_per_frame {a.tokens_per_frame}"
-                    )
-                timestamps, ts_synthetic = _build_timestamps(
-                    sample, t, a.timestamp_mode, self.video_root, a.duration_key, kept, a.fake_fps,
-                )
-                input_ids = _build_prompt_ids(
-                    self.processor, t, hw, a.merge_size, timestamps, self.prompt
-                )
-                out.append({
-                    "sample": sample, "feat": feat, "t": t, "input_ids": input_ids,
-                    "timestamps": timestamps, "ts_synthetic": ts_synthetic, "error": None,
-                })
+                out.append(self._prepare(sample))
             except Exception as exc:  # noqa: BLE001
                 out.append({"sample": sample, "error": str(exc)})
         return out
@@ -710,7 +1132,54 @@ def _load_mm_projector(model_path: str, dtype: torch.dtype) -> torch.nn.Module:
     return projector.to(dtype).eval()
 
 
-def _load_model(model_path: str, dtype: torch.dtype, attn_impl: str, llm_impl: str):
+def _load_vision_encoder(model_path: str, dtype: torch.dtype):
+    """Pull just the vision tower out of the checkpoint (same trick as
+    dataset_util/extract_vision_features.py: load the full model, keep the tower,
+    drop the rest). Only needed for --decode_video under --llm_impl stock; the
+    vendored backend already has one in memory.
+    """
+    logger.info("Loading the vision encoder from %s (--decode_video) ...", model_path)
+    full_model = Videollama3Qwen2ForCausalLM.from_pretrained(
+        model_path, dtype=dtype, low_cpu_mem_usage=True,
+    )
+    encoder = full_model.get_vision_encoder()
+    hidden_size = encoder.hidden_size
+    encoder = encoder.to("cpu")
+    del full_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info("Vision encoder loaded. hidden_size=%d", hidden_size)
+    return encoder.eval(), hidden_size
+
+
+@torch.no_grad()
+def _encode_pixels(vision_encoder, items: List[Dict], device, dtype, hidden_size: int) -> None:
+    """Run the frozen vision encoder over every --decode_video item in this batch
+    and write the result back as `item["feat"]` (T, HW, hidden), frame-major.
+
+    One padded forward for the whole batch, split back per sample by post-merge
+    token count -- the same accounting extract_vision_features.py does.
+    """
+    pixel_values = torch.cat([it["pixels"]["pixel_values"] for it in items], dim=0).to(
+        device=device, dtype=dtype
+    )
+    grid_sizes = torch.cat([it["pixels"]["grid_sizes"] for it in items], dim=0).to(device)
+    merge_sizes = torch.cat([it["pixels"]["merge_sizes"] for it in items], dim=0).to(device)
+
+    visual_tokens = vision_encoder(
+        pixel_values=pixel_values, grid_sizes=grid_sizes, merge_sizes=merge_sizes,
+    )
+    counts = [
+        int(gs[0]) * (int(gs[1]) // int(ms)) * (int(gs[2]) // int(ms))
+        for gs, ms in zip(grid_sizes.tolist(), merge_sizes.tolist())
+    ]
+    for it, chunk, gs in zip(items, visual_tokens.split(counts, dim=0), grid_sizes.tolist()):
+        it["feat"] = chunk.view(int(gs[0]), -1, hidden_size)
+        it["pixels"] = None
+
+
+def _load_model(model_path: str, dtype: torch.dtype, attn_impl: str, llm_impl: str,
+                keep_vision_encoder: bool = False):
     """Returns (model, projector, embed_tokens, generate_fn).
 
     llm_impl="stock" loads the LLM as a plain `transformers.Qwen2ForCausalLM`
@@ -733,7 +1202,7 @@ def _load_model(model_path: str, dtype: torch.dtype, attn_impl: str, llm_impl: s
         model = Videollama3Qwen2ForCausalLM.from_pretrained(
             model_path, dtype=dtype, attn_implementation=attn_impl, low_cpu_mem_usage=True,
         )
-        if getattr(model.get_model(), "vision_encoder", None) is not None:
+        if getattr(model.get_model(), "vision_encoder", None) is not None and not keep_vision_encoder:
             # Never invoked here: the features are already encoded.
             model.get_model().vision_encoder = None
             logger.info("Dropped the vision encoder (features are pre-extracted).")
@@ -760,6 +1229,42 @@ def _load_model(model_path: str, dtype: torch.dtype, attn_impl: str, llm_impl: s
 
 
 # ---------------------------------------------------------------------------
+# Registry output
+# ---------------------------------------------------------------------------
+
+def _write_meta_registry(
+    meta_out: Path,
+    anno: List[Tuple[Optional[str], Dict]],
+    registry: Dict,
+) -> None:
+    """Write an anno_data-style registry over this run's annotations.
+
+    One {dataset}_recaption.json per source dataset next to --meta_out, each
+    registry entry keeping the original data_root / repeat_time / ... and pointing
+    `annotation` at the new file. Drop the result straight into --data_path.
+    """
+    meta_out.parent.mkdir(parents=True, exist_ok=True)
+    grouped: Dict[str, List[Dict]] = {}
+    for dataset_name, entry in anno:
+        grouped.setdefault(dataset_name or "recaption", []).append(entry)
+
+    meta: Dict[str, Dict] = {}
+    for dataset_name, entries in grouped.items():
+        anno_path = meta_out.parent / f"{dataset_name}_recaption.json"
+        with open(anno_path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+        cfg = dict(registry.get(dataset_name, {}))
+        cfg["annotation"] = str(anno_path)
+        meta[dataset_name] = cfg
+        logger.info("Wrote %s with %d samples", anno_path, len(entries))
+
+    with open(meta_out, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    logger.info("Wrote %s with %d dataset(s)", meta_out, len(meta))
+
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -783,9 +1288,50 @@ def main():
                              "rank 0 merges into this path at the end.")
     parser.add_argument("--annotation_out", default=None,
                         help="Also write a conversation-format JSON (anno_online style) here.")
+    parser.add_argument("--meta_out", default=None,
+                        help="Also write an anno_data-style registry pointing at the annotations "
+                             "produced by this run (one {dataset}_recaption.json next to it per "
+                             "dataset). Needs --meta_path to have been a registry; the entries are "
+                             "the same ones --annotation_out writes.")
 
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument("--prompt_file", default=None, help="Read the prompt from this file instead.")
+    parser.add_argument("--prompt", default=None,
+                        help="Caption every sample with this one prompt. Giving neither --prompt "
+                             "nor --prompt_file turns on the prompt pool: each sample draws its "
+                             "own prompt from --prompt_pool, which is what buys caption diversity "
+                             "across a dataset.")
+    parser.add_argument("--prompt_file", default=None,
+                        help="Read the single prompt from this file instead (also disables the pool).")
+    parser.add_argument("--prompt_pool", default=",".join(DEFAULT_PROMPT_POOL),
+                        help="Comma-separated pool used when no single prompt is given. A bare name "
+                             "resolves to dataset_util/prompts/<name>.txt; a path is read as-is. "
+                             "Each sample's draw is a hash of its video id and --seed, so it "
+                             "survives resumes and a change of GPU count; change --seed to "
+                             "reshuffle. Default: " + ", ".join(DEFAULT_PROMPT_POOL) + ".")
+    parser.add_argument("--prompt_source", choices=["fixed", "annotation"], default="fixed",
+                        help="'fixed' captions every sample with --prompt/--prompt_file. "
+                             "'annotation' uses each sample's own user turn instead (falling back "
+                             "to --prompt when it has none); assistant/gpt/system turns are never "
+                             "shown to the model either way, so it answers the dataset's "
+                             "real question without seeing its GT.")
+    parser.add_argument("--annotate_unannotated", action="store_true",
+                        help="Also caption video files found under the data roots that the "
+                             "annotation never mentions. They always use --prompt.")
+
+    parser.add_argument("--decode_video", action="store_true",
+                        help="Decode + vision-encode samples that have no cached feature, instead "
+                             "of skipping them. Costs a vision-encoder load and makes the run "
+                             "decode-bound; extract_vision_features.py first is faster whenever a "
+                             "dataset is captioned more than once.")
+    parser.add_argument("--decode_max_frames", type=int, default=10,
+                        help="Frame cap for --decode_video, same meaning and default as "
+                             "extract_vision_features.py --max_frames: sampling is 1 FPS and only "
+                             "videos longer than this many seconds get their 1-FPS indices "
+                             "uniformly subsampled down to it.")
+    parser.add_argument("--force_image_size", type=int, default=448,
+                        help="Square size every decoded frame is resized to before patching "
+                             "(--decode_video only). With --merge_size 2 this is what makes a "
+                             "frame 256 tokens; <=0 lets the processor resize dynamically, which "
+                             "breaks the uniform-tokens-per-frame prompt.")
 
     parser.add_argument("--tokens_per_frame", type=int, default=256,
                         help="HW per frame; must match extraction (448/(14*2) -> 16*16=256).")
@@ -894,9 +1440,19 @@ def main():
     if meta_path is None and feat_dir is None:
         parser.error("Pass --feat_dir and/or --meta_path.")
 
-    prompt = args.prompt
+    prompt = args.prompt or ""
+    prompt_pool: Optional[List[Tuple[str, str]]] = None
     if args.prompt_file:
         prompt = Path(args.prompt_file).read_text().strip()
+    elif args.prompt is None:
+        prompt_pool = _load_prompt_pool(args.prompt_pool.split(","))
+        if rank == 0:
+            logger.info(
+                "No single prompt given -- drawing one per sample from a pool of %d: %s",
+                len(prompt_pool), ", ".join(n for n, _ in prompt_pool),
+            )
+    prompt_texts = [t for _, t in prompt_pool] if prompt_pool else [prompt]
+    prompt_tokens = _estimate_prompt_tokens(prompt_texts)
 
     output_file = Path(args.output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -904,15 +1460,37 @@ def main():
     if args.overwrite and rank_file.exists():
         rank_file.unlink()
 
-    samples = _load_samples(meta_path, feat_dir, args.data_root)
+    samples, registry = _load_samples(
+        meta_path, feat_dir, args.data_root,
+        decode_video=args.decode_video,
+        annotate_unannotated=args.annotate_unannotated,
+        prompt=prompt,
+        prompt_source=args.prompt_source,
+        prompt_pool=prompt_pool,
+        seed=args.seed,
+    )
+    if args.meta_out and not registry and rank == 0:
+        logger.warning(
+            "--meta_out was passed but --meta_path is not an anno_data-style registry; the "
+            "generated meta will hold a single 'recaption' dataset.",
+        )
     if args.limit > 0:
         samples = samples[: args.limit]
     done = set() if args.overwrite else _load_done_ids(output_file)
     todo = [s for s in samples if s["video_id"] not in done]
 
+    n_decode = sum(1 for s in todo if s["source"] != "feat")
+    if n_decode and rank == 0:
+        logger.info(
+            "%d of %d sample(s) have no cached feature and will be decoded + encoded in this run.",
+            n_decode, len(todo),
+        )
+
     items = [
         {"sample": s, "est_len": _estimate_seq_len(
-            _probe_num_frames(s, args.tokens_per_frame, args.max_frames), args.tokens_per_frame)}
+            _probe_num_frames(s, args.tokens_per_frame, args.max_frames,
+                              args.decode_max_frames, args.duration_key),
+            args.tokens_per_frame, prompt_tokens)}
         for s in todo
     ]
     if not args.no_sort_by_length:
@@ -958,11 +1536,27 @@ def main():
     gc.collect()
     logger.info("rank %d: work list ready, RSS %.0f MB", rank, _rss_mb())
 
+    needs_encoder = any(it["sample"]["source"] != "feat" for batch in batches for it in batch)
     model, projector, embed_tokens, generate_fn = _load_model(
-        args.model_path, dtype, args.attn_implementation, args.llm_impl
+        args.model_path, dtype, args.attn_implementation, args.llm_impl,
+        keep_vision_encoder=needs_encoder,
     )
     model.to(device)
     projector.to(device)
+
+    vision_encoder = None
+    ve_hidden_size = 0
+    image_processor = None
+    if needs_encoder:
+        if args.llm_impl == "vendored":
+            vision_encoder = model.get_model().vision_encoder
+            ve_hidden_size = vision_encoder.hidden_size
+        else:
+            vision_encoder, ve_hidden_size = _load_vision_encoder(args.model_path, dtype)
+        vision_encoder = vision_encoder.to(device).eval()
+        image_processor = Videollama3ImageProcessor.from_pretrained(args.model_path)
+        if args.force_image_size > 0:
+            image_processor.force_size = [args.force_image_size] * 2
 
     processor = Videollama3Processor.from_pretrained(args.model_path)
     # from_pretrained loads the checkpoint's chat_template.jinja, which references an
@@ -994,6 +1588,7 @@ def main():
     if "num_logits_to_keep" in inspect.signature(model.forward).parameters:
         generation_kwargs["num_logits_to_keep"] = 1
 
+
     # The projector's input width is the vision encoder's hidden size, and it is
     # present under both backends (stock's Qwen2Config has no mm_hidden_size).
     first_linear = next(m for m in projector.modules() if isinstance(m, torch.nn.Linear))
@@ -1015,7 +1610,7 @@ def main():
     # collected: the process exits when the run does.
     gc.freeze()
     loader = DataLoader(
-        _FeatureBatchDataset(batches, processor, args, video_root, prompt),
+        _FeatureBatchDataset(batches, processor, image_processor, args, video_root),
         batch_size=None,                 # the dataset already yields whole batches
         shuffle=False,
         num_workers=args.num_workers,
@@ -1028,6 +1623,25 @@ def main():
     pbar = tqdm(total=n_shard, desc=f"[rank {rank}] captioning", disable=(rank != 0))
     for n_batch, prepared in enumerate(loader, 1):
         embeds_list, metas = [], []
+
+        # --decode_video items arrive patchified but unencoded; one GPU forward for
+        # the whole batch, chunked so a batch of long videos cannot blow up the
+        # encoder's activations on its own.
+        to_encode = [it for it in prepared if it.get("error") is None and it.get("pixels") is not None]
+        chunk: List[Dict] = []
+        chunk_patches = 0
+        for it in to_encode + [None]:
+            n_patches = int(it["pixels"]["pixel_values"].shape[0]) if it is not None else 0
+            if chunk and (it is None or chunk_patches + n_patches > _ENCODE_MAX_PATCHES):
+                try:
+                    _encode_pixels(vision_encoder, chunk, device, dtype, ve_hidden_size)
+                except Exception as exc:  # noqa: BLE001
+                    for failed in chunk:
+                        failed["error"] = f"vision encoder failed: {exc}"
+                chunk, chunk_patches = [], 0
+            if it is not None:
+                chunk.append(it)
+                chunk_patches += n_patches
 
         for item in prepared:
             sample = item["sample"]
@@ -1042,7 +1656,9 @@ def main():
                         f"feature dim {feat.shape[-1]} != projector input width {expected_dim}; "
                         f"features were extracted with a different vision encoder."
                     )
-                if item["timestamps"] is None:
+                # Image samples have no time axis at all, so they are not a
+                # missing-timestamp problem to warn about.
+                if item["timestamps"] is None and sample.get("source") != "image":
                     n_no_ts += 1
                 elif item["ts_synthetic"]:
                     n_fake_ts += 1
@@ -1085,7 +1701,8 @@ def main():
                 # True => the times above were made up, not decoded. Filter on this
                 # before using these captions for anything that cites seconds.
                 "timestamps_synthetic": ts_synthetic,
-                "prompt": prompt,
+                "prompt_name": sample["prompt_name"],
+                "prompt": sample["prompt"],
                 "caption": caption.strip(),
             }
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -1136,12 +1753,23 @@ def main():
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         logger.info("Wrote %s with %d captions", output_file, len(records))
+        mix: Dict[str, int] = {}
+        for rec in records:
+            mix[rec.get("prompt_name") or "fixed"] = mix.get(rec.get("prompt_name") or "fixed", 0) + 1
+        if len(mix) > 1 or prompt_pool is not None:
+            logger.info(
+                "Prompt mix: %s",
+                ", ".join(f"{k}={v} ({100 * v / len(records):.0f}%)"
+                          for k, v in sorted(mix.items(), key=lambda kv: -kv[1])),
+            )
 
-        if args.annotation_out:
+        if args.annotation_out or args.meta_out:
             by_id = {s["video_id"]: s for s in samples}
             anno = []
             for rec in records:
-                base = dict(by_id.get(rec["video_id"], {}).get("raw", {}))
+                source_sample = by_id.get(rec["video_id"], {})
+                base = dict(source_sample.get("raw", {}))
+                dataset_name = base.get("_dataset")
                 for key in _INTERNAL_KEYS:
                     base.pop(key, None)
                 base["video"] = rec["video"]
@@ -1153,16 +1781,26 @@ def main():
                     base["num_frames"] = rec["num_frames"]
                     if rec.get("timestamps_synthetic"):
                         base["synthetic_timestamps"] = True
+                if rec.get("prompt_name"):
+                    # Which style this caption was written in -- lets a later run
+                    # filter or rebalance the mix without re-reading the JSONL.
+                    base["prompt_name"] = rec["prompt_name"]
+                modal_token = DEFAULT_IMAGE_TOKEN if source_sample.get("source") == "image" else DEFAULT_VIDEO_TOKEN
                 base["conversations"] = [
-                    {"from": "human", "value": f"<video>\n{rec['prompt']}"},
+                    {"from": "human", "value": f"{modal_token}\n{rec['prompt']}"},
                     {"from": "gpt", "value": rec["caption"]},
                 ]
-                anno.append(base)
-            anno_path = Path(args.annotation_out)
-            anno_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(anno_path, "w", encoding="utf-8") as f:
-                json.dump(anno, f, ensure_ascii=False, indent=2)
-            logger.info("Wrote %s with %d samples", anno_path, len(anno))
+                anno.append((dataset_name, base))
+
+            if args.annotation_out:
+                anno_path = Path(args.annotation_out)
+                anno_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(anno_path, "w", encoding="utf-8") as f:
+                    json.dump([entry for _, entry in anno], f, ensure_ascii=False, indent=2)
+                logger.info("Wrote %s with %d samples", anno_path, len(anno))
+
+            if args.meta_out:
+                _write_meta_registry(Path(args.meta_out), anno, registry)
 
     _barrier()
     if dist.is_initialized():
