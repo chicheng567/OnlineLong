@@ -1,0 +1,13 @@
+List the segments of this video in order, one per line, in exactly this form:
+<start>s - <end>s, <where we are and who or what is in frame>, <what happens: who does what to
+what, in which direction and manner>
+Take the times from the "Time XXs:" markers attached to the frames: the marker of the first frame
+where the segment starts and of the last frame where it is still going.
+Every line must contain BOTH halves -- the place and who is in frame, AND an action or change. A
+line that names only a place, or only an action, is wrong. When the place or the subject is the
+same as the previous line, still say what is in frame.
+Start a new segment when the action, the place, the main subject, or the shot changes. Cover the
+whole video from the first marker to the last; do not collapse it into one or two lines, and do
+not invent times that are not on the frames.
+Mark camera movement (pan, tilt, zoom, track, handheld, cut) as camera, never as subject motion.
+Describe only what is visible and do not repeat a segment.
