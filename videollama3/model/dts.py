@@ -481,13 +481,22 @@ class SiglipAECompressor(nn.Module):
     (pure temporal compression, matching `LocalAttnConvCompressor`'s framing, not
     `TransformerDecoderCompressor`'s learned-query cross-attention framing).
 
-    Constraint (unlike the other two compressor types): `config.window_size` must be a
+    Constraint (unlike TransformerDecoderCompressor): `config.window_size` must be a
     power of two >= 2, and EVERY window passed to `forward` must contain exactly
     `window_size` frames — this architecture's depth is fixed at construction, it
     cannot adapt to a different T per call. Set `window_size` to match whatever T you
     actually compress per window (e.g. `fixed_frames` in
     `videollama3_pretrain_compressor_dts.py`, or `compression_window_size` in real
     inference — see `Videollama3TokenCompressorConfig`).
+
+    Unlike T, the per-window spatial grid (h, w) IS dynamic: `forward` accepts an
+    optional `grid_hws` (one (h, w) per window) and reshapes/runs each window with its
+    own actual grid rather than the constructor's `config.compress_image_h/w` (which is
+    now only the fallback used when `grid_hws` is omitted). Since this architecture is a
+    pure spatial pass-through, the output grid always equals that window's input grid —
+    see `output_hw_for`. Because windows may now differ in (h, w), `forward` processes
+    each window through the conv/attention stages individually (no batched B>1 conv
+    call) rather than reshaping all windows into one `(B, T, H, W, C)` tensor.
     """
 
     def __init__(self, config):
@@ -512,46 +521,73 @@ class SiglipAECompressor(nn.Module):
         self.temporal_encoding = DynamicTokenSynthesizer(hidden_size=C, num_frames=T)
         self.stages = nn.ModuleList([SiglipAEStage(C) for _ in range(self.num_stages)])
 
-    def forward(self, kv: torch.Tensor, compression_cu_seqlens: torch.Tensor) -> torch.Tensor:
+    def output_hw_for(self, h: int, w: int):
+        # Pure spatial pass-through (only T is reduced) — the output grid always
+        # equals the window's own input grid. See TransformerDecoderCompressor's
+        # output_hw_for for the contrasting fixed-output-grid case.
+        return h, w
+
+    def forward(self, kv: torch.Tensor, compression_cu_seqlens: torch.Tensor, grid_hws=None) -> torch.Tensor:
         # kv: (total_tokens, hidden_size) or (1, total_tokens, hidden_size), frame-major
-        # per window: [frame0_p0, .., frame0_p{HW-1}, frame1_p0, ...] (same convention
+        # per window: [frame0_p0, .., frame0_p{HW_i-1}, frame1_p0, ...] (same convention
         # as LocalAttnConvCompressor).
+        # grid_hws: optional list of (h, w) pairs, one per window — the ACTUAL input
+        # frame grid for that window (may differ window to window). Defaults to
+        # compress_image_h/w for every window, matching the old fixed-grid behavior.
         if kv.dim() == 3:
             kv = kv.squeeze(0)
         device = kv.device
         compression_cu_seqlens = compression_cu_seqlens.to(device=device, dtype=torch.int32)
 
-        HW = self.compress_image_wh
         window_lens = (compression_cu_seqlens[1:] - compression_cu_seqlens[:-1]).long()
-        expected = self.window_size * HW
-        assert (window_lens == expected).all(), (
-            f"SiglipAECompressor requires every compression window to contain exactly "
-            f"window_size={self.window_size} frames ({expected} tokens each, HW={HW}); "
-            f"got window lengths {window_lens.tolist()}. Unlike LocalAttnConvCompressor/"
-            f"TransformerDecoderCompressor, this architecture's depth is fixed at "
-            f"construction time (matching Video-XL-Pro's SiglipAE), so every window "
-            f"must share the same frame count — see the class docstring."
-        )
-
         B = window_lens.shape[0]
-        T, H, W, C = self.window_size, self.compress_image_h, self.compress_image_w, self.hidden_size
-
-        # frame-major (B*T*HW, C) -> (B, T, H, W, C) -> channel-first (B, C, T, H, W).
-        x_bthwc = kv.view(B, T, H, W, C)
-
-        # DTS: unconditional additive per-frame temporal bias, matching
-        # SiglipAE.forward's `x = x + temporal_encoding`. DynamicTokenSynthesizer
-        # expects (B, T, HW, C), so flatten H,W for this call only.
-        x_bthwc = self.temporal_encoding(x_bthwc.view(B, T, HW, C)).view(B, T, H, W, C)
-
-        x = x_bthwc.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, T, H, W)
-        for stage in self.stages:
-            x = stage(x)
-
-        assert x.shape[2] == 1, (
-            f"SiglipAECompressor: expected T=1 after {self.num_stages} stride-2 "
-            f"stages (log2(window_size={self.window_size})), got T={x.shape[2]}."
+        if grid_hws is None:
+            grid_hws = [(self.compress_image_h, self.compress_image_w)] * B
+        assert len(grid_hws) == B, (
+            f"SiglipAECompressor: grid_hws must have one (h, w) per window ({B} "
+            f"windows), got {len(grid_hws)}."
         )
-        x = x.squeeze(2)                        # (B, C, H, W)
-        x = x.permute(0, 2, 3, 1).contiguous()   # (B, H, W, C)
-        return x.reshape(B * HW, C)
+
+        T, C = self.window_size, self.hidden_size
+
+        # Windows may have different (h, w), so each is reshaped/run through the
+        # conv/attention stages individually rather than batched as one (B, T, H, W, C)
+        # tensor — see the class docstring.
+        outputs = []
+        for i in range(B):
+            H_i, W_i = grid_hws[i]
+            HW_i = H_i * W_i
+            expected = T * HW_i
+            got = window_lens[i].item()
+            assert got == expected, (
+                f"SiglipAECompressor: window {i} must contain exactly "
+                f"window_size={T} frames at its grid_hws (h={H_i}, w={W_i}) "
+                f"-> {expected} tokens; got {got}. Unlike LocalAttnConvCompressor/"
+                f"TransformerDecoderCompressor, this architecture's depth is fixed at "
+                f"construction time (matching Video-XL-Pro's SiglipAE), so every window "
+                f"must share the same frame count — see the class docstring."
+            )
+
+            s = compression_cu_seqlens[i].item()
+            e = compression_cu_seqlens[i + 1].item()
+            # frame-major (T*HW_i, C) -> (1, T, H_i, W_i, C).
+            x_bthwc = kv[s:e].view(1, T, H_i, W_i, C)
+
+            # DTS: unconditional additive per-frame temporal bias, matching
+            # SiglipAE.forward's `x = x + temporal_encoding`. DynamicTokenSynthesizer
+            # expects (B, T, HW, C), so flatten H,W for this call only.
+            x_bthwc = self.temporal_encoding(x_bthwc.view(1, T, HW_i, C)).view(1, T, H_i, W_i, C)
+
+            x = x_bthwc.permute(0, 4, 1, 2, 3).contiguous()  # (1, C, T, H_i, W_i)
+            for stage in self.stages:
+                x = stage(x)
+
+            assert x.shape[2] == 1, (
+                f"SiglipAECompressor: expected T=1 after {self.num_stages} stride-2 "
+                f"stages (log2(window_size={self.window_size})), got T={x.shape[2]}."
+            )
+            x = x.squeeze(2)                        # (1, C, H_i, W_i)
+            x = x.permute(0, 2, 3, 1).contiguous()   # (1, H_i, W_i, C)
+            outputs.append(x.reshape(HW_i, C))
+
+        return torch.cat(outputs, dim=0)

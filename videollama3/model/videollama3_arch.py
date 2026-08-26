@@ -29,6 +29,46 @@ from .projector import build_vision_projector, load_mm_projector
 from .compressor import build_token_compressor
 
 
+def _grid_hw_for_compression_parts(compression_parts, grid_sizes, merge_sizes):
+    """
+    Map each compression part's [start, end) vision-token range to the post-merge
+    (h, w) patch grid of the single grid_sizes entry it falls inside.
+
+    grid_sizes: (num_grids, 3) rows of (t, h, w) in pre-merge patch units, one entry
+    per video/image in the sample. merge_sizes: (num_grids,) merge_size per entry.
+    A compression part is expected to come from exactly one video/image (compression
+    windows are built per-video upstream), so it must fall entirely within one grid
+    entry's token range.
+
+    Returns: List[Tuple[int, int]], one (h, w) per compression part, aligned to
+    compression_parts' input order (NOT sorted).
+    """
+    tokens_per_grid = []
+    grid_hw = []
+    for (t, h, w), m in zip(grid_sizes.tolist(), merge_sizes.tolist()):
+        oh, ow = h // m, w // m
+        tokens_per_grid.append(t * oh * ow)
+        grid_hw.append((oh, ow))
+    offsets = [0]
+    for n in tokens_per_grid:
+        offsets.append(offsets[-1] + n)
+
+    result = []
+    for start, end in compression_parts:
+        owner = None
+        for i in range(len(tokens_per_grid)):
+            if start >= offsets[i] and end <= offsets[i + 1]:
+                owner = i
+                break
+        assert owner is not None, (
+            f"Compression part [{start}, {end}) does not fall within a single "
+            f"grid_sizes entry (offsets={offsets}); every compression window must "
+            f"come from one video/image so the compressor can assign it one (h, w)."
+        )
+        result.append(grid_hw[owner])
+    return result
+
+
 def spatial_downsampling(features, grid_thws, stride=2):
     n, c = features.shape
 
@@ -125,30 +165,38 @@ class Videollama3MetaForCausalLM(ABC):
         return self.get_model().get_token_compressor()
 
     def compress_visual_tokens_with_compressor(
-        self, 
-        vision_tokens: torch.FloatTensor, 
+        self,
+        vision_tokens: torch.FloatTensor,
         compression_parts: List[List[int]],
+        grid_hws: List[Tuple[int, int]],
     ) -> Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]:
         # compression_parts: [[start, end], [start, end], ...]
+        # grid_hws: [(h, w), ...], one per compression part, same order as
+        # compression_parts — the ACTUAL input frame grid for that part (see
+        # _grid_hw_for_compression_parts). Determines each part's compressed OUTPUT
+        # length via the compressor's own output_hw_for (fixed for
+        # TransformerDecoderCompressor, == input (h, w) for SiglipAECompressor).
         # vision_tokens: [1, num_tokens, dim]
         device = vision_tokens.device
         vision_tokens = vision_tokens.squeeze(0) # [num_tokens, dim]
+        compressor = self.get_token_compressor()
         compression_cu_seqlens = [0]
         need_compress_parts = torch.zeros(vision_tokens.shape[0], device=device, dtype=torch.bool)
         replace_mask = torch.zeros(vision_tokens.shape[0], device=device, dtype=torch.bool)
-        compressor_output_length = self.get_token_compressor().compress_image_wh
-        for part in compression_parts:
+        for part, (h, w) in zip(compression_parts, grid_hws):
             part_len = part[1] - part[0]
             need_compress_parts[part[0]: part[1]] = True
-            replace_mask[part[0]: part[0] + compressor_output_length] = True
+            oh, ow = compressor.output_hw_for(h, w)
+            replace_mask[part[0]: part[0] + oh * ow] = True
             compression_cu_seqlens.append(compression_cu_seqlens[-1] + part_len)
         compression_cu_seqlens = torch.tensor(compression_cu_seqlens, device=device, dtype=torch.long)
-        
+
         # compressed vision tokens should have shape: [n, dim]
         original_tokens_to_reconstruct = vision_tokens[need_compress_parts]
-        compressed = self.get_token_compressor()(
+        compressed = compressor(
             original_tokens_to_reconstruct,
-            compression_cu_seqlens
+            compression_cu_seqlens,
+            grid_hws,
         )
         keeping_masks = ~need_compress_parts | replace_mask
         vision_tokens[replace_mask] = compressed
@@ -160,6 +208,7 @@ class Videollama3MetaForCausalLM(ABC):
         grid_sizes: torch.LongTensor,
         merge_sizes: torch.LongTensor,
         compression_parts: Optional[List[List[int]]] = None,
+        grid_hws: Optional[List[Tuple[int, int]]] = None,
     ) -> Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]:
         reconstruction_mse_loss = None
         mm_features = self.get_model().get_vision_encoder()(
@@ -172,6 +221,7 @@ class Videollama3MetaForCausalLM(ABC):
             mm_features = self.compress_visual_tokens_with_compressor(
                 mm_features,
                 compression_parts,
+                grid_hws,
             )
         mm_features = self.get_model().mm_projector(mm_features)
         return mm_features
@@ -212,12 +262,15 @@ class Videollama3MetaForCausalLM(ABC):
         # 2. embed visual tokens and compress if needed
         image_selected = (input_ids == self.config.image_token_index)
         image_positions = torch.nonzero(image_selected, as_tuple=False).squeeze(-1) # vision token's positions among all tokens
-        mm_features = self.encode_images(
-            pixel_values, grid_sizes, merge_sizes, compression_parts
-        )
-        
+        grid_hws = None
         if compression_parts is not None and len(compression_parts) > 0:
-            compact_vision_token_size = self.get_token_compressor().compress_image_wh
+            grid_hws = _grid_hw_for_compression_parts(compression_parts, grid_sizes, merge_sizes)
+        mm_features = self.encode_images(
+            pixel_values, grid_sizes, merge_sizes, compression_parts, grid_hws
+        )
+
+        if compression_parts is not None and len(compression_parts) > 0:
+            compressor = self.get_token_compressor()
             # List-based construction: build the new token sequence piece-by-piece.
             # This lets us replace the per-frame "Time X.0s:" text with a range
             # "Time:Xs-Ye:" before each compression block.
@@ -240,7 +293,10 @@ class Videollama3MetaForCausalLM(ABC):
                         is_start_segs.append(torch.zeros(len(tok_ids), device=device, dtype=torch.bool))
 
             prev = 0
-            for part_idx, part in enumerate(sorted(compression_parts, key=lambda p: p[0])):
+            parts_with_hw = sorted(zip(compression_parts, grid_hws), key=lambda pair: pair[0][0])
+            for part_idx, (part, (part_h, part_w)) in enumerate(parts_with_hw):
+                out_h, out_w = compressor.output_hw_for(part_h, part_w)
+                compact_vision_token_size = out_h * out_w
                 part_start = image_positions[part[0]].item()
                 part_end = image_positions[part[1] - 1].item()
 

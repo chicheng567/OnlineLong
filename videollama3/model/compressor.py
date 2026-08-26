@@ -212,39 +212,33 @@ class TransformerDecoderCompressor(nn.Module):
     def _build_query_rotary_pos_emb(self, w, h) -> torch.Tensor:
         return _build_2d_rotary_pos_emb(self.rotary_pos_emb, w, h)
 
-    def _build_cross_rotary_3d(self, compression_cu_seqlens, device):
+    def output_hw_for(self, h: int, w: int):
+        """The compressor's output grid is a fixed, learned query — it does not
+        depend on the input's (h, w) at all (unlike SiglipAECompressor's spatial
+        pass-through). Exposed so callers (arch.py) can size placeholder tokens
+        per compression part without hardcoding compress_image_h/w themselves."""
+        return self.compress_image_h, self.compress_image_w
+
+    def _build_cross_rotary_3d(self, compression_cu_seqlens, device, grid_hws):
         """
         Build 3-D (t, h, w) rotary tables for the cross-attention.
 
         Queries: one HW grid per window, all anchored at temporal slot 0 with their
-        2-D spatial coordinates.  Keys: the window's T×HW input tokens in frame-major
-        order — temporal coordinate = frame index, spatial coordinate = position
-        within the frame.  Returns (q_freqs, kv_freqs), each (N, head_dim // 2).
+        2-D spatial coordinates (compressor's own fixed output grid,
+        compress_image_h × compress_image_w). Keys: the window's T×(h_i×w_i) input
+        tokens in frame-major order — temporal coordinate = frame index, spatial
+        coordinate = position within the frame, using PER-WINDOW (h_i, w_i) from
+        `grid_hws` (one entry per window; may differ window-to-window and from the
+        query's output grid — that's what lets this compressor accept input frames
+        whose patch grid doesn't match compress_image_h/w). Returns
+        (q_freqs, kv_freqs), each (N, head_dim // 2).
         """
-        H, W, HW = self.compress_image_h, self.compress_image_w, self.compress_image_wh
-        # Per-frame spatial coords, matching the _build_2d_rotary_pos_emb convention.
-        hpos = torch.arange(H, device=device).unsqueeze(1).expand(-1, W).reshape(-1)  # (HW,)
-        wpos = torch.arange(W, device=device).unsqueeze(0).expand(H, -1).reshape(-1)  # (HW,)
-
         window_lens = (compression_cu_seqlens[1:] - compression_cu_seqlens[:-1]).long()
-        assert (window_lens % HW == 0).all(), (
-            f"TransformerDecoderCompressor: token count per window must be divisible "
-            f"by HW={HW}. Got window lengths: {window_lens.tolist()}"
+        B = window_lens.shape[0]
+        assert len(grid_hws) == B, (
+            f"TransformerDecoderCompressor: grid_hws must have one (h, w) per window "
+            f"({B} windows), got {len(grid_hws)}."
         )
-        T_per = (window_lens // HW).tolist()
-        B = len(T_per)
-
-        # Keys: frame-major layout [frame0_p0..p_{HW-1}, frame1_p0.., ...]
-        kv_t, kv_h, kv_w = [], [], []
-        for Ti in T_per:
-            kv_t.append(torch.arange(Ti, device=device).repeat_interleave(HW))
-            kv_h.append(hpos.repeat(Ti))
-            kv_w.append(wpos.repeat(Ti))
-        kv_t = torch.cat(kv_t); kv_h = torch.cat(kv_h); kv_w = torch.cat(kv_w)
-
-        # Queries: B grids, all at t=0.
-        q_t = torch.zeros(B * HW, device=device)
-        q_h = hpos.repeat(B); q_w = wpos.repeat(B)
 
         inv_freq = self.cross_rotary.inv_freq  # (head_dim // 2,)
         D = inv_freq.shape[0]
@@ -252,16 +246,48 @@ class TransformerDecoderCompressor(nn.Module):
         d_h = (D - d_t) // 2
         d_w = D - d_t - d_h
         dims = [d_t, d_h, d_w]
+
+        # Keys: frame-major layout per window [frame0_p0..p_{h_i*w_i-1}, frame1_p0.., ...].
+        kv_t, kv_h, kv_w = [], [], []
+        for i in range(B):
+            h_i, w_i = grid_hws[i]
+            hw_i = h_i * w_i
+            assert window_lens[i].item() % hw_i == 0, (
+                f"TransformerDecoderCompressor: window {i}'s token count "
+                f"({window_lens[i].item()}) must be divisible by its grid_hws "
+                f"h*w={hw_i} (h={h_i}, w={w_i})."
+            )
+            T_i = window_lens[i].item() // hw_i
+            hpos_i = torch.arange(h_i, device=device).unsqueeze(1).expand(-1, w_i).reshape(-1)
+            wpos_i = torch.arange(w_i, device=device).unsqueeze(0).expand(h_i, -1).reshape(-1)
+            kv_t.append(torch.arange(T_i, device=device).repeat_interleave(hw_i))
+            kv_h.append(hpos_i.repeat(T_i))
+            kv_w.append(wpos_i.repeat(T_i))
+        kv_t = torch.cat(kv_t); kv_h = torch.cat(kv_h); kv_w = torch.cat(kv_w)
+
+        # Queries: B grids at the compressor's own fixed output resolution, all at t=0.
+        H, W, HW = self.compress_image_h, self.compress_image_w, self.compress_image_wh
+        hpos_q = torch.arange(H, device=device).unsqueeze(1).expand(-1, W).reshape(-1)
+        wpos_q = torch.arange(W, device=device).unsqueeze(0).expand(H, -1).reshape(-1)
+        q_t = torch.zeros(B * HW, device=device)
+        q_h = hpos_q.repeat(B); q_w = wpos_q.repeat(B)
+
         kv_freqs = _build_factorized_rotary(inv_freq, [kv_t, kv_h, kv_w], dims)
         q_freqs = _build_factorized_rotary(inv_freq, [q_t, q_h, q_w], dims)
         return q_freqs, kv_freqs
 
-    def forward(self, kv, compression_cu_seqlens):
+    def forward(self, kv, compression_cu_seqlens, grid_hws=None):
         # kv: (1, total_tokens, hidden_size)
+        # grid_hws: optional list of (h, w) pairs, one per window — the ACTUAL input
+        # frame grid for that window (may differ from compress_image_h/w and from
+        # window to window). Defaults to compress_image_h/w for every window, matching
+        # the old fixed-grid-only behavior.
         compression_parts = compression_cu_seqlens.size(0) - 1
         if kv.dim() == 3:
             kv = kv.squeeze(0) # (total_tokens, hidden_size)
         B = compression_parts
+        if grid_hws is None:
+            grid_hws = [(self.compress_image_h, self.compress_image_w)] * B
         query = self.query.expand(B, -1, -1).contiguous().view(-1, kv.size(-1))  # (B * compress_image_wh, hidden_size)
         cu_seqlens_q = torch.arange(
             0,
@@ -272,7 +298,7 @@ class TransformerDecoderCompressor(nn.Module):
         ).contiguous()
         compression_cu_seqlens = compression_cu_seqlens.to(device=kv.device, dtype=torch.int32).contiguous()
         rotary_pos_emb = self._build_query_rotary_pos_emb(self.compress_image_w, self.compress_image_h)
-        cross_rotary_q, cross_rotary_kv = self._build_cross_rotary_3d(compression_cu_seqlens, kv.device)
+        cross_rotary_q, cross_rotary_kv = self._build_cross_rotary_3d(compression_cu_seqlens, kv.device, grid_hws)
         for layer in self.layers:
             query = layer(query, kv, cu_seqlens_q, compression_cu_seqlens, rotary_pos_emb,
                           cross_rotary_q, cross_rotary_kv)
@@ -376,6 +402,13 @@ class LocalAttnConvCompressor(nn.Module):
 
     def _build_query_rotary_pos_emb(self, w, h) -> torch.Tensor:
         return _build_2d_rotary_pos_emb(self.rotary_pos_emb, w, h)
+
+    def output_hw_for(self, h: int, w: int):
+        # Fixed output grid, matching TransformerDecoderCompressor's convention — see
+        # its output_hw_for docstring. Dynamic input (h, w) is NOT yet supported here
+        # (unlike TransformerDecoderCompressor/SiglipAECompressor); this compressor
+        # still requires every window's actual grid to equal compress_image_h/w.
+        return self.compress_image_h, self.compress_image_w
 
     def forward(self, kv, compression_cu_seqlens):
         # kv: (total_tokens, hidden_size) or (1, total_tokens, hidden_size)
