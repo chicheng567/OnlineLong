@@ -465,7 +465,8 @@ class ModelArguments:
     mm_vision_select_feature: Optional[str] = field(default="patch")
     mm_attn_implementation: Optional[str] = field(default="flash_attention_2")
     use_token_compression: Optional[bool] = field(default=True)
-    # transformer_decoder | local_attn_conv | siglip_ae (siglip_ae needs --fixed_frames 2**k)
+    # transformer_decoder | transformer_decoder_flat | local_attn_conv | siglip_ae
+    # (siglip_ae needs --fixed_frames 2**k)
     compressor_type: str = field(default="transformer_decoder")
     compressor_num_layers: int = field(default=8)
     compressor_num_attention_heads: int = field(default=8)
@@ -474,6 +475,13 @@ class ModelArguments:
     compressor_layer_norm_eps: float = field(default=1e-6)
     compress_image_w: int = field(default=16)
     compress_image_h: int = field(default=16)
+    num_queries: int = field(
+        default=32,
+        metadata={"help": "Only used by compressor_type=transformer_decoder_flat: number of "
+                          "flat output query tokens (sin/cos positional encoding over their "
+                          "flat index, replacing the other transformer_decoder variant's "
+                          "compress_image_h x compress_image_w spatial grid)."},
+    )
     pretrained_compressor_path: Optional[str] = field(
         default=None,
         metadata={"help": "Optional compressor_pretrained.pt from AE pretraining, loaded into token_compressor."},
@@ -607,6 +615,8 @@ def _build_token_compressor_config(
         # siglip_ae builds log2(window_size) stride-2 stages and a per-frame bias table,
         # so it needs the exact frame count; the other two derive T from cu_seqlens.
         "window_size": data_args.fixed_frames if model_args.compressor_type == "siglip_ae" else 0,
+        # Only transformer_decoder_flat reads this; harmless for the other types.
+        "num_queries": model_args.num_queries,
     }
 
 

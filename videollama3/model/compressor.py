@@ -1,3 +1,5 @@
+import math
+
 from torch.nn import LayerNorm
 import torch
 from transformers.activations import GELUTanh
@@ -14,6 +16,24 @@ def _build_2d_rotary_pos_emb(rotary_pos_emb_module, w, h):
     pos_ids = torch.stack([hpos_ids, wpos_ids], dim=-1)
     rotary_pos_emb_full = rotary_pos_emb_module(max(h, w))
     return rotary_pos_emb_full[pos_ids].flatten(1)
+
+
+def _build_sinusoidal_position_encoding(num_positions: int, dim: int) -> torch.Tensor:
+    """
+    Classic (Vaswani et al.) additive sin/cos positional encoding, directly encoding
+    the flat index 0..num_positions-1 -- NOT RoPE (no rotation, added straight to the
+    embedding). Returns (num_positions, dim), fp32 (cast by the caller).
+
+        PE[pos, 2i]   = sin(pos / 10000^(2i/dim))
+        PE[pos, 2i+1] = cos(pos / 10000^(2i/dim))
+    """
+    assert dim % 2 == 0, f"_build_sinusoidal_position_encoding requires an even dim, got {dim}."
+    position = torch.arange(num_positions, dtype=torch.float32).unsqueeze(1)  # (N, 1)
+    div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim))  # (dim/2,)
+    pe = torch.zeros(num_positions, dim, dtype=torch.float32)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe
 
 
 def _build_factorized_rotary(inv_freq: torch.Tensor, coords_list, dims_list) -> torch.Tensor:
@@ -144,9 +164,13 @@ class selfFlashAttention(Attention):
         parts_count = cu_seqlens.size(0) - 1
         query_states = query_states.view(parts_count, -1, self.n_head, self.head_dim)
         key_states = key_states.view(parts_count, -1, self.n_head, self.head_dim)
-        # Apply rotary positional embeddings
-        query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
-        key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
+        # Apply rotary positional embeddings. rotary_pos_emb=None skips rotation
+        # entirely (matches CrossFlashAttention2's same convention) -- used by
+        # compressors whose queries carry positional info additively instead of via
+        # RoPE (e.g. TransformerDecoderFlatCompressor's sin/cos encoding).
+        if rotary_pos_emb is not None:
+            query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
+            key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
         query_states = query_states.view(-1, self.n_head, self.head_dim)
         key_states = key_states.view(-1, self.n_head, self.head_dim)
         assert cu_seqlens[0].item() == 0
@@ -302,6 +326,124 @@ class TransformerDecoderCompressor(nn.Module):
         for layer in self.layers:
             query = layer(query, kv, cu_seqlens_q, compression_cu_seqlens, rotary_pos_emb,
                           cross_rotary_q, cross_rotary_kv)
+        return query
+
+
+class TransformerDecoderFlatCompressor(nn.Module):
+    """
+    Variant of TransformerDecoderCompressor whose compressed OUTPUT is a flat set of
+    `num_queries` learned tokens (default 32) instead of a 2-D
+    compress_image_h x compress_image_w spatial grid, positioned with a classic
+    (Vaswani et al.) ADDITIVE sin/cos positional encoding over the flat index range
+    [0, num_queries) — NOT RoPE. Everything else (cross-attention onto the T x
+    (h_i x w_i) input tokens with per-window dynamic (h, w) via grid_hws, the
+    TransformerDecoderLayer stack) is identical to TransformerDecoderCompressor.
+
+    Because the output has no spatial grid, the queries carry no (h, w) coordinate for
+    cross-attention either: cross_rotary_q is left None, which CrossFlashAttention2
+    treats as "every query sits at coordinate 0" (see its forward() docstring) — the
+    same convention LocalAttnConvCompressor's cross-attn already relies on. Only the
+    input KV tokens' real (t, h_i, w_i) coordinates get a rotary table; self-attention
+    among the queries drops RoPE entirely (rotary_pos_emb=None — see
+    selfFlashAttention's guard) since positional identity is already baked additively
+    into the query embedding before the layer stack runs.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        num_layers = config.num_layers
+        head_dim = config.hidden_size // config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = head_dim
+        self.num_head = config.num_attention_heads
+        self.num_queries = getattr(config, "num_queries", 32)
+
+        # KV-side (input tokens) 3-D (t, h, w) rotary — same role as
+        # TransformerDecoderCompressor.cross_rotary, query side unused (see above).
+        self.cross_rotary = VisionRotaryEmbedding(dim=head_dim)
+        self.layers = nn.ModuleList([TransformerDecoderLayer(config) for _ in range(num_layers)])
+        self.num_layers = num_layers
+
+        # Learned per-slot content (small-scale init, std=0.02) + fixed sin/cos
+        # positional encoding over the flat index, added together once before the
+        # layer stack (not re-applied per layer — the residual connections in
+        # TransformerDecoderLayer carry it forward, same as a standard Transformer
+        # decoder's input embedding + positional encoding).
+        self.query = nn.Parameter(torch.randn(1, self.num_queries, config.hidden_size) * 0.02)
+        self.register_buffer(
+            "pos_encoding",
+            _build_sinusoidal_position_encoding(self.num_queries, config.hidden_size),
+            persistent=False,
+        )
+        self.window_size = getattr(config, "window_size", 1)
+
+    def output_hw_for(self, h: int, w: int):
+        # Flat output, no 2-D grid — (1, num_queries) so callers' oh*ow arithmetic
+        # (arch.py) still yields the right total token count.
+        return 1, self.num_queries
+
+    def _build_cross_rotary_kv(self, compression_cu_seqlens, device, grid_hws):
+        """KV-side-only counterpart of TransformerDecoderCompressor._build_cross_rotary_3d
+        (see its docstring) — no query-side coordinates are built here since queries
+        carry no rotary at all (class docstring)."""
+        window_lens = (compression_cu_seqlens[1:] - compression_cu_seqlens[:-1]).long()
+        B = window_lens.shape[0]
+        assert len(grid_hws) == B, (
+            f"TransformerDecoderFlatCompressor: grid_hws must have one (h, w) per "
+            f"window ({B} windows), got {len(grid_hws)}."
+        )
+
+        inv_freq = self.cross_rotary.inv_freq  # (head_dim // 2,)
+        D = inv_freq.shape[0]
+        d_t = D // 3
+        d_h = (D - d_t) // 2
+        d_w = D - d_t - d_h
+        dims = [d_t, d_h, d_w]
+
+        kv_t, kv_h, kv_w = [], [], []
+        for i in range(B):
+            h_i, w_i = grid_hws[i]
+            hw_i = h_i * w_i
+            assert window_lens[i].item() % hw_i == 0, (
+                f"TransformerDecoderFlatCompressor: window {i}'s token count "
+                f"({window_lens[i].item()}) must be divisible by its grid_hws "
+                f"h*w={hw_i} (h={h_i}, w={w_i})."
+            )
+            T_i = window_lens[i].item() // hw_i
+            hpos_i = torch.arange(h_i, device=device).unsqueeze(1).expand(-1, w_i).reshape(-1)
+            wpos_i = torch.arange(w_i, device=device).unsqueeze(0).expand(h_i, -1).reshape(-1)
+            kv_t.append(torch.arange(T_i, device=device).repeat_interleave(hw_i))
+            kv_h.append(hpos_i.repeat(T_i))
+            kv_w.append(wpos_i.repeat(T_i))
+        kv_t = torch.cat(kv_t); kv_h = torch.cat(kv_h); kv_w = torch.cat(kv_w)
+        return _build_factorized_rotary(inv_freq, [kv_t, kv_h, kv_w], dims)
+
+    def forward(self, kv, compression_cu_seqlens, grid_hws):
+        # kv: (1, total_tokens, hidden_size) or (total_tokens, hidden_size)
+        # grid_hws: required (one (h, w) per window) — this compressor has no fixed
+        # compress_image_h/w to fall back on.
+        if kv.dim() == 3:
+            kv = kv.squeeze(0)
+        B = compression_cu_seqlens.size(0) - 1
+        if grid_hws is None:
+            raise ValueError(
+                "TransformerDecoderFlatCompressor has no 2-D output grid to fall back "
+                "on — grid_hws (one (h, w) per window) is required, not optional."
+            )
+
+        query = self.query + self.pos_encoding.to(dtype=self.query.dtype)  # (1, num_queries, hidden)
+        query = query.expand(B, -1, -1).contiguous().view(-1, kv.size(-1))
+        cu_seqlens_q = torch.arange(
+            0, (B + 1) * self.num_queries, step=self.num_queries,
+            device=kv.device, dtype=torch.int32,
+        ).contiguous()
+        compression_cu_seqlens = compression_cu_seqlens.to(device=kv.device, dtype=torch.int32).contiguous()
+        cross_rotary_kv = self._build_cross_rotary_kv(compression_cu_seqlens, kv.device, grid_hws)
+        for layer in self.layers:
+            query = layer(
+                query, kv, cu_seqlens_q, compression_cu_seqlens,
+                rotary_pos_emb=None, cross_rotary_q=None, cross_rotary_kv=cross_rotary_kv,
+            )
         return query
 
 
@@ -684,12 +826,17 @@ from transformers import PretrainedConfig
 class Videollama3TokenCompressorConfig(PretrainedConfig):
     model_type = "videollama3_token_compressor"
 
-    # compressor_type: "transformer_decoder" | "local_attn_conv" | "siglip_ae"
+    # compressor_type: "transformer_decoder" | "transformer_decoder_flat" |
+    #                  "local_attn_conv" | "siglip_ae"
     #   "siglip_ae" is a faithful port of Video-XL-Pro's SiglipAE (see dts.py) — unlike
     #   the other two, its depth is fixed at construction from `window_size`
     #   (log2(window_size) stride-2 Conv3d stages), so every compression window given
     #   to it must contain exactly `window_size` frames; `window_size` must be set
     #   explicitly (a power of two >= 2) when selecting this type.
+    #   "transformer_decoder_flat" outputs `num_queries` flat tokens (sin/cos
+    #   positional encoding over their flat index) instead of the 2-D
+    #   compress_image_h x compress_image_w grid the other transformer_decoder variant
+    #   and local_attn_conv use — see TransformerDecoderFlatCompressor's docstring.
     def __init__(
         self,
         compressor_type="transformer_decoder",
@@ -702,6 +849,7 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         compress_image_w=16,
         compress_image_h=16,
         window_size=1,
+        num_queries=32,
         **kwargs,
     ):
 
@@ -716,7 +864,8 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         self.compress_image_w = compress_image_w
         self.compress_image_h = compress_image_h
         self.window_size = window_size
-        
+        self.num_queries = num_queries
+
 def build_token_compressor(config):
     compressor = getattr(config, 'token_compressor_config', None)
     if compressor is None:
@@ -741,6 +890,8 @@ def build_token_compressor(config):
         compressor = Videollama3TokenCompressorConfig(**compressor)
     if isinstance(compressor, Videollama3TokenCompressorConfig):
         ct = compressor.compressor_type
+        if ct == "transformer_decoder_flat":
+            return TransformerDecoderFlatCompressor(config=compressor)
         if "transformer_decoder" in ct:
             return TransformerDecoderCompressor(config=compressor)
         if ct == "local_attn_conv":
