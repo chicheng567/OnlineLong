@@ -63,6 +63,48 @@ def _build_factorized_rotary(inv_freq: torch.Tensor, coords_list, dims_list) -> 
     return torch.cat(parts, dim=-1)  # (N, sum(dims_list)) == (N, head_dim // 2)
 
 
+def prune_kv_by_common_component(kv, compression_cu_seqlens, grid_hws, ratio, min_tokens=0):
+    """Training-time redundancy pruning of the compressor's KV.
+
+    Per window, drop the ``ratio`` fraction of tokens whose direction is closest
+    (cosine) to that window's *common component* -- the L2-normalised mean of its
+    tokens. A token that is almost entirely the common component adds little unique
+    signal, so it is the cheapest to remove.
+
+    Survivors keep their ORIGINAL flat position within the window, so
+    ``_build_cross_rotary_3d`` / ``_build_cross_rotary_kv`` give each the same
+    ``(t, h, w)`` (and hence the same RoPE angle) it would have in the un-pruned
+    window; the dropped tokens simply never enter the KV.
+
+    Returns ``(kv_pruned, cu_pruned, kept_idx)`` where ``kept_idx[i]`` is a sorted
+    1-D LongTensor of survivor flat indices into window i's dense ``[0, L_i)`` range
+    (or ``None`` when that window was left intact). Deterministic (topk, no RNG).
+    """
+    device = kv.device
+    cu = compression_cu_seqlens.tolist()
+    parts, kept, new_cu = [], [], [0]
+    for i in range(len(cu) - 1):
+        w = kv[cu[i]:cu[i + 1]]
+        length = w.shape[0]
+        hw = int(grid_hws[i][0]) * int(grid_hws[i][1])
+        floor = max(1, int(min_tokens) if min_tokens and min_tokens > 0 else hw)
+        n_keep = max(floor, length - int(round(length * ratio)))
+        if n_keep >= length:
+            parts.append(w); kept.append(None); new_cu.append(new_cu[-1] + length)
+            continue
+        with torch.no_grad():
+            x = w.float()
+            c = torch.nn.functional.normalize(x.mean(dim=0), dim=0)
+            sim = torch.nn.functional.normalize(x, dim=1) @ c
+            keep_i = torch.topk(sim, n_keep, largest=False).indices.sort().values
+        parts.append(w.index_select(0, keep_i))
+        kept.append(keep_i)
+        new_cu.append(new_cu[-1] + n_keep)
+    kv_pruned = torch.cat(parts, dim=0)
+    cu_pruned = torch.tensor(new_cu, device=device, dtype=compression_cu_seqlens.dtype)
+    return kv_pruned, cu_pruned, kept
+
+
 class mlp(nn.Module):
     def __init__(self, hidden_size, intermediate_size):
         super().__init__()
@@ -232,6 +274,10 @@ class TransformerDecoderCompressor(nn.Module):
         # Learned query tokens (small-scale init, std=0.02).
         self.query = nn.Parameter(torch.randn(1, self.compress_image_w * self.compress_image_h, config.hidden_size) * 0.02)
         self.window_size = getattr(config, "window_size", 1)
+        # Training-only common-component KV pruning (see prune_kv_by_common_component).
+        # 0 disables; applied only in .train() mode so inference always sees the full KV.
+        self.token_prune_ratio = float(getattr(config, "token_prune_ratio", 0.0) or 0.0)
+        self.token_prune_min_tokens = int(getattr(config, "token_prune_min_tokens", 0) or 0)
 
     def _build_query_rotary_pos_emb(self, w, h) -> torch.Tensor:
         return _build_2d_rotary_pos_emb(self.rotary_pos_emb, w, h)
@@ -243,19 +289,22 @@ class TransformerDecoderCompressor(nn.Module):
         per compression part without hardcoding compress_image_h/w themselves."""
         return self.compress_image_h, self.compress_image_w
 
-    def _build_cross_rotary_3d(self, compression_cu_seqlens, device, grid_hws):
+    def _build_cross_rotary_3d(self, compression_cu_seqlens, device, grid_hws, kept_idx=None):
         """
         Build 3-D (t, h, w) rotary tables for the cross-attention.
 
         Queries: one HW grid per window, all anchored at temporal slot 0 with their
         2-D spatial coordinates (compressor's own fixed output grid,
-        compress_image_h × compress_image_w). Keys: the window's T×(h_i×w_i) input
-        tokens in frame-major order — temporal coordinate = frame index, spatial
-        coordinate = position within the frame, using PER-WINDOW (h_i, w_i) from
-        `grid_hws` (one entry per window; may differ window-to-window and from the
-        query's output grid — that's what lets this compressor accept input frames
-        whose patch grid doesn't match compress_image_h/w). Returns
-        (q_freqs, kv_freqs), each (N, head_dim // 2).
+        compress_image_h × compress_image_w). Keys: the window's input tokens —
+        temporal coordinate = frame index, spatial coordinate = position within the
+        frame, using PER-WINDOW (h_i, w_i) from `grid_hws`.
+
+        By default (`kept_idx=None`) window i is assumed dense frame-major
+        (T_i×h_i×w_i tokens, in order). If `kept_idx` is given (one 1-D LongTensor
+        per window, flat indices into that dense layout), the KV already holds only
+        those tokens and each is given the (t, h, w) of its ORIGINAL flat index —
+        so a surviving token's RoPE angle is byte-identical to the un-pruned clip;
+        the dropped tokens simply never enter the KV. Returns (q_freqs, kv_freqs).
         """
         window_lens = (compression_cu_seqlens[1:] - compression_cu_seqlens[:-1]).long()
         B = window_lens.shape[0]
@@ -263,6 +312,11 @@ class TransformerDecoderCompressor(nn.Module):
             f"TransformerDecoderCompressor: grid_hws must have one (h, w) per window "
             f"({B} windows), got {len(grid_hws)}."
         )
+        if kept_idx is not None:
+            assert len(kept_idx) == B, (
+                f"TransformerDecoderCompressor: kept_idx must have one entry per window "
+                f"({B}), got {len(kept_idx)}."
+            )
 
         inv_freq = self.cross_rotary.inv_freq  # (head_dim // 2,)
         D = inv_freq.shape[0]
@@ -271,22 +325,30 @@ class TransformerDecoderCompressor(nn.Module):
         d_w = D - d_t - d_h
         dims = [d_t, d_h, d_w]
 
-        # Keys: frame-major layout per window [frame0_p0..p_{h_i*w_i-1}, frame1_p0.., ...].
+        # Keys: derive each token's (t, h, w) from its flat index in the dense
+        # frame-major layout — dense == arange, pruned == the kept indices.
         kv_t, kv_h, kv_w = [], [], []
         for i in range(B):
             h_i, w_i = grid_hws[i]
             hw_i = h_i * w_i
-            assert window_lens[i].item() % hw_i == 0, (
-                f"TransformerDecoderCompressor: window {i}'s token count "
-                f"({window_lens[i].item()}) must be divisible by its grid_hws "
-                f"h*w={hw_i} (h={h_i}, w={w_i})."
-            )
-            T_i = window_lens[i].item() // hw_i
-            hpos_i = torch.arange(h_i, device=device).unsqueeze(1).expand(-1, w_i).reshape(-1)
-            wpos_i = torch.arange(w_i, device=device).unsqueeze(0).expand(h_i, -1).reshape(-1)
-            kv_t.append(torch.arange(T_i, device=device).repeat_interleave(hw_i))
-            kv_h.append(hpos_i.repeat(T_i))
-            kv_w.append(wpos_i.repeat(T_i))
+            ki = None if kept_idx is None else kept_idx[i]
+            if ki is None:
+                assert window_lens[i].item() % hw_i == 0, (
+                    f"TransformerDecoderCompressor: window {i}'s token count "
+                    f"({window_lens[i].item()}) must be divisible by its grid_hws "
+                    f"h*w={hw_i} (h={h_i}, w={w_i})."
+                )
+                idx_i = torch.arange(window_lens[i].item(), device=device)
+            else:
+                idx_i = ki.to(device=device, dtype=torch.long)
+                assert idx_i.numel() == window_lens[i].item(), (
+                    f"TransformerDecoderCompressor: window {i} kept_idx has {idx_i.numel()} "
+                    f"entries but {window_lens[i].item()} tokens were passed for it."
+                )
+            rem = idx_i % hw_i
+            kv_t.append(idx_i // hw_i)
+            kv_h.append(rem // w_i)
+            kv_w.append(rem % w_i)
         kv_t = torch.cat(kv_t); kv_h = torch.cat(kv_h); kv_w = torch.cat(kv_w)
 
         # Queries: B grids at the compressor's own fixed output resolution, all at t=0.
@@ -300,12 +362,15 @@ class TransformerDecoderCompressor(nn.Module):
         q_freqs = _build_factorized_rotary(inv_freq, [q_t, q_h, q_w], dims)
         return q_freqs, kv_freqs
 
-    def forward(self, kv, compression_cu_seqlens, grid_hws=None):
+    def forward(self, kv, compression_cu_seqlens, grid_hws=None, kept_idx=None):
         # kv: (1, total_tokens, hidden_size)
         # grid_hws: optional list of (h, w) pairs, one per window — the ACTUAL input
         # frame grid for that window (may differ from compress_image_h/w and from
-        # window to window). Defaults to compress_image_h/w for every window, matching
-        # the old fixed-grid-only behavior.
+        # window to window). Defaults to compress_image_h/w for every window.
+        # kept_idx: optional list (one per window) of flat indices into that window's
+        # dense frame-major layout; when given, kv already holds only those tokens
+        # and the cross-RoPE gives each survivor its original (t, h, w). Normally left
+        # None — the compressor prunes its own KV below when token_prune_ratio > 0.
         compression_parts = compression_cu_seqlens.size(0) - 1
         if kv.dim() == 3:
             kv = kv.squeeze(0) # (total_tokens, hidden_size)
@@ -321,8 +386,14 @@ class TransformerDecoderCompressor(nn.Module):
             dtype=torch.int32,
         ).contiguous()
         compression_cu_seqlens = compression_cu_seqlens.to(device=kv.device, dtype=torch.int32).contiguous()
+        # Training-only redundancy pruning of the KV (inference always sees the full set).
+        if kept_idx is None and self.training and self.token_prune_ratio > 0.0:
+            kv, compression_cu_seqlens, kept_idx = prune_kv_by_common_component(
+                kv, compression_cu_seqlens, grid_hws, self.token_prune_ratio, self.token_prune_min_tokens
+            )
+            compression_cu_seqlens = compression_cu_seqlens.to(dtype=torch.int32).contiguous()
         rotary_pos_emb = self._build_query_rotary_pos_emb(self.compress_image_w, self.compress_image_h)
-        cross_rotary_q, cross_rotary_kv = self._build_cross_rotary_3d(compression_cu_seqlens, kv.device, grid_hws)
+        cross_rotary_q, cross_rotary_kv = self._build_cross_rotary_3d(compression_cu_seqlens, kv.device, grid_hws, kept_idx)
         for layer in self.layers:
             query = layer(query, kv, cu_seqlens_q, compression_cu_seqlens, rotary_pos_emb,
                           cross_rotary_q, cross_rotary_kv)
@@ -376,22 +447,30 @@ class TransformerDecoderFlatCompressor(nn.Module):
             persistent=False,
         )
         self.window_size = getattr(config, "window_size", 1)
+        # Training-only common-component KV pruning (see prune_kv_by_common_component).
+        self.token_prune_ratio = float(getattr(config, "token_prune_ratio", 0.0) or 0.0)
+        self.token_prune_min_tokens = int(getattr(config, "token_prune_min_tokens", 0) or 0)
 
     def output_hw_for(self, h: int, w: int):
         # Flat output, no 2-D grid — (1, num_queries) so callers' oh*ow arithmetic
         # (arch.py) still yields the right total token count.
         return 1, self.num_queries
 
-    def _build_cross_rotary_kv(self, compression_cu_seqlens, device, grid_hws):
+    def _build_cross_rotary_kv(self, compression_cu_seqlens, device, grid_hws, kept_idx=None):
         """KV-side-only counterpart of TransformerDecoderCompressor._build_cross_rotary_3d
-        (see its docstring) — no query-side coordinates are built here since queries
-        carry no rotary at all (class docstring)."""
+        (see its docstring, including the `kept_idx` token-pruning contract) — no
+        query-side coordinates are built here since queries carry no rotary at all."""
         window_lens = (compression_cu_seqlens[1:] - compression_cu_seqlens[:-1]).long()
         B = window_lens.shape[0]
         assert len(grid_hws) == B, (
             f"TransformerDecoderFlatCompressor: grid_hws must have one (h, w) per "
             f"window ({B} windows), got {len(grid_hws)}."
         )
+        if kept_idx is not None:
+            assert len(kept_idx) == B, (
+                f"TransformerDecoderFlatCompressor: kept_idx must have one entry per "
+                f"window ({B}), got {len(kept_idx)}."
+            )
 
         inv_freq = self.cross_rotary.inv_freq  # (head_dim // 2,)
         D = inv_freq.shape[0]
@@ -404,24 +483,34 @@ class TransformerDecoderFlatCompressor(nn.Module):
         for i in range(B):
             h_i, w_i = grid_hws[i]
             hw_i = h_i * w_i
-            assert window_lens[i].item() % hw_i == 0, (
-                f"TransformerDecoderFlatCompressor: window {i}'s token count "
-                f"({window_lens[i].item()}) must be divisible by its grid_hws "
-                f"h*w={hw_i} (h={h_i}, w={w_i})."
-            )
-            T_i = window_lens[i].item() // hw_i
-            hpos_i = torch.arange(h_i, device=device).unsqueeze(1).expand(-1, w_i).reshape(-1)
-            wpos_i = torch.arange(w_i, device=device).unsqueeze(0).expand(h_i, -1).reshape(-1)
-            kv_t.append(torch.arange(T_i, device=device).repeat_interleave(hw_i))
-            kv_h.append(hpos_i.repeat(T_i))
-            kv_w.append(wpos_i.repeat(T_i))
+            ki = None if kept_idx is None else kept_idx[i]
+            if ki is None:
+                assert window_lens[i].item() % hw_i == 0, (
+                    f"TransformerDecoderFlatCompressor: window {i}'s token count "
+                    f"({window_lens[i].item()}) must be divisible by its grid_hws "
+                    f"h*w={hw_i} (h={h_i}, w={w_i})."
+                )
+                idx_i = torch.arange(window_lens[i].item(), device=device)
+            else:
+                idx_i = ki.to(device=device, dtype=torch.long)
+                assert idx_i.numel() == window_lens[i].item(), (
+                    f"TransformerDecoderFlatCompressor: window {i} kept_idx has "
+                    f"{idx_i.numel()} entries but {window_lens[i].item()} tokens were passed."
+                )
+            rem = idx_i % hw_i
+            kv_t.append(idx_i // hw_i)
+            kv_h.append(rem // w_i)
+            kv_w.append(rem % w_i)
         kv_t = torch.cat(kv_t); kv_h = torch.cat(kv_h); kv_w = torch.cat(kv_w)
         return _build_factorized_rotary(inv_freq, [kv_t, kv_h, kv_w], dims)
 
-    def forward(self, kv, compression_cu_seqlens, grid_hws):
+    def forward(self, kv, compression_cu_seqlens, grid_hws, kept_idx=None):
         # kv: (1, total_tokens, hidden_size) or (total_tokens, hidden_size)
         # grid_hws: required (one (h, w) per window) — this compressor has no fixed
         # compress_image_h/w to fall back on.
+        # kept_idx: optional list (one per window) of flat indices into that window's
+        # dense frame-major layout; kv then holds only those tokens, each keeping its
+        # original (t, h, w) in the cross-RoPE.
         if kv.dim() == 3:
             kv = kv.squeeze(0)
         B = compression_cu_seqlens.size(0) - 1
@@ -438,7 +527,13 @@ class TransformerDecoderFlatCompressor(nn.Module):
             device=kv.device, dtype=torch.int32,
         ).contiguous()
         compression_cu_seqlens = compression_cu_seqlens.to(device=kv.device, dtype=torch.int32).contiguous()
-        cross_rotary_kv = self._build_cross_rotary_kv(compression_cu_seqlens, kv.device, grid_hws)
+        # Training-only redundancy pruning of the KV (inference always sees the full set).
+        if kept_idx is None and self.training and self.token_prune_ratio > 0.0:
+            kv, compression_cu_seqlens, kept_idx = prune_kv_by_common_component(
+                kv, compression_cu_seqlens, grid_hws, self.token_prune_ratio, self.token_prune_min_tokens
+            )
+            compression_cu_seqlens = compression_cu_seqlens.to(dtype=torch.int32).contiguous()
+        cross_rotary_kv = self._build_cross_rotary_kv(compression_cu_seqlens, kv.device, grid_hws, kept_idx)
         for layer in self.layers:
             query = layer(
                 query, kv, cu_seqlens_q, compression_cu_seqlens,
@@ -850,6 +945,8 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         compress_image_h=16,
         window_size=1,
         num_queries=32,
+        token_prune_ratio=0.0,
+        token_prune_min_tokens=0,
         **kwargs,
     ):
 
@@ -865,6 +962,10 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         self.compress_image_h = compress_image_h
         self.window_size = window_size
         self.num_queries = num_queries
+        # Training-only common-component KV pruning; only transformer_decoder /
+        # transformer_decoder_flat read these (0 = disabled).
+        self.token_prune_ratio = token_prune_ratio
+        self.token_prune_min_tokens = token_prune_min_tokens
 
 def build_token_compressor(config):
     compressor = getattr(config, 'token_compressor_config', None)

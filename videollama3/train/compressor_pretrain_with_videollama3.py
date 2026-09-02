@@ -61,6 +61,7 @@ collator builds still holds the uncompressed ``T x HW`` image tokens (256 per fr
 it and the compression part no longer lines up; samples that would overflow are
 skipped with a warning. Bound it with ``--max_frames`` / ``--fixed_frames``.
 """
+import bisect
 import copy
 from dataclasses import dataclass, field
 import json
@@ -137,6 +138,29 @@ def get_video_content(messages: List[Dict]) -> Dict:
         f"(multi-turn online data is not supported here)."
     )
     return contents[0]
+
+
+def _rewrite_image_block_as_single_frame_video(messages: List[Dict]) -> None:
+    """In-place: turn ``_convert_normal``'s ``{"type": "image"}`` content block into a
+    one-frame ``{"type": "video"}`` block, so a still image flows through the
+    whole-video compression path unchanged.
+
+    ``get_video_content`` then finds its single video block, ``content["num_frames"]``
+    is 1, the one compression part covers the frame's ``HW`` tokens, and -- because no
+    timestamps are attached -- ``build_range_ts_info`` returns ``[(0, [])]`` and the
+    chat template renders a single bare ``<image>`` token with no ``"Time X.0s:"``
+    prefix. The image is still fed to ``vlprocessor`` as raw pixels (``merge_size`` is
+    switched to ``video_merge_size`` by the caller so one 448px frame yields the same
+    ``HW`` tokens a cached video frame does).
+    """
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        for content in message.get("content", []):
+            if isinstance(content, dict) and content.get("type") == "image":
+                content.pop("timestamp", None)
+                content["type"] = "video"
+                content["num_frames"] = 1
 
 
 def resample_indices(num_frames: int, target: int) -> List[int]:
@@ -406,9 +430,16 @@ class GlobalCompressorLazySupervisedDataset(LazySupervisedDataset):
                     modal, images, messages, merge_size = self._convert_online_video(sample)
                 else:
                     modal, images, messages, merge_size = self._convert_normal(sample)
+                is_still_image = modal == "image"
+                if is_still_image:
+                    # Compress a still image as a one-frame video (see helper). The
+                    # pixels stay raw; only the content block and merge_size change.
+                    _rewrite_image_block_as_single_frame_video(messages)
+                    modal, merge_size = "video", self.data_args.video_merge_size
                 assert modal == "video", "Compressor training currently only supports video data."
                 content = get_video_content(messages)
-                if self.fixed_frames > 0:
+                # fixed_frames is a temporal resample; a still image stays at T=1.
+                if self.fixed_frames > 0 and not is_still_image:
                     images = resample_video_frames(images, content, self.fixed_frames)
                 data_dict = self.vlprocessor(
                     images=images,
@@ -482,6 +513,22 @@ class ModelArguments:
                           "flat index, replacing the other transformer_decoder variant's "
                           "compress_image_h x compress_image_w spatial grid)."},
     )
+    # Training-only common-component TOKEN pruning of the compressor input. A pure
+    # compressor hyperparameter (like num_queries): it rides into the compressor via
+    # token_compressor_config and only the compressor's .forward acts on it, in
+    # .train() mode. Only transformer_decoder / transformer_decoder_flat honour it
+    # (their cross-RoPE is rebuilt from each kept token's original (t, h, w)).
+    token_prune_ratio: float = field(
+        default=0.0,
+        metadata={"help": "Fraction of each window's vision tokens the compressor drops (per window) "
+                          "before its cross-attention, choosing the tokens whose direction is closest "
+                          "to the window's common component (L2-normalised mean). 0 disables. "
+                          "Inference always sees the full set."},
+    )
+    token_prune_min_tokens: int = field(
+        default=0,
+        metadata={"help": "Floor on tokens the compressor keeps per window (0 = one frame's worth, h*w)."},
+    )
     pretrained_compressor_path: Optional[str] = field(
         default=None,
         metadata={"help": "Optional compressor_pretrained.pt from AE pretraining, loaded into token_compressor."},
@@ -511,6 +558,19 @@ class DataArguments:
         default=0,
         metadata={"help": "Resample every video to exactly this many frames (0 = keep as decoded). "
                           "Must be a power of two >= 2 for compressor_type=siglip_ae."},
+    )
+    separate_modality_batches: bool = field(
+        default=False,
+        metadata={"help": "Keep the fixed per_device_train_batch_size but force every collated "
+                          "micro-batch to a SINGLE pixel_values modality -- cached .pt vision "
+                          "feature ((T*HW, C)) vs decoded pixels ((N, 3*patch**2), i.e. a still "
+                          "image or a decoded video) -- so a mixed annotation trains without "
+                          "DataCollatorWithCompressor's torch.cat hitting mismatched feature dims. "
+                          "Different ranks / grad-accum steps may still carry different modalities "
+                          "in one optimizer step (safe: the vision encoder is frozen and the "
+                          "compressor runs on every sample). Each modality's tail remainder "
+                          "(< batch_size) is dropped and re-diced every epoch. False = stock "
+                          "fixed-size batching."},
     )
     validation_split_rate: float = field(
         default=0,
@@ -617,7 +677,167 @@ def _build_token_compressor_config(
         "window_size": data_args.fixed_frames if model_args.compressor_type == "siglip_ae" else 0,
         # Only transformer_decoder_flat reads this; harmless for the other types.
         "num_queries": model_args.num_queries,
+        # Training-only KV pruning; only transformer_decoder / transformer_decoder_flat act on it.
+        "token_prune_ratio": model_args.token_prune_ratio,
+        "token_prune_min_tokens": model_args.token_prune_min_tokens,
     }
+
+
+# ---------------------------------------------------------------------------
+# Mixed cached-feature + decoded annotation: single-modality micro-batches
+# ---------------------------------------------------------------------------
+#
+# A cached ``.pt`` feature sample carries ``pixel_values`` of shape ``(T*HW, C)``
+# (``C == vision_encoder.hidden_size``); a decoded still-image or video sample
+# carries raw patches ``(N, 3*patch**2)``. ``DataCollatorWithCompressor`` joins the
+# micro-batch's ``pixel_values`` with a single ``torch.cat``, so the two kinds cannot
+# share one collated micro-batch -- but they CAN sit on different ranks / grad-accum
+# steps of the same optimizer step: the encoder is frozen and the compressor runs on
+# every sample regardless of modality. ``--separate_modality_batches`` keeps the fixed
+# ``per_device_train_batch_size`` and only guarantees the per-micro-batch homogeneity.
+
+
+def _leaf_and_local_index(dataset, index: int):
+    """Walk ``Subset`` / ``ConcatDataset`` wrappers down to the leaf dataset that
+    owns global ``index``; returns ``(leaf_dataset, local_index)`` without touching
+    ``__getitem__`` (no decode)."""
+    if isinstance(dataset, torch.utils.data.Subset):
+        return _leaf_and_local_index(dataset.dataset, dataset.indices[index])
+    if isinstance(dataset, torch.utils.data.ConcatDataset):
+        ds_idx = bisect.bisect_right(dataset.cumulative_sizes, index)
+        local = index if ds_idx == 0 else index - dataset.cumulative_sizes[ds_idx - 1]
+        return _leaf_and_local_index(dataset.datasets[ds_idx], local)
+    return dataset, index
+
+
+def _feature_modality_flags(train_dataset) -> List[int]:
+    """``1`` if the sample is read from a cached ``.pt`` vision feature (``pixel_values``
+    shape ``(T*HW, C)``), ``0`` if it is decoded pixels (still image or decoded video,
+    shape ``(N, 3*patch**2)``). The two cannot share a ``torch.cat`` in
+    ``DataCollatorWithCompressor``. Read straight from each leaf dataset's own
+    ``_feature_path`` -- the same test ``__getitem__`` dispatches on -- with no decode."""
+    flags: List[int] = []
+    for i in range(len(train_dataset)):
+        leaf, local = _leaf_and_local_index(train_dataset, i)
+        sample = leaf.list_data_dict[local]
+        flags.append(1 if leaf._feature_path(sample) is not None else 0)
+    return flags
+
+
+class _ModalityGroupedBatchSampler(torch.utils.data.Sampler):
+    """Yields fixed-size (``batch_size``) index batches, each from a SINGLE modality
+    (``_feature_modality_flags``). Batch order is shuffled; each modality's tail
+    remainder (``< batch_size``) is dropped. The full-batch count per modality is
+    ``len(idx) // batch_size`` regardless of the shuffle, so ``__len__`` is stable
+    across epochs -- ``set_epoch`` only re-dices membership and order."""
+
+    def __init__(self, modality_flags, batch_size: int, seed: int = 42):
+        self.mod = [int(m) for m in modality_flags]
+        self.batch_size = max(1, int(batch_size))
+        self.seed = int(seed)
+        self.epoch = 0
+        self._batches: List[List[int]] = self._build()
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        self._batches = self._build()
+
+    def _build(self) -> List[List[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        by_mod: Dict[int, List[int]] = {}
+        for i, m in enumerate(self.mod):
+            by_mod.setdefault(m, []).append(i)
+        batches: List[List[int]] = []
+        for m in sorted(by_mod):
+            idx = by_mod[m]
+            rng.shuffle(idx)
+            for s in range(0, len(idx) - self.batch_size + 1, self.batch_size):
+                batches.append(idx[s:s + self.batch_size])
+        rng.shuffle(batches)
+        return batches
+
+    def batches_per_modality(self) -> Dict[int, int]:
+        out: Dict[int, int] = {}
+        for b in self._batches:
+            m = self.mod[b[0]]
+            out[m] = out.get(m, 0) + 1
+        return out
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+    def __iter__(self):
+        return iter(self._batches)
+
+
+class _ModalityBatchSamplerEpochCallback(transformers.TrainerCallback):
+    """Re-dice the modality-separated batch sampler at each epoch boundary."""
+
+    def __init__(self, trainer):
+        self._trainer = trainer
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        sampler = getattr(self._trainer, "_modality_batch_sampler", None)
+        if sampler is not None:
+            sampler.set_epoch(int(state.epoch or 0))
+
+
+class ModalitySeparatedBatchCompressorTrainer(VideoLLaMA3Trainer):
+    """``VideoLLaMA3Trainer`` that keeps the fixed ``per_device_train_batch_size`` but
+    drives the train loader from a ``_ModalityGroupedBatchSampler`` so every collated
+    micro-batch is one ``pixel_values`` modality (see the module comment above)."""
+
+    def __init__(self, *args, modality_flags=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._modality_flags = modality_flags
+        self._modality_batch_sampler = None
+
+    def get_train_dataloader(self):
+        if self._modality_flags is None:
+            return super().get_train_dataloader()
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        batch_sampler = _ModalityGroupedBatchSampler(
+            modality_flags=self._modality_flags,
+            batch_size=self.args.per_device_train_batch_size,
+            seed=self.args.seed,
+        )
+        self._modality_batch_sampler = batch_sampler
+
+        n_feat = sum(batch_sampler.mod)
+        per_mod = batch_sampler.batches_per_modality()
+        rank0_print(
+            f"[INFO] modality-separated batching: batch_size={self.args.per_device_train_batch_size}, "
+            f"{len(batch_sampler)} batches/epoch "
+            f"({per_mod.get(0, 0)} decoded-pixel + {per_mod.get(1, 0)} cached-feature), "
+            f"from {len(batch_sampler.mod) - n_feat} decoded + {n_feat} cached-feature samples "
+            f"(per-modality tail remainder dropped, re-diced each epoch)."
+        )
+        if per_mod.get(0, 0) == 0 or per_mod.get(1, 0) == 0:
+            rank0_print(
+                "[WARN] modality-separated batching: one modality yielded 0 full batches "
+                "(fewer than per_device_train_batch_size samples of it) -- those samples go unused."
+            )
+
+        params: Dict = {
+            "batch_sampler": batch_sampler,
+            "collate_fn": self.data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+        }
+        if self.args.dataloader_num_workers > 0:
+            if getattr(self.args, "dataloader_persistent_workers", False):
+                params["persistent_workers"] = True
+            pf = getattr(self.args, "dataloader_prefetch_factor", None)
+            if pf:
+                params["prefetch_factor"] = pf
+        loader = torch.utils.data.DataLoader(self.train_dataset, **params)
+        # Every batch is exactly per_device_train_batch_size, so batch_sampler.batch_size
+        # is set and Accelerate's BatchSamplerShard shards whole batches round-robin with
+        # even_batches left at its default (a few whole -- still single-modality -- batches
+        # may repeat at epoch end to keep every rank's step count equal).
+        return self.accelerator.prepare(loader)
 
 
 def train(attn_implementation=None):
@@ -626,6 +846,21 @@ def train(attn_implementation=None):
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    if model_args.token_prune_ratio > 0 and model_args.compressor_type not in (
+        "transformer_decoder", "transformer_decoder_flat"
+    ):
+        raise ValueError(
+            f"--token_prune_ratio is only supported with compressor_type 'transformer_decoder' or "
+            f"'transformer_decoder_flat' (got '{model_args.compressor_type}'): only their cross-attention "
+            f"RoPE is rebuilt from each kept token's original (t, h, w). Disable one of them."
+        )
+
+    if data_args.separate_modality_batches and training_args.group_by_modality_length:
+        rank0_print(
+            "[WARN] --separate_modality_batches drives the train loader from its own batch sampler; "
+            "--group_by_modality_length is ignored while it is on."
+        )
 
     if model_args.compressor_type == "siglip_ae":
         n = data_args.fixed_frames
@@ -836,7 +1071,8 @@ def train(attn_implementation=None):
         f"{model_args.compress_image_w * model_args.compress_image_h} tokens "
         f"(compressor_type={model_args.compressor_type}, "
         f"max_frames={data_args.max_frames}, "
-        f"fixed_frames={data_args.fixed_frames or 'off'})"
+        f"fixed_frames={data_args.fixed_frames or 'off'}, "
+        f"token_prune_ratio={model_args.token_prune_ratio or 'off'})"
     )
 
     data_module = make_global_compressor_data_module(
@@ -847,7 +1083,20 @@ def train(attn_implementation=None):
         dtype=compute_dtype,
     )
 
-    trainer = VideoLLaMA3Trainer(
+    modality_flags = None
+    if data_args.separate_modality_batches:
+        modality_flags = _feature_modality_flags(data_module["train_dataset"])
+        n_feat = sum(modality_flags)
+        rank0_print(
+            f"[INFO] separate_modality_batches: {len(modality_flags) - n_feat} decoded-pixel + "
+            f"{n_feat} cached-feature samples -> modality-separated fixed-size batching "
+            f"(per_device_train_batch_size kept)."
+        )
+
+    trainer_cls = (
+        ModalitySeparatedBatchCompressorTrainer if modality_flags is not None else VideoLLaMA3Trainer
+    )
+    trainer_kwargs = dict(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
@@ -857,6 +1106,11 @@ def train(attn_implementation=None):
         full_loss_weight=0.0,
         **data_module,
     )
+    if modality_flags is not None:
+        trainer_kwargs["modality_flags"] = modality_flags
+    trainer = trainer_cls(**trainer_kwargs)
+    if modality_flags is not None:
+        trainer.add_callback(_ModalityBatchSamplerEpochCallback(trainer))
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
