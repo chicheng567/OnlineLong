@@ -287,10 +287,42 @@ class VideoLLaMA3Trainer(Trainer):
             log_dict["loss_partial"] = (self.partial_loss_weight * l_partial).detach().item()
         if l_full is not None:
             log_dict["loss_full"] = (self.full_loss_weight * l_full).detach().item()
+
+        # Option B: distribution-match aux loss stashed on the token compressor
+        # during the CE forward (compressor._distribution_match_loss). Added here so
+        # it shows up as its own logged term. No-op unless
+        # --compressor_distr_loss_weight > 0.
+        aux = self._compressor_distr_loss(model)
+        if aux is not None and loss is not None:
+            loss = loss + aux
+            log_dict["loss_distr"] = aux.detach().item()
+
         if log_dict:
             self.log(log_dict)
 
         return (loss, outputs) if return_outputs else loss
+
+    def _compressor_distr_loss(self, model):
+        """Return the already-weighted Option-B distribution-match loss stashed on
+        the token compressor by the most recent CE forward, or None when disabled /
+        absent. With use_dual_forward the stash reflects the LAST (full) window
+        only; the recipes that enable this weight run a single forward."""
+        comp = None
+        try:
+            comp = self.accelerator.unwrap_model(model).get_token_compressor()
+        except Exception:
+            for attr in ("module", "base_model"):
+                inner = getattr(model, attr, None)
+                if inner is not None and hasattr(inner, "get_token_compressor"):
+                    comp = inner.get_token_compressor()
+                    break
+        if comp is None:
+            return None
+        w = float(getattr(comp, "distr_loss_weight", 0.0) or 0.0)
+        raw = getattr(comp, "_last_distr_loss", None)
+        if w <= 0.0 or raw is None:
+            return None
+        return w * raw
 
     def _get_train_sampler(self, dataset: Optional[torch.utils.data.Dataset] = None) -> Optional[torch.utils.data.Sampler]:
         dataset = dataset if dataset is not None else self.train_dataset

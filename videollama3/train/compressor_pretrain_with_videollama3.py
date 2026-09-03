@@ -533,6 +533,23 @@ class ModelArguments:
         default=None,
         metadata={"help": "Optional compressor_pretrained.pt from AE pretraining, loaded into token_compressor."},
     )
+    # Keep the compressed tokens on the frozen encoder / mm_projector's feature
+    # scale. Both ride into the compressor via token_compressor_config;
+    # transformer_decoder / transformer_decoder_flat only.
+    match_encoder_scale: bool = field(
+        default=False,
+        metadata={"help": "Option A: affine-map each compressed window's per-dim mean/std onto the "
+                          "compressor's own KV input (the frozen encoder tokens) + a learnable "
+                          "per-channel gamma/beta. Applies at train AND inference. Fixes the ~26x "
+                          "compressed/raw norm gap deterministically."},
+    )
+    compressor_distr_loss_weight: float = field(
+        default=0.0,
+        metadata={"help": "Option B: weight on the CORAL-style distribution-match aux loss "
+                          "(compressed token cloud -> encoder token manifold: centroid + covariance "
+                          "+ token-norm), added to the CE loss by the trainer. 0 = off. Composes "
+                          "with --match_encoder_scale (which only fixes the covariance diagonal)."},
+    )
 
 
 @dataclass
@@ -680,6 +697,9 @@ def _build_token_compressor_config(
         # Training-only KV pruning; only transformer_decoder / transformer_decoder_flat act on it.
         "token_prune_ratio": model_args.token_prune_ratio,
         "token_prune_min_tokens": model_args.token_prune_min_tokens,
+        # Option A / Option B -- keep compressed tokens on the frozen-encoder scale.
+        "match_encoder_scale": model_args.match_encoder_scale,
+        "distr_loss_weight": model_args.compressor_distr_loss_weight,
     }
 
 

@@ -105,6 +105,114 @@ def prune_kv_by_common_component(kv, compression_cu_seqlens, grid_hws, ratio, mi
     return kv_pruned, cu_pruned, kept
 
 
+def _match_encoder_scale(compressed, ref_mean, ref_std, gamma, beta):
+    """Option A -- put the compressor output back on the frozen-encoder scale.
+
+    Affine-maps the compressed set's per-dim mean / std onto the encoder tokens'
+    (``ref_mean`` / ``ref_std``, taken from the compressor's OWN KV input this
+    forward -- i.e. the very tokens the frozen ``mm_projector`` was trained on),
+    then applies a learnable per-channel ``gamma`` / ``beta`` (identity at init).
+
+    Deterministic and runs at train *and* inference, so the compressed tokens
+    stop drifting ~26x above the encoder-token norm the projector expects. Grad
+    flows through ``compressed``; ``ref_*`` are detached.
+    """
+    x = compressed.float()
+    m = x.mean(0, keepdim=True)
+    s = x.std(0, keepdim=True).clamp_min(1e-6)
+    x = (x - m) / s * ref_std + ref_mean
+    x = x * gamma.float() + beta.float()
+    return x.to(compressed.dtype)
+
+
+def _distribution_match_loss(compressed, ref_rows):
+    """Option B -- CORAL-style pull of the compressed token cloud onto the frozen
+    encoder-token manifold, designed to COMPOSE with ``_match_encoder_scale``
+    (which only fixes the per-dim mean / variance, i.e. the covariance diagonal).
+
+    Three terms, each a RELATIVE error bounded roughly in ``[0, 1]`` (denominator
+    detached, so it acts as a constant scale) -- this keeps the weight sane whether
+    or not Option A is also on:
+      * ``l_mean`` : ``||E[c] - E[r]||^2``                       (centroid)
+      * ``l_cov``  : ``||cov(c) - cov(r)||_F^2``                 (off-diagonal
+                     correlation structure -- the PCA-spectrum / effective-rank
+                     mismatch that the diagonal affine cannot touch)
+      * ``l_norm`` : ``(mean||c|| - mean||r||)^2``               (the headline
+                     compressed/raw norm gap)
+
+    ``ref_rows`` is a detached ``(Nr, d)`` sample of the encoder tokens;
+    ``compressed`` is ``(Nc, d)`` and carries grad.
+    """
+    eps = 1e-8
+    r = ref_rows.float()
+    c = compressed.float()
+    mr, mc = r.mean(0), c.mean(0)
+    l_mean = (mc - mr).pow(2).mean() / (mr.pow(2).mean() + mc.detach().pow(2).mean() + eps)
+    rc = r - mr
+    cc = c - mc
+    cov_r = (rc.t() @ rc) / max(r.shape[0] - 1, 1)
+    cov_c = (cc.t() @ cc) / max(c.shape[0] - 1, 1)
+    l_cov = (cov_c - cov_r).pow(2).mean() / (
+        cov_r.pow(2).mean() + cov_c.detach().pow(2).mean() + eps)
+    nr = r.norm(dim=1).mean()
+    nc = c.norm(dim=1).mean()
+    l_norm = (nc - nr).pow(2) / (nr.pow(2) + nc.detach().pow(2) + eps)
+    return l_mean + l_cov + l_norm
+
+
+def _init_encoder_scale_match(module, config):
+    """Shared __init__ tail for the transformer_decoder* compressors: read the
+    Option A / Option B knobs off ``config`` and, for A, register the learnable
+    per-channel ``out_gamma`` / ``out_beta`` (identity init). Both default off so
+    existing checkpoints load and behave unchanged."""
+    module.match_encoder_scale = bool(getattr(config, "match_encoder_scale", False))
+    if module.match_encoder_scale:
+        module.out_gamma = nn.Parameter(torch.ones(config.hidden_size))
+        module.out_beta = nn.Parameter(torch.zeros(config.hidden_size))
+    # Option B: the trainer reads distr_loss_weight + _last_distr_loss off this
+    # module and adds distr_loss_weight * _last_distr_loss to the CE loss. 0 = off.
+    module.distr_loss_weight = float(getattr(config, "distr_loss_weight", 0.0) or 0.0)
+    module.distr_loss_max_ref_tokens = int(getattr(config, "distr_loss_max_ref_tokens", 4096) or 4096)
+    module._last_distr_loss = None
+
+
+def _capture_ref_stats(module, kv):
+    """Per-dim mean/std (and, when Option B is active in training, a row sample) of
+    the compressor's raw KV input -- the frozen encoder tokens. Called BEFORE any
+    KV pruning so the target is the full window. Returns (ref_mean, ref_std,
+    ref_rows); any element is None when not needed."""
+    need_scale = getattr(module, "match_encoder_scale", False)
+    need_aux = module.training and getattr(module, "distr_loss_weight", 0.0) > 0.0
+    if not (need_scale or need_aux):
+        return None, None, None
+    with torch.no_grad():
+        rk = kv.detach().float()
+        ref_mean = rk.mean(0, keepdim=True)
+        ref_std = rk.std(0, keepdim=True).clamp_min(1e-6)
+        ref_rows = None
+        if need_aux:
+            cap = module.distr_loss_max_ref_tokens
+            if rk.shape[0] > cap:
+                sel = torch.randperm(rk.shape[0], device=rk.device)[:cap]
+                ref_rows = rk.index_select(0, sel)
+            else:
+                ref_rows = rk
+    return ref_mean, ref_std, ref_rows
+
+
+def _finalize_compressed(module, query, ref_mean, ref_std, ref_rows):
+    """Shared forward tail: apply Option A's scale match (if enabled) and stash
+    Option B's aux loss on the module (if enabled in training). Returns the
+    (possibly rescaled) query."""
+    if getattr(module, "match_encoder_scale", False) and ref_mean is not None:
+        query = _match_encoder_scale(query, ref_mean, ref_std, module.out_gamma, module.out_beta)
+    if module.training and getattr(module, "distr_loss_weight", 0.0) > 0.0 and ref_rows is not None:
+        module._last_distr_loss = _distribution_match_loss(query, ref_rows)
+    else:
+        module._last_distr_loss = None
+    return query
+
+
 class mlp(nn.Module):
     def __init__(self, hidden_size, intermediate_size):
         super().__init__()
@@ -278,6 +386,8 @@ class TransformerDecoderCompressor(nn.Module):
         # 0 disables; applied only in .train() mode so inference always sees the full KV.
         self.token_prune_ratio = float(getattr(config, "token_prune_ratio", 0.0) or 0.0)
         self.token_prune_min_tokens = int(getattr(config, "token_prune_min_tokens", 0) or 0)
+        # Option A (encoder-scale match) + Option B (distribution-match aux loss).
+        _init_encoder_scale_match(self, config)
 
     def _build_query_rotary_pos_emb(self, w, h) -> torch.Tensor:
         return _build_2d_rotary_pos_emb(self.rotary_pos_emb, w, h)
@@ -374,6 +484,8 @@ class TransformerDecoderCompressor(nn.Module):
         compression_parts = compression_cu_seqlens.size(0) - 1
         if kv.dim() == 3:
             kv = kv.squeeze(0) # (total_tokens, hidden_size)
+        # Encoder-token reference stats (Options A/B), captured before KV pruning.
+        ref_mean, ref_std, ref_rows = _capture_ref_stats(self, kv)
         B = compression_parts
         if grid_hws is None:
             grid_hws = [(self.compress_image_h, self.compress_image_w)] * B
@@ -397,7 +509,7 @@ class TransformerDecoderCompressor(nn.Module):
         for layer in self.layers:
             query = layer(query, kv, cu_seqlens_q, compression_cu_seqlens, rotary_pos_emb,
                           cross_rotary_q, cross_rotary_kv)
-        return query
+        return _finalize_compressed(self, query, ref_mean, ref_std, ref_rows)
 
 
 class TransformerDecoderFlatCompressor(nn.Module):
@@ -450,6 +562,8 @@ class TransformerDecoderFlatCompressor(nn.Module):
         # Training-only common-component KV pruning (see prune_kv_by_common_component).
         self.token_prune_ratio = float(getattr(config, "token_prune_ratio", 0.0) or 0.0)
         self.token_prune_min_tokens = int(getattr(config, "token_prune_min_tokens", 0) or 0)
+        # Option A (encoder-scale match) + Option B (distribution-match aux loss).
+        _init_encoder_scale_match(self, config)
 
     def output_hw_for(self, h: int, w: int):
         # Flat output, no 2-D grid — (1, num_queries) so callers' oh*ow arithmetic
@@ -513,6 +627,8 @@ class TransformerDecoderFlatCompressor(nn.Module):
         # original (t, h, w) in the cross-RoPE.
         if kv.dim() == 3:
             kv = kv.squeeze(0)
+        # Encoder-token reference stats (Options A/B), captured before KV pruning.
+        ref_mean, ref_std, ref_rows = _capture_ref_stats(self, kv)
         B = compression_cu_seqlens.size(0) - 1
         if grid_hws is None:
             raise ValueError(
@@ -539,7 +655,7 @@ class TransformerDecoderFlatCompressor(nn.Module):
                 query, kv, cu_seqlens_q, compression_cu_seqlens,
                 rotary_pos_emb=None, cross_rotary_q=None, cross_rotary_kv=cross_rotary_kv,
             )
-        return query
+        return _finalize_compressed(self, query, ref_mean, ref_std, ref_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +1063,9 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         num_queries=32,
         token_prune_ratio=0.0,
         token_prune_min_tokens=0,
+        match_encoder_scale=False,
+        distr_loss_weight=0.0,
+        distr_loss_max_ref_tokens=4096,
         **kwargs,
     ):
 
@@ -966,6 +1085,13 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         # transformer_decoder_flat read these (0 = disabled).
         self.token_prune_ratio = token_prune_ratio
         self.token_prune_min_tokens = token_prune_min_tokens
+        # Option A: affine-match the compressor output's per-dim mean/std onto the
+        # frozen-encoder tokens + a learnable per-channel gamma/beta (applies at
+        # train AND inference). Option B: CORAL-style distribution-match aux loss
+        # (weight; the trainer adds it to CE). transformer_decoder* only.
+        self.match_encoder_scale = match_encoder_scale
+        self.distr_loss_weight = distr_loss_weight
+        self.distr_loss_max_ref_tokens = distr_loss_max_ref_tokens
 
 def build_token_compressor(config):
     compressor = getattr(config, 'token_compressor_config', None)
