@@ -1,0 +1,422 @@
+[
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/panda/-2M5nq7SmTo.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video showcases various perspectives of a green tractor in a simulated farming environment, starting with a close-up rear view focusing on its tires and mechanical components such as hydraulic hoses, power take-off shaft, and three-point hitch. The tractor initially appears stationary against a backdrop of a clear sky and an open field. As the video progresses, the perspective shifts to the side, providing a view of the cabin and the front loader arm, with the environment including slender trees and farming signage, reinforcing the agricultural setting. The simulation context is further highlighted by the graphic rendering quality of the images.\n\nThe camera then moves inside the tractor's cabin, offering a detailed look at the steering wheel, control panel, and various operational levers and buttons, giving the impression of preparing to operate the tractor. The brand \"FENDT\" becomes visible, indicating the manufacturer of the agricultural machinery. Throughout these transitions, the external environment remains consistently depicted through the cabin's windshield, maintaining a coherent setting.\n\nContinuing through the interior, the focus shifts to highlight the ergonomic design of the operator's seat and the control panel that features a joystick and various control buttons, suggesting the technology and comfort available to the operator. The external view becomes less prominent, focusing instead on the cabin's layout and the functionality of the control panel.\n\nLater, the perspective shifts to what appears to be the operator's view, showing the steering wheel, instrument cluster, and the front-loader attachment, together with a clearer view of the path ahead, lined with neatly aligned trees. An interactive interface then overlays the screen, displaying keybindings for actions, technical information such as time, speed, gear, and fuel level, indicating the video's setting within a simulation or video game. This interface provides insight into the game's complexity and the interactive experience of managing the tractor's operations.\n\nFinally, the camera angle shifts outside the tractor to display its full structure from behind, showing it stationary in an open paved area, with the on-screen interface elements persisting, including the speedometer at 0 km/h and a full fuel tank, indicating a pause in the tractor's use within the simulation. The video encapsulates a detailed overview of the tractor's features, the operator's interaction within the cabin, and the simulated farming environment, concluding with the tractor at rest.",
+    "source": "sharegpt4v",
+    "duration": 48.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v_ok3Kpgv0PzE.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "In the middle of her routine, the gymnast transitions into a series of tumbling moves on the beam, displaying significant athleticism. She executes flips and twists, punctuated by brief balances where she extends her arms outward for stability. Additionally, she incorporates running along the beam, introducing dynamic movement and balance challenges. These movements on the beam highlight her agility and skill during the performance.",
+    "source": "vcg_20k",
+    "duration": 98.3
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/e84c2ee8-0e6a-4d77-953d-00fb5afd76c4_1.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "on the work table",
+    "source": "ego_4d",
+    "duration": 49.1
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/RoadAccidents080_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(D) RoadAccidents",
+    "source": "anomaly_det",
+    "duration": 43.2
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/wPmTp9up26w.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(D) They escalate their differences.",
+    "source": "cinepine_30k",
+    "duration": 160.7
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/panda/emdV3v0vOIc.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video presents a sequence showing the process of editing an Adobe After Effects project titled \"AE TUTORIAL.\" Initially, the software's interface is shown with a simple layout featuring the \"AE TUTORIAL\" text against a dark background, along with tools and panes typical of video editing software, including a timeline and preview window. The playhead’s position suggests that the editing process is paused.\n\nThe user initiates a pre-composition of layers named \"[Black Solid 1]\" and \"[TEXT],\" as indicated by a dialog box discussing pre-composition options. Subsequently, the timeline reflects a consolidation of these layers into a single layer named \"[FinalTEXT],\" indicating the completion of the pre-composition process. The interface shows the project's progress without open dialog boxes, focusing on the selected \"[FinalTEXT]\" layer and hinting at further editing steps.\n\nFurther into the sequence, the video editing interface displays the project, composition, and timeline panels with various components listed, including compositions and footage items, with the \"AE TUTORIAL\" text unchanged in the preview. Notably, the timeline now contains an additional layer named \"[BG.jpg]\" beneath the \"[FinalTEXT]\" layer, introducing a textured background visible in the preview. The \"Scale\" property of the \"[BG.jpg]\" layer is highlighted, and the playhead's position has advanced, suggesting an ongoing editing process.\n\nThe texture details of the background are subsequently more pronounced, with the scale properties of the \"[BG.jpg]\" layer adjusted to \"20.8%.\" The screen's magnification remains consistent, indicating a detailed focus on the editing process.\n\nAn \"Effects & Presets\" panel is introduced, displaying a search for sharpening effects, suggesting the user's intent to enhance texture or edge definition within the composition. This phase of the editing process remains focused on refinement, with no significant layout changes to the software interface.\n\nLater, a segment of the workspace reveals a list of assets including \"texture.jpg,\" which is likely responsible for the textured background in the composition. The \"Timeline\" panel displays the \"FINAL TEXT\" layer, hinting at a stage of completion. The playhead's position indicates a specific segment under review or editing, with no active modifications observed.\n\nThe focus then shifts closer to the timeline and layers, minimizing the composition view. Both layers, \"[Final TEXT]\" and \"[BG.jpg]\", are set to a blending mode of \"Normal,\" with the \"Render Queue\" tab suggesting possible rendering tasks. The timeline's playhead position remains unchanged, with the composition window's zoom level consistent, indicating readiness for further editing or rendering actions.\n\nLastly, the cursor engages with the visibility toggle of the \"[Final TEXT]\" layer, suggesting an imminent action to adjust its visibility. This action, set against the backdrop of an unchanged environment from the previous snapshot, portrays a focused moment within the continuous editing workflow.",
+    "source": "sharegpt4v",
+    "duration": 48.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v__eanWnL3FtM.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "In the competition, one man is dressed in a blue shirt, while the other man sports a dark shirt. The man in the blue shirt and the man in the dark shirt are the participants in the competition.",
+    "source": "vcg_20k",
+    "duration": 239.3
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/e837708f-8276-4d2b-88b3-319cddabbf74_6.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "5",
+    "source": "ego_4d",
+    "duration": 20.3
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/RoadAccidents031_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(B) RoadAccidents",
+    "source": "anomaly_det",
+    "duration": 72.9
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/e4Dlc6yqJuA.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(C) Slows down",
+    "source": "cinepine_30k",
+    "duration": 133.8
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/panda/m-ddTSb1JcA.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video showcases an evolving view of an outdoor agricultural setting, beginning with a focus on a patch of lush greenery, including a well-tended grass lawn that transitions into a cultivated area with rows of crops and dense vegetation. As the camera pans left, further aspects of the garden are revealed including a large white propane tank, indications of active cultivation like irrigation tubes and gardening equipment, and a more expansively maintained vegetable plot with vertical stakes supporting the plants.\n\nThe garden's surroundings are gradually unfolded, featuring more of the grassy environment, another glimpse of the large white propane tank, and the introduction of a wooden trellis, suggesting infrastructure for climbing plants. The serene atmosphere is highlighted by the gentle sunlight casting warm hues over the scene, indicating early morning or late afternoon. Importantly, the environment maintains its stillness throughout, with no discernible movement captured within the landscape.\n\nFurther exploration of the garden presents a closer look at the meticulously aligned crop rows and the health of the vegetation, the exploration extending towards areas of dense foliage and regions highlighting the extent of agricultural practice, revealed through differing stages of plant maturity and crop types. Additionally, subtle changes such as the introduction of a piece of discarded wood, the edge of a possible structure or equipment, and shifts in the camera perspective to include bare soil alongside the dense greenery add layers to the narrative of human presence and interaction with the land.\n\nAs the video progresses, the camera's movements - whether panning left or right, slightly moving forward, or altering angles - offer varied glimpses into the agricultural environment, showcasing not only the rich biodiversity of the plants but also the meticulous care evident in the cultivated land. Despite these changes, the conditions of lighting suggest a constant time frame, with the sun casting an unchanged hue over the scene, contributing to a sense of tranquility.\n\nTowards the end, a slight shift in perspective introduces a grassy area at the edge of the farmland, gently expanding the view to include more diversified vegetation. This shift provides a broader context to the agricultural practices displayed, framed by the same consistent sunlight, further emphasizing the serene and steady progression of time within this tranquil agricultural setting. The video encapsulates a detailed exploration of cultivated land and its immediate surroundings, characterized by a serene atmosphere and a deep connection to the practices of cultivation and care.",
+    "source": "sharegpt4v",
+    "duration": 48.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v_uYqNIBbz4_Q.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "Throughout the video, the man is engaged in woodcutting activities in the backyard. He starts by securing a rope around a tree bark, indicating preparation for cutting. Moving to a log on the ground with a saw blade stuck in it, he progresses to chopping it with an axe, splitting it into smaller pieces. He then transitions to using a chainsaw to further cut the logs, focusing on his task. The background showcases a wooden fence, a grassy ground with scattered leaves, and an overcast sky. The man's methodical actions encompass tying the rope, sawing, chopping, and using the chainsaw, all contributing to effectively breaking down the logs.",
+    "source": "vcg_20k",
+    "duration": 24.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/40a7470c-f3ed-41d4-956a-4b65f97e895a_1.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "Yellow.",
+    "source": "ego_4d",
+    "duration": 79.1
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/Burglary027_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(A) Burglary",
+    "source": "anomaly_det",
+    "duration": 103.4
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/8r_dXbWf2Aw.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(C) Yanking it too much",
+    "source": "cinepine_30k",
+    "duration": 105.7
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/panda/Xc3yS9KtIq0.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video showcases a series of frames highlighting the contents of a well-stocked pantry shelf, starting with a variety of food items and brands. Initially, we see a mix of products including Fiesta Taco seasoning, Knorr Rice Sides, stackable food containers with grains, Roland Quinoa, and a Bigelow Sweet Dreams herbal tea box, all suggesting a domestic kitchen setting with a casual recording vibe.\n\nAs the video progresses, the focus shifts across the shelf, revealing an assortment of tea boxes centralized by a Bigelow Green Tea box, Celestial Fruit Tea Sampler, and Market Pantry Green Tea. The continuity of items such as the Roland Quinoa and Bigelow Sweet Dreams tea from earlier frames introduces a coherent narrative of an organized and abundant pantry.\n\nSubsequent frames continue the journey across the shelf, bringing into view Better Oats oatmeal, jars of Jif and Skippy peanut butter, Orville Redenbacher's popcorn, and Belvita breakfast biscuits, highlighting a diversity of health-conscious and snack options. The addition of a Biscoff cookie spread jar enriches the variety of spreadable items, maintaining a consistent light source throughout the frames.\n\nFurther panning reveals a Stevia natural sweetener box and introduces a WOWBUTTER jar, subtly indicating the camera's leftward movement. The visual narrative continues with the Orville Redenbacher's popcorn and various tea boxes becoming more or less prominent depending on their placement relative to the frame's center, underscoring the pantry's extensive selection.\n\nAs the camera pans further left, it captures the evolving placement of items, with the WOWBUTTER jar, peanut butter jars, Jell-O packs, and a hazelnut spread jar shifting positions. The frames detail the items' labels and packaging, supported by consistent overhead lighting, which illuminates the pantry's contents clearly.\n\nTowards the end, the camera's leftward pan slows down, allowing for a closer look at the \"100% NATURALS\" label on the Orville Redenbacher's popcorn box, the \"NATURAL CREAMY\" text on the Jif peanut butter jar, and the snug positioning of the Biscoff cookie spread next to them. The gradual shift leftward in the final frames brings the Jif To Go boxes partially into view, with the Jell-O boxes now less visible.\n\nThroughout the video, changes frame by frame reveal a comprehensive scan of the pantry shelf, showcasing an array of consumable items ranging from seasonings and grains to teas, spreads, and snacks. The consistent lighting and steady camera movement maintain clarity and visibility, ensuring an uninterrupted view into the variety and organization of the pantry contents.",
+    "source": "sharegpt4v",
+    "duration": 49.6
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v_asM7fbK_F-U.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "During the initial segment where the woman is playing the keyboard, she is dressed in casual attire, and as the scene shifts to the bongo drums, she is seen wearing a gray tank top.",
+    "source": "vcg_20k",
+    "duration": 127.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/b4b27c5b-2b73-4083-a41c-a6a960475c1a_5.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "Blue",
+    "source": "ego_4d",
+    "duration": 35.2
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/RoadAccidents008_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(C) RoadAccidents",
+    "source": "anomaly_det",
+    "duration": 44.2
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/Nuwu9VTP3Ak.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(A) To calm Jack down",
+    "source": "cinepine_30k",
+    "duration": 145.2
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/panda/aiQa2_zADiY.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video sequence unfolds on a webpage featuring a Black Friday sale, starting with a promotional focus on sleek, black overhead headphones against a white backdrop in the upper left quadrant, complemented by vibrant colors to attract viewers' attention. Adjacent, two presenters engage in what appears to be a live streaming video, enhanced by studio equipment and decor, further highlighting the sales event. The page also displays a string of logos at the bottom, likely representing brands or sponsors linked to the sale.\n\nAs the video advances, the webpage maintains its focus on the Black Friday promotion, displaying the headphone with product details and pricing consistently. A new section recommends similar products, while the presenters continue their apparent discussion of the event, and the logos provide a foundation of partnership and collaboration.\n\nThe content shifts to a broader selection of sponsored products, featuring various headphones with pricing and installment options, and introduces a section for bundled purchase options. The presenters remain, suggesting ongoing live event coverage.\n\nSubsequently, a detailed description of the Philips P2 Headphones with Microphone is showcased, providing viewers with comprehensive product features and technical specifications. This informative approach allows for an informed purchase decision, with the live event persisting in the background and logos signifying partnership continuity.\n\nThe focus then shifts to a section suggesting related products, promoting convenience and affordability by offering various purchasing options. This strategic move aims to facilitate consumer product discovery without deviating from the live coverage of the sales event.\n\nThe scene transitions to concentrate on an individual product, the black Philips SHl5005/00 Upbeat In-Ear with Microphone headphone, highlighted with a discounted price and an additional promotional offer. This spotlights specific deals, retaining the live event broadcast yet not detracting from the product promotion.\n\nThe layout remains consistent in subsequent frames, emphasizing the highlighted headphone and its promotional offers, with the top banner creating a sense of urgency for the deals presented. The presenters continue their participation, providing a dynamic element to the page.\n\nThe video concludes without significant changes, underlining the promotion of the Philips SHl5005/00 headphones, with the campaign details and discount remaining constant. The stable webpage composition centers on delivering a clear, uninterrupted message, ensuring viewers have ample opportunity to absorb the product's features and promotional specifics, reflecting a clear and focused marketing strategy throughout the sequence.",
+    "source": "sharegpt4v",
+    "duration": 33.4
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v_-fMxoShIXiM.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "Throughout the video, a woman with long, dark, curly hair inspects the roof of a house, removes old shingles, and oversees the installation of new roofing materials. Initially on the roof, she inspects a black shingle, then moves to another part of the roof for a closer look. Transitioning to the ground, she converses while a truck unloads shingles. Back on the roof, she uses a shovel to clear old shingles, which are then discarded. Teamwork is evident as men lay black material and fix it to the roof, followed by the precise placement and nailing of new shingles. The video concludes with a view of the finished roof and the woman standing proudly in front of the house.",
+    "source": "vcg_20k",
+    "duration": 117.7
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/ed5791ed-49ec-4dca-8071-fa1024442841_5.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "the man in black shorts",
+    "source": "ego_4d",
+    "duration": 106.3
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/Shooting022_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(A) Shooting",
+    "source": "anomaly_det",
+    "duration": 151.9
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/kHRSh7JOKxo.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(A) In Gordon's briefcase",
+    "source": "cinepine_30k",
+    "duration": 169.7
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/panda/AeHuH39M4QQ.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video begins with a frame that establishes the subject of \"PLANNING\" focused on \"STEPS TO INCREASE FEBRUARY SALES\". An individual cartoon character with blonde hair and a blue dress hints at an educational or explanatory theme, as indicated by the watermark \"Education-Portal.com\". As the video progresses, three additional cartoon characters join the initial character, presenting diversity in hairstyles and clothing colors while emphasizing a team or group dynamic. They all share cheerful expressions, reinforcing the positive nature of the content being presented.\n\nFollowing the introduction of these characters, the content under the header develops to list specific strategies aimed at increasing February sales. This list includes steps such as increasing advertising in a specific region, placing items on sale, enhancing customer-rep interactions, and reaching out to prior customers. The video maintains a static backdrop throughout, focusing on the textual content and the cartoon characters, who remain in a fixed position with unchanged expressions, signifying a continuous narrative without shifts in environment or camera angles.",
+    "source": "sharegpt4v",
+    "duration": 20.6
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v_7rf06_5zNJk.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "In the video, a group of dancers from the Belly Dance Academy performs a choreographed routine on stage in a visually striking setting with a dark background and a red curtain. The dancers don colorful costumes with sequins, ruffles, and headdresses, enhancing the aesthetic appeal. A central dancer in a pink dress takes the spotlight, showcasing dynamic movements and using props throughout the performance. The ensemble transitions through various formations, executing synchronized dance moves that highlight their unity and grace. The choreography includes moments displaying the dancers' bellies to emphasize the theme. The video ends with all dancers coming together in a final synchronized pose, facing the audience with arms uplifted, providing a powerful conclusion to their energetic routine.",
+    "source": "vcg_20k",
+    "duration": 238.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/ab78f4e5-aa25-442c-933f-9b277b1d9715_7.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "on the arm of the couch",
+    "source": "ego_4d",
+    "duration": 23.4
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/RoadAccidents119_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(A) RoadAccidents",
+    "source": "anomaly_det",
+    "duration": 60.9
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/y5vxDOma1Ok.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(B) John and his phase matter are sucked against the machine.",
+    "source": "cinepine_30k",
+    "duration": 144.1
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/panda/t8s4mslOeEs.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video begins with a graphic overlay on a blue background with light horizontal streaks, featuring a photograph of a smiling individual wearing glasses. Next to the photograph is text indicating the person's professional title related to earthquake conferences, with a visual representation of seismographic data below the title. This setup suggests an introductory title card for a news report or documentary focused on seismic events or related conferences, designed to introduce an expert in the field. The overall presentation is professional and informative, aimed at setting the context for the viewers. As the video progresses, the subsequent imagery maintains the consistency of the original graphic design, including the photograph of the same individual, the text denoting their professional expertise, and the seismographic data visualization. The background and visual elements remain unchanged, indicating a continuous focus on introducing or referring to the expert in a professional or educational video segment.",
+    "source": "sharegpt4v",
+    "duration": 21.1
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v_9zm9jW7_ANc.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video begins with the chef engaging in the preparation of a salad. Initially, he focuses on the endive, slicing and placing them in a bin. Subsequently, the chef slices and peels additional vegetables before proceeding to chop romaine, which is then placed in a silver bin. He mixes the romaine with the endive in a round silver bowl, adding dressing to create the final salad mixture. The chef skillfully transfers this salad onto a white plate for serving. Throughout the video, the chef's movements in the professional kitchen environment are meticulous, using a knife to slice vegetables and manage ingredients with precision. The process involves a series of steps from slicing and chopping to mixing and plating, highlighting the chef's systematic approach to salad preparation.",
+    "source": "vcg_20k",
+    "duration": 210.7
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/dafc3206-3b70-4f43-b386-e0d01a3516a7_1.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "water",
+    "source": "ego_4d",
+    "duration": 80.6
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/Normal_Videos086_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(D) Normal",
+    "source": "anomaly_det",
+    "duration": 113.1
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/MbRhuUtKHV4.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(A) Mike pulls up a chair, then the team signs the contract.",
+    "source": "cinepine_30k",
+    "duration": 167.7
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/panda/dWAsbOQnXak.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video begins with a person indoors, their face hidden by their hands, in what looks to be a moment of emotional expression, possibly surprise, embarrassment, or sorrow. The background indicates a cozy, domestic setting. Shortly after, the person reveals their face, showing excitement or amazement, with the indoor setting unchanged. \n\nThe scene then moves outdoors, where the person adjusts sunglasses and is joined by another individual, hinting at a casual, outdoor interaction. The primary person secures their sunglasses in place, engaging more directly with the accompanying individual who is now smiling and closer, suggesting interaction or observation.\n\nIn a swift change, the primary individual performs a quick action or dance, their hands raised, which blurs the frame, while the other individual claps, enjoying the performance. This quickly transitions to a more subdued scene where the primary person sits, engaging with a phone, wearing sunglasses and dressed casually for the outdoors. The other individual is no longer present, and the surroundings and person's engagement with the phone suggest focus and possibly surprise or laughter at something on the device.\n\nContinuing this focused interaction, the person adjusts their hand placement but maintains attention on their phone, eventually relaxing and engaging with the device more attentively. They are outdoors throughout, shown interacting actively with the phone amidst a residential setting.\n\nThe narrative progresses as the individual is seen from behind, walking along a garden path, indicating movement, possibly following the person with a slight camera movement. Then, in a playful or sudden turn, the person faces the camera, possibly adjusting their sunglasses, still holding the phone.\n\nSubsequently, the individual moves forward, indicated by their posture and outstretched arm, turning slightly, suggesting ongoing movement or interaction with the environment. This is emphasized further as they continue moving, gestures and posture indicating active engagement with their surroundings, against a backdrop that remains residential, with houses and mailboxes subtly framing the movement.\n\nAs the video approaches its end, the person is more centrally focused, looking ahead with the scene capturing the late afternoon or early evening ambiance, suggesting a passage of time or concluding part of the day. The person's actions evolve from casual observation to pointing towards something off-frame, sparking curiosity about the focus of their attention. The residential background and the lighting underscore the continuity and coherence of the setting throughout the video. The camera’s movement adjusts to capture the dynamic nature of the person’s actions, maintaining focus and framing as the video progresses.",
+    "source": "sharegpt4v",
+    "duration": 30.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v_AOBkrb8yYS4.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "In the video, the man demonstrates various croquet techniques by hitting the red ball to different locations across the field. He showcases precise and methodical movements, emphasizing skill and control. Additionally, he kneels on the ground at one point to adjust his angle for a more complex shot towards a red flag in the distance, showcasing his adaptability and high proficiency in gameplay. His approach changes dynamically as he executes different shots, highlighting his skill and versatility in croquet.",
+    "source": "vcg_20k",
+    "duration": 113.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/3dd00666-a34d-4b45-bb4c-7a4c2342e475_7.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "no",
+    "source": "ego_4d",
+    "duration": 23.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/Robbery040_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(B) Robbery",
+    "source": "anomaly_det",
+    "duration": 34.8
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/XFK5SV1-Pzg.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(C) Surprised",
+    "source": "cinepine_30k",
+    "duration": 234.9
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/panda/HefdVogMnaQ.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video initiates with a split-screen illustration comparing two different characters under distinct captions - one being a \"MASKED SAIYANS\" explanation and the other detailing \"DARK DRAGON BALLS,\" set against a backdrop intertwined with a crumpled paper texture. This juxtaposition, coupled with the captions, hints at an elaborate discourse on character and story elements, likely from an animated series or game. A bold text at the bottom, \"LINK AT THE END OF THIS VIDEO!\", prompts viewers to seek more information post-viewing.\n\nTransitioning, the focus shifts solely to an animated character donning a red vest with a golden border, spiky black hair, and white face paint or mask around the eyes, complemented by a tail. This character is positioned against the same crumpled paper textured background, maintaining the bold text from the previous scene at the bottom of the frame. The character's aggressive posture and facial expression suggest a shift towards a more action-oriented or high-energy narrative within the video's content.\n\nSubsequently, without altering the core setup, the character showcased undergoes a subtle transformation in expression and posture, adopting a slight smirk and a relaxed stance, with hands crossed over the chest. This change suggests a narrative progression or a shift in the conveyed message, possibly hinting at confidence or amusement from the character's perspective. The continuity of the crumpled paper texture background and the repeated prompt for viewers to follow a link at the video's end is consistent, underscoring an ongoing invitation for the audience to explore the content further beyond the video.",
+    "source": "sharegpt4v",
+    "duration": 23.2
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v_q3NOVbRyFfw.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video commences with a group of people carrying yellow inflatable tubes walking towards a river in a lush forest. They start by entering the water and sitting on their tubes, establishing a serene and leisurely atmosphere at the outset.",
+    "source": "vcg_20k",
+    "duration": 209.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/2d01625b-b7c4-41aa-989b-2d0b392d8b54_1.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "Four.",
+    "source": "ego_4d",
+    "duration": 38.8
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/Normal_Videos065_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(D) Normal",
+    "source": "anomaly_det",
+    "duration": 28.9
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/58BDrZH7SX8.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(C) From safety to fear",
+    "source": "cinepine_30k",
+    "duration": 222.9
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/panda/PdSk44lIaBc.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video showcases a series of detailed views and information about the EVGA NEX1500 Supernova Classified power supply unit. Initially, the power supply is presented from various angles, highlighting its black and red fan grill, distinctive model and brand markings, and its reflective positioning on a surface against a dark background. These segments focus on the physical design and branding elements of the unit, providing a clear view of its aesthetic and identifying markers without any observable camera movement or dynamic changes within the scenes.\n\nFollowing the physical showcase, the video transitions to a graphical user interface (GUI) designed for monitoring and controlling the power supply's settings. The interface features a dark color scheme with red highlights, consistent with the unit's branding, and displays various metrics such as temperature, efficiency, output voltage, and fan speed, along with numerical values and gauges. Subsequent frames introduce additional sections within the GUI, indicating the possibility to adjust input power, and rail configurations for +12V and +5V/+3.3V, among other settings. A subtle reflection in the background suggests the GUI might be overlaid on a transparent surface or displayed in a manner that incorporates the physical hardware component into its visualization.\n\nTransitioning back to the tangible realm, a physical setup is presented, including the power supply unit alongside a \"1500W Power Supply User Guide,\" clearly linking the hardware with the GUI previously seen. Cables are now connected to the unit, indicating its readiness for use or actual operation within what appears to be a technical or computer hardware workspace.\n\nAs the video progresses, the focus then shifts towards the power cables themselves, particularly highlighting their color contrast and connectivity aspects. These cables, black with red connectors, are brought into the foreground, suggesting an emphasis on the connectivity and setup processes integral to the power supply's operation within a computer system.\n\nThroughout the video, there is a consistent emphasis on the aesthetics, functionality, and setup components of the EVGA NEX1500 Supernova Classified power supply unit, methodically transitioning from its physical design and branding, through its digital interface for settings control, to the practical aspects of its installation and use, all without significant camera movement or alteration of the scene's environmental context.",
+    "source": "sharegpt4v",
+    "duration": 28.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v_2zwUExKXw9s.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video showcases a group of men and women on horseback riding along a dirt trail in a wooded environment. Initially, the group takes a break on their horses, making adjustments and managing the reins. Dressed appropriately, the riders then resume their journey, where the horses move at varying paces, from walking calmly to gently galloping. Demonstrating proficiency, the riders maintain composure and control over their horses. The camera captures different perspectives, potentially including views from a horse's standpoint. The setting shifts between dense woods and open clearings, with terrain comprising dirt, patches of grass, and fallen leaves, hinting at the season being late autumn or winter. The video emphasizes the harmony between the riders, their horses, and the natural surroundings from beginning to end.",
+    "source": "vcg_20k",
+    "duration": 43.3
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/baaf6d24-7117-4b0b-acdf-a79765036d84_1.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "Orange",
+    "source": "ego_4d",
+    "duration": 28.9
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/Normal_Videos113_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(C) Normal",
+    "source": "anomaly_det",
+    "duration": 23.1
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/GU1zIn2BRN0.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(E) He throws his ice pick away",
+    "source": "cinepine_30k",
+    "duration": 216.7
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/panda/3WZowTHEoAI.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video unveils with a scene of an individual, possibly a worker, spotted outdoors near a caged enclosure within a lush green setting, indicative of a zoo or sanctuary environment. The person, characterized by long tied-back hair, a dark blue shirt with white text, and dark pants, is seen walking with a green, leafy branch held in their right hand, hinting at an interaction or task related to the enclosure. As the video proceeds, focus shifts to highlight various inhabitants and interactions within this enclosure. Initially, a group of dark-furred animals, likened to raccoons but not clearly identified, is spotted within the enclosure alongside a red object on the ground, possibly a toy or enrichment item.\n\nSubsequent scenes reintroduce human presence, this time featuring an individual partially visible, wearing a dark blue shirt and handling a long stick or pole with a gloved hand, presumably for interacting with the animals. The narrative soon unfolds to showcase a large cat, initially mistaken for a tiger then corrected to a leopard, engaging with the stick presented by the person. The leopard's responses intensify from attention to actively standing on its hind legs and using its paws to touch, and eventually swipe at, the stick.\n\nRemarkably, the leopard's attention is captured anew by the appearance of a red object in motion above its head, introduced into the enclosure, leading to varied reactions from the leopard, including attempts to interact with this new element. The presence of a long, tan object also emerges, hinting at another tool or form of enrichment being used within the enclosure. No changes in the lush, verdant surroundings or the leopard's naturalistic habitat are noted throughout these interactions, with the camera maintaining a steady focus on the unfolding events.\n\nTransitioning toward the video's conclusion, a significant shift occurs with the introduction of a new scene featuring a serval, marking a departure from the previous interaction narrative with the leopard. The serval is depicted behind a metal fence, its slender build, patterned coat, and prominent ears highlighting its distinctiveness. Initially observed in a state of alert observation, the serval transitions into motion, with subsequent frames detailing its progress as it steps forward and directs its gaze towards something beyond the enclosure, apparently engaged with an unseen stimulus. Throughout these moments, the environment remains lush and stable, indicating a controlled setting designed to mimic the animals' natural habitats. The camera subtly adjusts to track the serval's movements, ensuring it remains the focal point, culminating in a portrayal of the serval's attentive and active demeanor within its enclosure.",
+    "source": "sharegpt4v",
+    "duration": 48.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v_z93quI8Gxx4.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "Veronica White, the news reporter from WXII 12 News, is dressed in a blue T-shirt with a visible logo and jeans. She is seated on the back of the light brown camel, holding onto a red handlebar-like structure for support while speaking into the camera. The man beside the camel, dressed in a dark t-shirt and sunglasses, is managing the camel's reins and feeding it intermittently.",
+    "source": "vcg_20k",
+    "duration": 60.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/c67cb1da-90ac-4da8-af17-4f8b77da9b9d_4.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "There are two black baskets in the car.",
+    "source": "ego_4d",
+    "duration": 23.2
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/Normal_Videos075_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(D) Normal",
+    "source": "anomaly_det",
+    "duration": 113.3
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/Mmcr5WLNtZA.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(B) Pancakes",
+    "source": "cinepine_30k",
+    "duration": 154.1
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/sharegpt4video/zip_folder/pixabay/0ca7efa095a2c54063c97e2fb8e59e108ec6b19291aa1a91724d39b749e48820.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "The video features a consistent scene throughout its duration, portraying a night landscape under a star-filled sky. This scene incorporates silhouetted mountain ranges against a dark horizon and a rugged, undulating foreground characterized by earthy brown and orange tones, suggesting either rocky or sandy terrain. The terrain is illuminated by an unseen light source, contributing to the overall desolation and otherworldly, alien-like ambiance of the environment. Throughout the video, there are no significant changes or variations in the composition or elements of the scene, maintaining the impression of a static yet mesmerizing extraterrestrial landscape.",
+    "source": "sharegpt4v",
+    "duration": 27.9
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/vcg/vcg/v_uokQq9Xrjf8.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "During the demonstration of the Tall Kneeling Palloff Press in the gym, the fitness trainer is dressed in a black t-shirt and gray sweatpants. He is shown kneeling on the gym floor with both knees firmly placed and maintaining an upright posture with his back and shoulders aligned. The gym setting is well-equipped with the necessary apparatus for the exercise, including a weight machine labeled for the specific exercise. The background is well-lit, emphasizing both the trainer and the equipment for clear instructional visibility.",
+    "source": "vcg_20k",
+    "duration": 26.3
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/ego4d/ego_4d/af17c6b9-c00e-4f68-ba79-78a6f9085c62_7.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "yes",
+    "source": "ego_4d",
+    "duration": 110.3
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/anomalydet/anomalydet/Stealing079_x264.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(A) Stealing",
+    "source": "anomaly_det",
+    "duration": 195.0
+  },
+  {
+    "video": "/root/datasets/videoxl/Finetuning/data/_extracted/cinepile/cinepile/R_moIp38Fk8.mp4",
+    "prompt": "Describe this video in detail. Cover the main subjects and their appearance, the actions and events in the order they happen, the scene and background, any notable camera movement, and any visible text. Write one coherent, factual paragraph and do not speculate about what is not shown.",
+    "reference": "(A) A brick comes through the window.",
+    "source": "cinepine_30k",
+    "duration": 145.8
+  }
+]
