@@ -193,11 +193,22 @@ class Videollama3MetaForCausalLM(ABC):
 
         # compressed vision tokens should have shape: [n, dim]
         original_tokens_to_reconstruct = vision_tokens[need_compress_parts]
-        compressed = compressor(
-            original_tokens_to_reconstruct,
-            compression_cu_seqlens,
-            grid_hws,
-        )
+        if hasattr(compressor, "compress_windows"):
+            # Two-stage (Stage-1 per-segment lift + Stage-2 Mamba fold): each part is
+            # one readout unit, subdivided into <= frames_per_segment-frame segments
+            # inside the compressor. Output is (sum_parts M, dim), part-major — same
+            # layout the single-stage call returns, so the scatter below is unchanged.
+            compressed = compressor.compress_windows(
+                original_tokens_to_reconstruct,
+                compression_cu_seqlens,
+                grid_hws,
+            )
+        else:
+            compressed = compressor(
+                original_tokens_to_reconstruct,
+                compression_cu_seqlens,
+                grid_hws,
+            )
         keeping_masks = ~need_compress_parts | replace_mask
         vision_tokens[replace_mask] = compressed
         vision_tokens = vision_tokens[keeping_masks]

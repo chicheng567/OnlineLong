@@ -1,3 +1,4 @@
+import contextlib
 import math
 
 from torch.nn import LayerNorm
@@ -7,6 +8,7 @@ from torch import nn
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from .videollama3_encoder.modeling_videollama3_encoder import VisionRotaryEmbedding, apply_rotary_pos_emb_vision
 from .dts import SiglipAECompressor
+from .segment_aggregator import SegmentAggregator, SegmentAggregatorConfig
 
 
 def _build_2d_rotary_pos_emb(rotary_pos_emb_module, w, h):
@@ -1032,6 +1034,165 @@ class CompressorDecoder(nn.Module):
         return x.reshape(B * T * self.HW, dim)  # (B * max_output_frames * HW, hidden_size)
 
 
+def _load_flat_compressor_state_dict(path: str) -> dict:
+    """Read a `transformer_decoder_flat` (qbase) state dict from either
+
+    * a plain ``.pt`` / ``.bin`` file (bare compressor, or ``{"compressor"|"state_dict": ...}``), or
+    * an HF checkpoint dir — every ``*.safetensors`` shard is scanned for
+      ``…token_compressor.<k>`` keys (but NOT ``…token_compressor.stage2.<k>``).
+
+    Keys are returned relative to the compressor module (leading
+    ``model.token_compressor.`` / ``token_compressor.`` / ``stage1.`` stripped), ready
+    for ``TransformerDecoderFlatCompressor.load_state_dict(..., strict=False)``.
+    """
+    import os
+
+    def _strip(k: str) -> str:
+        for pref in ("model.token_compressor.", "token_compressor.", "stage1."):
+            if k.startswith(pref):
+                k = k[len(pref):]
+        return k
+
+    if os.path.isdir(path):
+        from safetensors import safe_open
+        shards = sorted(f for f in os.listdir(path) if f.endswith(".safetensors"))
+        if not shards:
+            raise FileNotFoundError(f"no *.safetensors under {path}")
+        sd = {}
+        for shard in shards:
+            with safe_open(os.path.join(path, shard), framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    if ".token_compressor." in k and ".token_compressor.stage2." not in k:
+                        sd[_strip(k)] = f.get_tensor(k)
+        if not sd:
+            raise KeyError(f"no *.token_compressor.* tensors in the shards under {path}")
+        return sd
+
+    obj = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(obj, dict):
+        obj = obj.get("compressor", obj.get("state_dict", obj))
+    return {_strip(k): v for k, v in obj.items()}
+
+
+class TwoStageCompressor(nn.Module):
+    """Stage-1 per-segment query compressor + Stage-2 Mamba-2 segment fold.
+
+    ``compress_windows(kv, compression_cu_seqlens, grid_hws)`` compresses each window
+    (= one readout unit / one ``compression_part``) to ``M`` tokens::
+
+        window's  T x h x w  input tokens
+          └ split into ceil(T / frames_per_segment) segments (<= frames_per_segment frames each)
+              └ Stage-1 flat compressor, per segment  -> N_u x K tokens
+                  └ Stage-2 fold (fresh state per window) -> M tokens
+
+    Output is ``(sum_windows M, hidden)`` in input-window order, so
+    ``compress_visual_tokens_with_compressor`` scatters it exactly like the other
+    compressors' output. ``output_hw_for`` returns ``(1, M)``.
+
+    Stage-1 (``.stage1``, a ``TransformerDecoderFlatCompressor``) is warm-started from
+    the pretrained qbase and, for Stage-2a, frozen via ``freeze_stage1()`` — its
+    params get ``requires_grad=False`` and it is pinned to ``eval()`` (no dropout, no
+    Option-B distr-loss stash) even when the parent is in ``train()``. Only
+    ``.stage2`` (the ``SegmentAggregator``) trains.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.stage1 = TransformerDecoderFlatCompressor(config)
+        self.tokens_per_segment = int(getattr(config, "num_queries", 64))                       # K
+        self.n_summary_tokens = int(getattr(config, "stage2_n_summary_tokens", self.tokens_per_segment))  # M
+        self.frames_per_segment = int(getattr(config, "stage2_frames_per_segment", 4))
+        hidden = int(config.hidden_size)
+        agg_cfg = SegmentAggregatorConfig(
+            d_input=hidden,
+            d_output=hidden,
+            d_model=int(getattr(config, "stage2_d_model", 1024)),
+            tokens_per_segment=self.tokens_per_segment,
+            n_summary_tokens=self.n_summary_tokens,
+            n_layers=int(getattr(config, "stage2_n_layers", 4)),
+            d_state=int(getattr(config, "stage2_d_state", 128)),
+            headdim=int(getattr(config, "stage2_headdim", 64)),
+            ngroups=int(getattr(config, "stage2_ngroups", 1)),
+            d_conv=int(getattr(config, "stage2_d_conv", 4)),
+            expand=int(getattr(config, "stage2_expand", 2)),
+            chunk_size=int(getattr(config, "stage2_chunk_size", 128)),
+            mlp_ratio=float(getattr(config, "stage2_mlp_ratio", 0.0)),
+            dropout=float(getattr(config, "stage2_dropout", 0.0)),
+            input_norm=bool(getattr(config, "stage2_input_norm", True)),
+            time_embed=str(getattr(config, "stage2_time_embed", "index_sincos")),
+        )
+        self.stage2 = SegmentAggregator(agg_cfg)
+        self.stage1_frozen = False
+
+    # -- API parity with the single-stage compressors -------------------------
+    def output_hw_for(self, h: int, w: int):
+        return 1, self.n_summary_tokens
+
+    def freeze_stage1(self):
+        for p in self.stage1.parameters():
+            p.requires_grad_(False)
+        self.stage1.eval()
+        self.stage1_frozen = True
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.stage1_frozen:
+            self.stage1.eval()
+        return self
+
+    def _segment_cu_seqlens(self, n_frames: int, hw: int, device) -> "tuple[torch.Tensor, int]":
+        fps = self.frames_per_segment
+        n_seg = max(1, (n_frames + fps - 1) // fps)
+        lens = [min(fps, n_frames - s * fps) * hw for s in range(n_seg)]
+        cu = torch.zeros(n_seg + 1, dtype=torch.int32, device=device)
+        cu[1:] = torch.tensor(lens, dtype=torch.int32, device=device).cumsum(0)
+        return cu, n_seg
+
+    def compress_windows(self, kv, compression_cu_seqlens, grid_hws):
+        if kv.dim() == 3:
+            kv = kv.squeeze(0)                                   # (total_tokens, hidden)
+        cu = compression_cu_seqlens.to(device=kv.device, dtype=torch.long).tolist()
+        W = len(cu) - 1
+        assert grid_hws is not None and len(grid_hws) == W, (
+            f"TwoStageCompressor: need one (h, w) per window ({W}), got "
+            f"{None if grid_hws is None else len(grid_hws)}"
+        )
+        outs = []
+        for i in range(W):
+            win = kv[cu[i]:cu[i + 1]]                            # (T*h*w, hidden)
+            h, w = int(grid_hws[i][0]), int(grid_hws[i][1])
+            hw = h * w
+            assert win.shape[0] % hw == 0, (
+                f"TwoStageCompressor: window {i} has {win.shape[0]} tokens, not a multiple "
+                f"of h*w={hw}"
+            )
+            n_frames = win.shape[0] // hw
+            seg_cu, n_seg = self._segment_cu_seqlens(n_frames, hw, kv.device)
+            seg_grid = [(h, w)] * n_seg
+            ctx = torch.no_grad() if self.stage1_frozen else contextlib.nullcontext()
+            with ctx:
+                k_tok = self.stage1(win, seg_cu, seg_grid)       # (n_seg * K, hidden)
+            k_tok = k_tok.reshape(1, n_seg, self.tokens_per_segment, -1)
+            m_tok = self.stage2(k_tok)                           # (1, M, hidden)
+            outs.append(m_tok[0])
+        return torch.cat(outs, dim=0)                            # (W * M, hidden)
+
+    def forward(self, kv, compression_cu_seqlens, grid_hws=None, kept_idx=None):
+        return self.compress_windows(kv, compression_cu_seqlens, grid_hws)
+
+    def load_stage1_pretrained(self, path: str, verbose: bool = True):
+        sd = _load_flat_compressor_state_dict(path)
+        missing, unexpected = self.stage1.load_state_dict(sd, strict=False)
+        if verbose:
+            print(
+                f"[TwoStageCompressor] loaded stage-1 qbase from {path} "
+                f"({len(sd)} tensors; missing={len(missing)}, unexpected={len(unexpected)})"
+            )
+            if unexpected:
+                print(f"[TwoStageCompressor]   unexpected: {sorted(unexpected)[:8]}")
+        return missing, unexpected
+
+
 from transformers import PretrainedConfig
 
 class Videollama3TokenCompressorConfig(PretrainedConfig):
@@ -1066,6 +1227,23 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         match_encoder_scale=False,
         distr_loss_weight=0.0,
         distr_loss_max_ref_tokens=4096,
+        # Stage-2 fold (compressor_type "…+mamba" -> TwoStageCompressor). K is
+        # num_queries (the stage-1 qbase's query count); these size .stage2, the
+        # SegmentAggregator. See docs/two_stage_compression_design.md.
+        stage2_n_summary_tokens=64,     # M (tie to K unless told otherwise)
+        stage2_frames_per_segment=4,    # frames per stage-1 segment, clamp [1, 8]
+        stage2_d_model=1024,
+        stage2_n_layers=4,
+        stage2_d_state=128,
+        stage2_headdim=64,
+        stage2_ngroups=1,
+        stage2_d_conv=4,
+        stage2_expand=2,
+        stage2_chunk_size=128,
+        stage2_mlp_ratio=0.0,
+        stage2_dropout=0.0,
+        stage2_input_norm=True,
+        stage2_time_embed="index_sincos",
         **kwargs,
     ):
 
@@ -1092,6 +1270,21 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         self.match_encoder_scale = match_encoder_scale
         self.distr_loss_weight = distr_loss_weight
         self.distr_loss_max_ref_tokens = distr_loss_max_ref_tokens
+        # Stage-2 fold knobs (only read when compressor_type endswith "+mamba").
+        self.stage2_n_summary_tokens = stage2_n_summary_tokens
+        self.stage2_frames_per_segment = stage2_frames_per_segment
+        self.stage2_d_model = stage2_d_model
+        self.stage2_n_layers = stage2_n_layers
+        self.stage2_d_state = stage2_d_state
+        self.stage2_headdim = stage2_headdim
+        self.stage2_ngroups = stage2_ngroups
+        self.stage2_d_conv = stage2_d_conv
+        self.stage2_expand = stage2_expand
+        self.stage2_chunk_size = stage2_chunk_size
+        self.stage2_mlp_ratio = stage2_mlp_ratio
+        self.stage2_dropout = stage2_dropout
+        self.stage2_input_norm = stage2_input_norm
+        self.stage2_time_embed = stage2_time_embed
 
 def build_token_compressor(config):
     compressor = getattr(config, 'token_compressor_config', None)
@@ -1117,6 +1310,15 @@ def build_token_compressor(config):
         compressor = Videollama3TokenCompressorConfig(**compressor)
     if isinstance(compressor, Videollama3TokenCompressorConfig):
         ct = compressor.compressor_type
+        # "transformer_decoder_flat+mamba" -> Stage-1 flat qbase + Stage-2 Mamba-2
+        # fold. Checked BEFORE the substring test below (which would otherwise pick
+        # the grid variant).
+        if ct.endswith("+mamba"):
+            base = ct[: -len("+mamba")]
+            assert base == "transformer_decoder_flat", (
+                f"two-stage compressor only supports a 'transformer_decoder_flat' base, got {base!r}"
+            )
+            return TwoStageCompressor(config=compressor)
         if ct == "transformer_decoder_flat":
             return TransformerDecoderFlatCompressor(config=compressor)
         if "transformer_decoder" in ct:

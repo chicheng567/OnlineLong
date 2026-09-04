@@ -27,6 +27,12 @@ sentencepiece==0.2.0
 shortuuid
 einops==0.6.1
 einops-exts==0.0.4
+safetensors>=0.4                     # Stage-2 qbase warm-start reads token_compressor.* from HF shards
+# Stage-2 segment fold (videollama3/model/segment_aggregator.py) runs on a pure-PyTorch
+# SSD scan — no extra dep. Optional fused Mamba-2 kernel for throughput (build against
+# the pinned Torch/CUDA; not imported anywhere, safe to skip):
+#   mamba-ssm==2.2.2
+#   causal-conv1d==1.4.0
 pydantic>=2.7,<3
 markdown2[all]
 httpx==0.24.1
