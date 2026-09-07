@@ -49,7 +49,7 @@ from videollama3.mm_utils import load_video
 from videollama3.model import Videollama3Qwen2ForCausalLM
 from videollama3.model.processor import Videollama3Processor
 from videollama3.model.videollama3_qwen2 import Videollama3Qwen2Config
-from videollama3.train.videollama3_chat_finetune_compressor import select_compression_parts, select_full_compression_parts
+from videollama3.train.data.compressor import select_compression_parts, select_full_compression_parts
 
 
 def parse_args():

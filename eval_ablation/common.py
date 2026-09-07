@@ -33,7 +33,7 @@ from videollama3.model import Videollama3Qwen2ForCausalLM  # noqa: E402
 from videollama3.model.processor import Videollama3Processor  # noqa: E402
 from videollama3.model.videollama3_arch import _grid_hw_for_compression_parts  # noqa: E402
 from videollama3.mm_utils import load_video  # noqa: E402
-from videollama3.train.videollama3_chat_finetune_compressor import (  # noqa: E402
+from videollama3.train.data.compressor import (  # noqa: E402
     select_full_compression_parts,
 )
 

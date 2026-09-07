@@ -388,6 +388,7 @@ class VideoLLaMA3Trainer(Trainer):
                 ])
 
             if compressor_lr is not None and compressor_lr > 0:
+                stage1_lr = getattr(self.args, "stage1_lr", None)
                 compressor_parameters = [name for name, _ in optimized_parameters if "token_compressor" in name]
                 # When the LLM is frozen (llm_lr=0) but embed_tokens was extended
                 # for new compression tokens, route embed_tokens into this group so
@@ -399,20 +400,47 @@ class VideoLLaMA3Trainer(Trainer):
                         name for name, _ in optimized_parameters
                         if "embed_tokens" in name and name not in compressor_parameters
                     ]
-                decay_compressor_parameters = [name for name in compressor_parameters if name in decay_parameters]
-                nodecay_compressor_parameters = [name for name in compressor_parameters if name not in decay_parameters]
-                optimizer_grouped_parameters.extend([
-                    {
-                        "params": [p for n, p in optimized_parameters if n in decay_compressor_parameters],
-                        "weight_decay": self.args.weight_decay,
-                        "lr": compressor_lr,
-                    },
-                    {
-                        "params": [p for n, p in optimized_parameters if n in nodecay_compressor_parameters],
-                        "weight_decay": 0.0,
-                        "lr": compressor_lr,
-                    }
-                ])
+                # Optional Stage-1/Stage-2 LR split: the qbase (token_compressor.stage1.*)
+                # gets its own group at stage1_lr; everything else (the Stage-2 fold +
+                # embed_tokens) stays at compressor_lr. stage1_lr <= 0 -> single group.
+                use_stage1_group = stage1_lr is not None and stage1_lr > 0 and any(
+                    "token_compressor.stage1" in n for n in compressor_parameters
+                )
+                if use_stage1_group:
+                    stage1_parameters = [n for n in compressor_parameters if "token_compressor.stage1" in n]
+                    rest_parameters = [n for n in compressor_parameters if n not in stage1_parameters]
+                    for grp_names, grp_lr in ((rest_parameters, compressor_lr), (stage1_parameters, stage1_lr)):
+                        decay_grp = [n for n in grp_names if n in decay_parameters]
+                        nodecay_grp = [n for n in grp_names if n not in decay_parameters]
+                        optimizer_grouped_parameters.extend([
+                            {
+                                "params": [p for n, p in optimized_parameters if n in decay_grp],
+                                "weight_decay": self.args.weight_decay,
+                                "lr": grp_lr,
+                            },
+                            {
+                                "params": [p for n, p in optimized_parameters if n in nodecay_grp],
+                                "weight_decay": 0.0,
+                                "lr": grp_lr,
+                            },
+                        ])
+                    print(f"[create_optimizer] stage1 LR split: {len(stage1_parameters)} qbase params @ "
+                          f"{stage1_lr}, {len(rest_parameters)} fold/embed params @ {compressor_lr}")
+                else:
+                    decay_compressor_parameters = [name for name in compressor_parameters if name in decay_parameters]
+                    nodecay_compressor_parameters = [name for name in compressor_parameters if name not in decay_parameters]
+                    optimizer_grouped_parameters.extend([
+                        {
+                            "params": [p for n, p in optimized_parameters if n in decay_compressor_parameters],
+                            "weight_decay": self.args.weight_decay,
+                            "lr": compressor_lr,
+                        },
+                        {
+                            "params": [p for n, p in optimized_parameters if n in nodecay_compressor_parameters],
+                            "weight_decay": 0.0,
+                            "lr": compressor_lr,
+                        }
+                    ])
 
             if mm_projector_lr is not None and mm_projector_lr > 0:
                 projector_parameters = [name for name, _ in optimized_parameters if "mm_projector" in name]

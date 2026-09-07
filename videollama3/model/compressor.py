@@ -7,7 +7,7 @@ from transformers.activations import GELUTanh
 from torch import nn
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from .videollama3_encoder.modeling_videollama3_encoder import VisionRotaryEmbedding, apply_rotary_pos_emb_vision
-from .dts import SiglipAECompressor
+from .siglip_ae import SiglipAECompressor
 from .segment_aggregator import SegmentAggregator, SegmentAggregatorConfig
 
 
@@ -833,207 +833,6 @@ class LocalAttnConvCompressor(nn.Module):
         return query
 
 
-class CompressorDecoderLayer(nn.Module):
-    """
-    Fixed AE-decoder block.  Doubles the temporal length, then refines it with a
-    temporal + spatial transformer.  The structure is hard-wired (four steps, in
-    this order):
-
-        x = conv_up(x) + copy2x(x)        # T → 2T  (learnable ConvTranspose3d main + NN-copy residual)
-        x = x + temporal_attn(LN(x))      # per spatial position, self-attn over the 2T frames
-        x = x + spatial_attn(LN(x))       # per frame, self-attn over the HW positions
-        x = x + mlp(LN(x))                # position-wise feed-forward
-
-    Because every layer doubles T, the number of layers is fixed by the target
-    frame count (``log2(max_output_frames)``) and is not configurable — see
-    ``CompressorDecoder``.
-
-    Tensors flow as the channel-last 5-D layout ``(B, T, H, W, dim)``.  Each
-    attention sub-layer flattens to the packed ``(N, dim)`` form flash-attention
-    expects: *temporal-major* (each ``(b, h, w)``'s ``T`` frames contiguous) for the
-    temporal attention, *frame-major* (each ``(b, t)``'s ``HW`` positions contiguous)
-    for the spatial attention.  RoPE is shared from the parent decoder: a 1-D
-    temporal table (rebuilt per layer for the current ``T``) and a constant 2-D
-    spatial table.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        dim = config.hidden_size
-        self.embed_dim = dim
-        self.upsample_factor = 2  # every decoder layer doubles the temporal length
-
-        # ── Temporal 2x upsample (T → 2T) ──
-        #   MAIN path  : a learnable depthwise ConvTranspose3d (temporal stride 2,
-        #     kernel 2 so T_out == 2*T_in exactly) + pointwise 1x1x1 channel mix. The
-        #     two output frames of each input frame come from DIFFERENT kernel taps, so
-        #     they carry different content — this is what breaks the temporal symmetry
-        #     and lets the decoder reconstruct motion.
-        #   RESIDUAL path: the parameter-free nearest-neighbour copy (repeat_interleave),
-        #     an identity highway at init.
-        #   The conv always runs in fp32 (3-D (transpose-)convs are unreliable in
-        #     fp16/bf16 on CUDA); see _upsample_conv_fp32.
-        self.layer_norm_conv = LayerNorm(dim, eps=config.layer_norm_eps)
-        self.depthwise = nn.ConvTranspose3d(
-            dim, dim,
-            kernel_size=(2, 3, 3),
-            stride=(2, 1, 1),
-            padding=(0, 1, 1),
-            groups=dim,
-        )
-        self.pointwise = nn.Conv3d(dim, dim, kernel_size=1)
-        self.act = GELUTanh()
-
-        # ── Temporal self-attention (each spatial position over its T frames) ──
-        self.temporal_attn = selfFlashAttention(
-            embed_dim=dim,
-            n_head=config.num_attention_heads,
-            dropout=config.attention_probs_dropout_prob,
-            causal=False,
-        )
-        self.layer_norm_temporal = LayerNorm(dim, eps=config.layer_norm_eps)
-
-        # ── Spatial self-attention (each frame over its HW positions) ──
-        self.spatial_attn = selfFlashAttention(
-            embed_dim=dim,
-            n_head=config.num_attention_heads,
-            dropout=config.attention_probs_dropout_prob,
-            causal=False,
-        )
-        self.layer_norm_spatial = LayerNorm(dim, eps=config.layer_norm_eps)
-
-        # ── MLP ──
-        self.layer_norm_mlp = LayerNorm(dim, eps=config.layer_norm_eps)
-        self.mlp = mlp(hidden_size=dim, intermediate_size=config.intermediate_size)
-
-    def _upsample_conv_fp32(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, H, W, dim) → (B, 2T, H, W, dim).  3-D (transpose-)convs are
-        # numerically unreliable in fp16/bf16 on CUDA, so the whole conv sub-layer runs
-        # in fp32: disable autocast and feed fp32 activations.  The conv params are kept
-        # in fp32 (AE pretraining uses AMP autocast, which leaves master weights in
-        # fp32), so the op runs entirely in fp32; the result is cast back.
-        out_dtype = x.dtype
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            h = self.layer_norm_conv(x.float())              # (B, T, H, W, dim)
-            h = h.permute(0, 4, 1, 2, 3).contiguous()        # (B, dim, T, H, W)
-            h = self.depthwise(h)                            # (B, dim, 2T, H, W)
-            h = self.pointwise(h)
-            h = self.act(h)
-            h = h.permute(0, 2, 3, 4, 1).contiguous()        # (B, 2T, H, W, dim)
-        return h.to(out_dtype)
-
-    def forward(self, x: torch.Tensor, spatial_rotary: torch.Tensor,
-                temporal_rotary_module) -> torch.Tensor:
-        # x: (B, T, H, W, dim)
-        B, T, H, W, dim = x.shape
-        device = x.device
-
-        # 1. Temporal 2x upsample (T → 2T): learnable ConvTranspose3d as the MAIN path
-        #    (its per-frame-distinct kernel taps make the two new frames differ, breaking
-        #    the temporal symmetry) + parameter-free nearest-neighbour copy as the
-        #    RESIDUAL skip.  Both branches read the original (pre-upsample) x.
-        x = x.repeat_interleave(2, dim=1) + self._upsample_conv_fp32(x)
-        T = T * 2
-        HW = H * W
-
-        # 2. Temporal self-attention: temporal-major pack so each (b, h, w)'s T frames
-        #    are contiguous; 1-D temporal RoPE (arange(T)) shared across all positions.
-        temporal_rotary = temporal_rotary_module(T)                       # (T, head_dim // 2)
-        xt = x.permute(0, 2, 3, 1, 4).reshape(B * HW * T, dim)
-        cu_t = torch.arange(0, B * HW * T + 1, step=T, device=device, dtype=torch.int32)
-        xt = xt + self.temporal_attn(self.layer_norm_temporal(xt), cu_t, temporal_rotary)
-        x = xt.view(B, H, W, T, dim).permute(0, 3, 1, 2, 4).contiguous()  # → (B, T, H, W, dim)
-
-        # 3. Spatial self-attention: frame-major pack so each (b, t)'s HW positions are
-        #    contiguous; 2-D spatial RoPE shared across all frames.
-        xs = x.reshape(B * T * HW, dim)
-        cu_s = torch.arange(0, B * T * HW + 1, step=HW, device=device, dtype=torch.int32)
-        xs = xs + self.spatial_attn(self.layer_norm_spatial(xs), cu_s, spatial_rotary)
-
-        # 4. MLP.
-        xs = xs + self.mlp(self.layer_norm_mlp(xs))
-        return xs.view(B, T, H, W, dim)
-
-
-class CompressorDecoder(nn.Module):
-    """
-    AE decoder: a stack of fixed ``CompressorDecoderLayer`` blocks that expand the
-    single compressed frame back to ``max_output_frames`` frames.
-
-    Each layer doubles the temporal length (upsample 2x → temporal attention →
-    spatial attention → MLP), so the seed frame grows 1 → 2 → 4 → … .  The number
-    of layers is therefore **fixed by the output length**: it is exactly
-    ``log2(max_output_frames)`` and is *not* configurable.  ``max_output_frames``
-    must be a power of two.
-
-    Input  : ``compressed_tokens`` (B * HW, hidden_size)   — one HW grid per sample.
-    Output : (B * max_output_frames * HW, hidden_size)     — frame-major (B, T, H, W).
-
-    Parameters
-    ----------
-    config : Videollama3TokenCompressorConfig
-    max_output_frames : int  (power of two, default 8)
-    """
-
-    def __init__(self, config, max_output_frames: int = 8):
-        super().__init__()
-        H   = config.compress_image_h
-        W   = config.compress_image_w
-        dim = config.hidden_size
-        head_dim = dim // config.num_attention_heads
-
-        assert max_output_frames >= 1 and (max_output_frames & (max_output_frames - 1)) == 0, (
-            f"max_output_frames must be a power of two (each decoder layer doubles the "
-            f"temporal length); got {max_output_frames}."
-        )
-
-        self.hidden_size       = dim
-        self.H                 = H
-        self.W                 = W
-        self.HW                = H * W
-        self.max_output_frames = max_output_frames
-        self.num_layers        = max_output_frames.bit_length() - 1  # log2(max_output_frames)
-
-        # Shared RoPE: 2-D spatial (h/w bands) for the spatial attention and 1-D
-        # temporal for the temporal attention.  Each table's last dim is head_dim//2,
-        # as apply_rotary_pos_emb_vision expects.
-        self.spatial_rotary  = VisionRotaryEmbedding(dim=head_dim // 2)
-        self.temporal_rotary = VisionRotaryEmbedding(dim=head_dim)
-
-        self.layers = nn.ModuleList([
-            CompressorDecoderLayer(config) for _ in range(self.num_layers)
-        ])
-
-    # ------------------------------------------------------------------
-    def _build_spatial_rotary_pos_emb(self) -> torch.Tensor:
-        return _build_2d_rotary_pos_emb(self.spatial_rotary, self.W, self.H)
-
-    # ------------------------------------------------------------------
-    def forward(self, compressed_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            compressed_tokens : (B * HW, hidden_size)
-        Returns:
-            (B * max_output_frames * HW, hidden_size)  — frame-major (B, T, H, W).
-        """
-        B   = compressed_tokens.shape[0] // self.HW
-        dim = self.hidden_size
-
-        spatial_rotary = self._build_spatial_rotary_pos_emb()
-
-        # Seed the temporal axis with the single compressed frame:
-        # (B * HW, dim) → (B, 1, H, W, dim)
-        x = compressed_tokens.view(B, 1, self.H, self.W, dim)
-
-        for layer in self.layers:
-            x = layer(x, spatial_rotary, self.temporal_rotary)
-
-        # (B, T, H, W, dim) → frame-major (B*T*HW, dim)
-        T = x.shape[1]
-        assert T == self.max_output_frames, (T, self.max_output_frames)
-        return x.reshape(B * T * self.HW, dim)  # (B * max_output_frames * HW, hidden_size)
-
-
 def _load_flat_compressor_state_dict(path: str) -> dict:
     """Read a `transformer_decoder_flat` (qbase) state dict from either
 
@@ -1200,7 +999,7 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
 
     # compressor_type: "transformer_decoder" | "transformer_decoder_flat" |
     #                  "local_attn_conv" | "siglip_ae"
-    #   "siglip_ae" is a faithful port of Video-XL-Pro's SiglipAE (see dts.py) — unlike
+    #   "siglip_ae" is a faithful port of Video-XL-Pro's SiglipAE (see siglip_ae.py) — unlike
     #   the other two, its depth is fixed at construction from `window_size`
     #   (log2(window_size) stride-2 Conv3d stages), so every compression window given
     #   to it must contain exactly `window_size` frames; `window_size` must be set

@@ -13,10 +13,10 @@ from tqdm import tqdm
 from videollama3.constants import DEFAULT_IMAGE_TOKEN
 from videollama3.model import Videollama3Qwen2Config, Videollama3Qwen2ForCausalLM
 from videollama3.model.processor import Videollama3Processor
-from videollama3.train.videollama3_chat_finetune_compressor import (
+from videollama3.train.data.compressor import (
+    CompressorLazySupervisedDataset,
     select_compression_parts,
 )
-from videollama3.train.videollama3_chat_finetune_compressor import CompressorLazySupervisedDataset
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
 
 

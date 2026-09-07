@@ -15,7 +15,11 @@ frozen-everything-but-the-compressor CE recipe, single forward
   an HF checkpoint dir) and **frozen**; only the Stage-2 fold trains.
 
 Everything else (token add / embed resize / DeepSpeed / trainable-LR wiring / save)
-is reused verbatim from the base script via monkeypatch, so this file stays small.
+is reused verbatim from the base script. Instead of monkeypatching the base module,
+this file passes its overrides through ``base.train()``'s keyword-only injection
+hooks (``model_args_cls`` / ``data_args_cls`` / ``dataset_cls`` /
+``build_token_compressor_config`` / ``configure_image_processor`` /
+``on_compressor_built``).
 
 Run from repo root with ``PYTHONPATH=.`` (the shell wrapper exports it)::
 
@@ -28,7 +32,9 @@ Run from repo root with ``PYTHONPATH=.`` (the shell wrapper exports it)::
 """
 from __future__ import annotations
 
+import logging
 import math
+import random
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -38,7 +44,21 @@ sys.path.append("./")
 import torch
 
 import videollama3.train.compressor_pretrain_with_videollama3 as base
+from videollama3.constants import DEFAULT_IMAGE_TOKEN
 from videollama3.model.compressor import TwoStageCompressor
+from videollama3.train.compressor_pretrain_with_videollama3 import (
+    _build_token_compressor_config as _orig_build_cfg,
+)
+from videollama3.train.data.common import rank0_print
+from videollama3.train.data.global_compressor import (
+    GlobalCompressorLazySupervisedDataset,
+    _rewrite_image_block_as_single_frame_video,
+    get_video_content,
+    resample_video_frames,
+)
+
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Unit partition — U <= max_units contiguous frame chunks, one compression_part
@@ -134,14 +154,17 @@ def build_stage2_ts_info(
 # U contiguous units instead of one whole-video part.
 # ---------------------------------------------------------------------------
 
-class Stage2UnitDataset(base.GlobalCompressorLazySupervisedDataset):
+class Stage2UnitDataset(GlobalCompressorLazySupervisedDataset):
     def _stage2_knobs(self):
         da = self.data_args
+        m = 64
+        if self.model_args is not None:
+            m = int(getattr(self.model_args, "stage2_n_summary_tokens", 64))
         return (
             int(getattr(da, "frames_per_segment", 4)),
             int(getattr(da, "segs_per_unit", 6)),
             int(getattr(da, "stage2_max_units", 5)),
-            int(getattr(base, "_STAGE2_M", 64)),   # M readout tokens / unit (from model_args)
+            m,  # M readout tokens / unit (from model_args)
         )
 
     def _convert_normal(self, data_dict):
@@ -171,32 +194,26 @@ class Stage2UnitDataset(base.GlobalCompressorLazySupervisedDataset):
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         try:
             sample = self.list_data_dict[i]
-            feat_path = self._feature_path(sample)
-            if feat_path is not None:
-                modal, feat, messages, merge_size = self._convert_feature(sample, feat_path)
-                content = base.get_video_content(messages)
-                data_dict = self._process_feature(feat, messages, merge_size)
+            if self.online_mode:
+                modal, images, messages, merge_size = self._convert_online_video(sample)
             else:
-                if self.online_mode:
-                    modal, images, messages, merge_size = self._convert_online_video(sample)
-                else:
-                    modal, images, messages, merge_size = self._convert_normal(sample)
-                is_still_image = modal == "image"
-                if is_still_image:
-                    base._rewrite_image_block_as_single_frame_video(messages)
-                    modal, merge_size = "video", self.data_args.video_merge_size
-                assert modal == "video", "Compressor training currently only supports video data."
-                content = base.get_video_content(messages)
-                if self.fixed_frames > 0 and not is_still_image:
-                    images = base.resample_video_frames(images, content, self.fixed_frames)
-                data_dict = self.vlprocessor(
-                    images=images,
-                    text=messages,
-                    merge_size=merge_size,
-                    return_labels=self.return_label,
-                    return_tensors="pt",
-                )
-                data_dict["modals"] = [modal] * len(images)
+                modal, images, messages, merge_size = self._convert_normal(sample)
+            is_still_image = modal == "image"
+            if is_still_image:
+                _rewrite_image_block_as_single_frame_video(messages)
+                modal, merge_size = "video", self.data_args.video_merge_size
+            assert modal == "video", "Compressor training currently only supports video data."
+            content = get_video_content(messages)
+            if self.fixed_frames > 0 and not is_still_image:
+                images = resample_video_frames(images, content, self.fixed_frames)
+            data_dict = self.vlprocessor(
+                images=images,
+                text=messages,
+                merge_size=merge_size,
+                return_labels=self.return_label,
+                return_tensors="pt",
+            )
+            data_dict["modals"] = [modal] * len(images)
 
             total_frames = int(content["num_frames"])
             assert total_frames > 0, f"Sample {i} has no frames."
@@ -204,15 +221,15 @@ class Stage2UnitDataset(base.GlobalCompressorLazySupervisedDataset):
             max_len = self.vlprocessor.tokenizer.model_max_length
             seq_len = int(data_dict["input_ids"].shape[-1])
             if seq_len > max_len:
-                backup_idx = base.random.randint(0, len(self.list_data_dict) - 1)
-                base.logger.warning(
+                backup_idx = random.randint(0, len(self.list_data_dict) - 1)
+                logger.warning(
                     "Sample %s: pre-compression length %d exceeds model_max_length %d (%d frames). "
                     "Lower --max_frames or --fixed_frames. Retrying with sample %s.",
                     i, seq_len, max_len, total_frames, backup_idx,
                 )
                 return self.__getitem__(backup_idx)
 
-            image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(base.DEFAULT_IMAGE_TOKEN)
+            image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
             total_vision_tokens = int((data_dict["input_ids"] == image_token_id).sum().item())
             assert total_vision_tokens % total_frames == 0, (
                 f"Total vision tokens {total_vision_tokens} should be divisible by total frames {total_frames}."
@@ -238,8 +255,8 @@ class Stage2UnitDataset(base.GlobalCompressorLazySupervisedDataset):
             )
 
         except Exception:
-            backup_idx = base.random.randint(0, len(self.list_data_dict) - 1)
-            base.logger.exception("Failed to process sample %s. Fallback index: %s.", i, backup_idx)
+            backup_idx = random.randint(0, len(self.list_data_dict) - 1)
+            logger.exception("Failed to process sample %s. Fallback index: %s.", i, backup_idx)
             return self.__getitem__(backup_idx)
         return data_dict
 
@@ -254,7 +271,14 @@ class Stage2ModelArguments(base.ModelArguments):
     stage1_pretrained: str = field(
         default="",
         metadata={"help": "Warm-start for Stage-1: a bare qbase .pt/.bin OR an HF checkpoint dir "
-                          "(model.token_compressor.* pulled from the shards). Stage-1 is then frozen."},
+                          "(model.token_compressor.* pulled from the shards). Leave empty when the "
+                          "whole compressor (stage1+stage2) is warm-started via --pretrained_compressor_path."},
+    )
+    freeze_stage1: bool = field(
+        default=True,
+        metadata={"help": "Stage-2a: keep the Stage-1 qbase frozen (only the fold trains). Set False "
+                          "for the joint-polish run that unfreezes the qbase (pair with a small "
+                          "--stage1_lr so it moves ~10x slower than the fold)."},
     )
     stage2_n_summary_tokens: int = field(default=64, metadata={"help": "M readout tokens per unit."})
     stage2_d_model: int = field(default=1024)
@@ -262,12 +286,6 @@ class Stage2ModelArguments(base.ModelArguments):
     stage2_d_state: int = field(default=128)
     stage2_headdim: int = field(default=64)
     stage2_time_embed: str = field(default="index_sincos")
-
-    def __post_init__(self):
-        # stash for the monkeypatched _set_module_trainable (fires mid-train())
-        base._STAGE1_PRETRAINED = self.stage1_pretrained or None
-        # stash M for Stage2UnitDataset._stage2_knobs (min unit size = M tokens)
-        base._STAGE2_M = int(self.stage2_n_summary_tokens)
 
 
 @dataclass
@@ -292,46 +310,10 @@ class Stage2DataArguments(base.DataArguments):
                           "checkpoint value (16 -> 4x4 grid)."},
     )
 
-    def __post_init__(self):
-        # stash for the monkeypatched Videollama3Processor factory (fires mid-train())
-        base._VISION_MAX_TOKENS = self.vision_max_tokens
-        base._VISION_MIN_TOKENS = self.vision_min_tokens
-
 
 # ---------------------------------------------------------------------------
-# Config builder + trainable hook (monkeypatched into the base module).
+# Injection hooks passed to base.train() (no monkeypatching).
 # ---------------------------------------------------------------------------
-
-_orig_build_cfg = base._build_token_compressor_config
-_orig_set_trainable = base._set_module_trainable
-_orig_processor_cls = base.Videollama3Processor
-base._STAGE1_PRETRAINED = None
-base._VISION_MAX_TOKENS = None
-base._VISION_MIN_TOKENS = None
-base._STAGE2_M = 64
-
-
-def _stage2_processor(image_processor=None, tokenizer=None, *args, **kwargs):
-    """Push the image processor into DYNAMIC-HW mode before it is wrapped.
-
-    ``force_size`` is left as-is (so passing --force_image_size still forces a
-    square); we only widen the token budget so native-resolution frames are not
-    shrunk. ``max_tokens`` is a per-video budget shared across frames.
-    """
-    if image_processor is not None:
-        mt = getattr(base, "_VISION_MAX_TOKENS", None)
-        mn = getattr(base, "_VISION_MIN_TOKENS", None)
-        if mt:
-            image_processor.max_tokens = int(mt)
-        if mn:
-            image_processor.min_tokens = int(mn)
-        base.rank0_print(
-            f"[stage2a] image processor: force_size={image_processor.force_size}, "
-            f"min_tokens={image_processor.min_tokens}, max_tokens={image_processor.max_tokens} "
-            f"(dynamic HW unless force_size is set; max_tokens is a per-video budget)"
-        )
-    return _orig_processor_cls(image_processor, tokenizer, *args, **kwargs)
-
 
 def _build_stage2_token_compressor_config(model_config, model_args, data_args) -> Dict:
     d = _orig_build_cfg(model_config, model_args, data_args)
@@ -349,29 +331,59 @@ def _build_stage2_token_compressor_config(model_config, model_args, data_args) -
     return d
 
 
-def _set_module_trainable_with_stage2(module, trainable):
-    _orig_set_trainable(module, trainable)
-    if isinstance(module, TwoStageCompressor):
-        if getattr(base, "_STAGE1_PRETRAINED", None):
-            module.load_stage1_pretrained(base._STAGE1_PRETRAINED)
-        module.freeze_stage1()
-        n2 = sum(p.numel() for p in module.stage2.parameters() if p.requires_grad)
-        base.rank0_print(
-            f"[stage2a] TwoStageCompressor: stage-1 frozen, stage-2 trainable "
-            f"({n2/1e6:.2f}M params); frames_per_segment={module.frames_per_segment}, "
-            f"K={module.tokens_per_segment}, M={module.n_summary_tokens}"
-        )
+def _configure_stage2_image_processor(image_processor, model_args, data_args) -> None:
+    """Push the image processor into DYNAMIC-HW mode before it is wrapped.
+
+    ``force_size`` is left as-is (so passing --force_image_size still forces a
+    square); we only widen the token budget so native-resolution frames are not
+    shrunk. ``max_tokens`` is a per-video budget shared across frames.
+    """
+    mt = data_args.vision_max_tokens
+    mn = data_args.vision_min_tokens
+    if mt:
+        image_processor.max_tokens = int(mt)
+    if mn:
+        image_processor.min_tokens = int(mn)
+    rank0_print(
+        f"[stage2a] image processor: force_size={image_processor.force_size}, "
+        f"min_tokens={image_processor.min_tokens}, max_tokens={image_processor.max_tokens} "
+        f"(dynamic HW unless force_size is set; max_tokens is a per-video budget)"
+    )
 
 
-base.ModelArguments = Stage2ModelArguments
-base.DataArguments = Stage2DataArguments
-base.GlobalCompressorLazySupervisedDataset = Stage2UnitDataset
-base._build_token_compressor_config = _build_stage2_token_compressor_config
-base._set_module_trainable = _set_module_trainable_with_stage2
-base.Videollama3Processor = _stage2_processor
+def _warmstart_and_freeze_stage1(compressor, model_args, data_args) -> None:
+    if not isinstance(compressor, TwoStageCompressor):
+        return
+    if model_args.stage1_pretrained:
+        compressor.load_stage1_pretrained(model_args.stage1_pretrained)
+    if getattr(model_args, "freeze_stage1", True):
+        compressor.freeze_stage1()
+        s1_state = "frozen"
+    else:
+        compressor.stage1_frozen = False
+        for p in compressor.stage1.parameters():
+            p.requires_grad_(True)
+        compressor.stage1.train()
+        s1_state = "TRAINABLE"
+    n1 = sum(p.numel() for p in compressor.stage1.parameters() if p.requires_grad)
+    n2 = sum(p.numel() for p in compressor.stage2.parameters() if p.requires_grad)
+    rank0_print(
+        f"[stage2a] TwoStageCompressor: stage-1 {s1_state} ({n1 / 1e6:.2f}M trainable), "
+        f"stage-2 trainable ({n2 / 1e6:.2f}M params); "
+        f"frames_per_segment={compressor.frames_per_segment}, "
+        f"K={compressor.tokens_per_segment}, M={compressor.n_summary_tokens}"
+    )
 
 
 if __name__ == "__main__":
-    # base.train()'s own __main__ passes this; base.train() defaults it to None,
-    # which trips `assert model.config._attn_implementation == "flash_attention_2"`.
-    base.train(attn_implementation="flash_attention_2")
+    # base.train() defaults attn_implementation to None, which trips
+    # `assert model.config._attn_implementation == "flash_attention_2"`.
+    base.train(
+        attn_implementation="flash_attention_2",
+        model_args_cls=Stage2ModelArguments,
+        data_args_cls=Stage2DataArguments,
+        dataset_cls=Stage2UnitDataset,
+        build_token_compressor_config=_build_stage2_token_compressor_config,
+        configure_image_processor=_configure_stage2_image_processor,
+        on_compressor_built=_warmstart_and_freeze_stage1,
+    )

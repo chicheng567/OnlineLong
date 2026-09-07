@@ -1,63 +1,53 @@
 #!/usr/bin/env python3
 """
 Re-annotate a video dataset with detailed captions from the frozen, pretrained
-VideoLLaMA3.
+VideoLLaMA3, decoding + vision-encoding every sample on the fly.
 
 Output is always text: one caption per video as JSONL (streamed, resume-safe),
 plus a merged conversation-format JSON that drops straight into anno_online/ and,
 with --meta_out, an anno_data/*.json registry over it.
 
 This file absorbed the former `precompute_teacher_gt.py`: both scripts ran the
-same frozen model over the same datasets and differed only in where the pixels
-came from, so they are now one batched pipeline whose input side is decided per
-sample. (Its logit-cache half is gone -- this is a captioning tool.)
+same frozen model over the same datasets. (Its logit-cache half is gone -- this
+is a captioning tool; the pre-extracted-feature input path is gone too -- frames
+are always decoded here.)
 
-Input, decided per sample (annotation-driven, not a global flag)
----------------------------------------------------------------
-  cached features  a .pt written by dataset_util/extract_vision_features.py --
-                   located via the entry's `vision_feat_path`, a `video` field
-                   that already names a .pt, or {--feat_dir}/{video_stem}.pt.
-                   Shape (T, HW, hidden) or (T*HW, hidden): exactly the frozen
-                   vision-encoder output *before* the mm_projector. No decode.
-  raw video        needs --decode_video. Frames are decoded and pushed through
-                   the frozen vision encoder here, at the extractor's exact
-                   settings (1 FPS sampling, --force_image_size, --merge_size),
-                   so a decoded run and an extract-then-caption run see the same
-                   features. Costs a vision-encoder load and ~90% of the wall
-                   time; pre-extracting wins as soon as a dataset is captioned
-                   more than once.
-  images           needs --decode_video, for `image` entries. Same encoder path,
-                   every image treated as one frame, no timestamps.
+Input: exactly one of
+  --meta_path   a plain sample list, or an anno_data-style dict-of-datasets
+                registry. Each entry's `video` (frames decoded at 1 FPS,
+                --force_image_size, --merge_size, and encoded on the GPU) or
+                `image` (one frame per image, no timestamps).
+  --video_dir   caption every video file found recursively under a bare folder,
+                with no annotation -- every clip captions with --prompt / the
+                pool.
 
-Why the cached path works without touching pixels
--------------------------------------------------
+How the caption is generated
+----------------------------
 Videollama3MetaForCausalLM.encode_images() is just
 
     vision_encoder(pixels) -> [optional compressor] -> mm_projector
 
 and prepare_inputs_labels_for_multimodal() then scatters those projected
-features into the text embedding sequence at every <image> token. Since the
-cached .pt files already hold the vision_encoder output, this script replays
-only the second half of that pipeline (mm_projector + scatter) and calls the
-plain Qwen2 generate() on the resulting inputs_embeds.
+features into the text embedding sequence at every <image> token. This script
+runs that pipeline (vision_encoder + mm_projector + scatter) and calls the plain
+Qwen2 generate() on the resulting inputs_embeds.
 
 NOTE: the multimodal `generate()` refuses `inputs_embeds`. By default
 (--llm_impl stock) the LLM is loaded as a plain `transformers.Qwen2ForCausalLM`
-alongside a standalone mm_projector, so `model.generate()` is the vanilla HF
-loop already; --llm_impl vendored restores the repo's `qwen2/` copy and reaches
-the same loop via `super(Videollama3Qwen2ForCausalLM, model).generate(...)`.
-The two backends were verified bitwise identical (teacher-forced, cache off, on
-real features: max|dlogit| == 0 across every caption position); stock is kept as
-the default only because it decodes ~1.35x faster at batch 1 and ~2.25x faster
-at batch 4. With --decode_video, 'stock' loads the vision encoder separately
-(one extra checkpoint read, freed immediately) while 'vendored' reuses the one
-already inside the multimodal model.
+alongside a standalone mm_projector (and a separately-loaded vision encoder), so
+`model.generate()` is the vanilla HF loop already; --llm_impl vendored restores
+the repo's `qwen2/` copy (reusing the vision encoder already inside the
+multimodal model) and reaches the same loop via
+`super(Videollama3Qwen2ForCausalLM, model).generate(...)`. The two backends were
+verified bitwise identical (teacher-forced, cache off: max|dlogit| == 0 across
+every caption position); stock is the default only because it decodes ~1.35x
+faster at batch 1 and ~2.25x faster at batch 4.
 
 Prompts
 -------
 With NO --prompt and NO --prompt_file, every sample draws its own prompt from a
 pool (--prompt_pool, default: baseline_default, scene_shift, motion_scene,
-state_change, timed_segments -- see dataset_util/prompts/README.md). The draw is
+timed_segments -- see dataset_util/prompts/README.md). The draw is
 per SAMPLE, not per run, so one pass over a dataset produces a mix of caption
 styles rather than one voice repeated N times, and the JSONL / --annotation_out
 entries record which style each caption is in as `prompt_name`.
@@ -84,12 +74,11 @@ so greedy captions are not reproducible token-for-token across runs.
 
 Timestamps
 ----------
-Feature files carry no time information, but the chat template wants a
-"Time X.0s:" prefix per frame. --timestamp_mode controls where those come from:
-  auto     (default) frames decoded here -> meta 'frame_timestamps' -> duration
-           field -> video metadata -> fabricated --fake_fps grid
-  meta     ONLY the 'frame_timestamps' extract_vision_features.py recorded (or,
-           for --decode_video samples, the times of the frames just decoded)
+The chat template wants a "Time X.0s:" prefix per frame. --timestamp_mode
+controls where those come from:
+  auto     (default) the exact times of the frames decoded here -> a meta
+           'frame_timestamps' field -> duration field -> video metadata ->
+           fabricated --fake_fps grid
   video    read fps/frame-count via decord from --video_root/<video> (metadata
            only, no decoding) and replay the 'uniform' sampling grid
   duration use meta's --duration_key and spread T frames evenly over it
@@ -97,13 +86,12 @@ Feature files carry no time information, but the chat template wants a
   fake     ignore every real source and fabricate a --fake_fps grid
   none     no timestamps at all
 
-Prefer 'meta'/'auto': the extractor samples at 1 FPS, which puts frame i at
-i + 0.5 seconds, and subsamples that grid for videos longer than its
---max_frames, so *every* re-derived grid here is an approximation. 'index' is
-only close for short videos and is badly wrong (off by the subsample factor)
-for long ones. Whatever the source, the resulting times are the only wall-clock
-signal the LLM gets -- the Qwen2 side sees plain 1-D RoPE over the flattened
-token sequence, which encodes frame *order* but not frame *rate*.
+Prefer 'auto': the decode samples at 1 FPS, which puts frame i at i + 0.5
+seconds and subsamples that grid for videos longer than --max_frames, so a
+re-derived grid ('video'/'duration'/'index') is only ever an approximation.
+Whatever the source, the resulting times are the only wall-clock signal the LLM
+gets -- the Qwen2 side sees plain 1-D RoPE over the flattened token sequence,
+which encodes frame *order* but not frame *rate*.
 
 Fabricated grids (--fake_fps, used by 'auto' as a last resort and by 'fake'
 unconditionally) are a deliberate LIE about wall-clock time, so every record
@@ -111,32 +99,37 @@ they produce is tagged "timestamps_synthetic": true in the JSONL and
 "synthetic_timestamps": true in --annotation_out, and the run warns with a
 count at the end. Use them for plain captioning, where only frame order
 matters; never for second-referencing annotation such as temporal grounding or
-dense captioning. Pass --fake_fps 0 to restore the old behaviour of emitting no
-timestamps at all when no real source is available.
+dense captioning. Pass --fake_fps 0 to emit no timestamps at all when no real
+source is available.
 
 Usage
 -----
-Caption from a feature cache, one prompt drawn per sample (single GPU):
-    /miniconda/envs/video/bin/python dataset_util/recaption_from_features.py \
-        --feat_dir vision_feat_cache \
+Caption a bare folder of clips (one prompt drawn per sample), all GPUs:
+    torchrun --nproc_per_node=8 dataset_util/recaption_videos.py \
+        --video_dir /share/dataset/internVid \
+        --output_file recaption/internvid/captions.jsonl \
+        --annotation_out anno_online/internvid_recap.json
+
+Caption a plain sample list, one prompt drawn per sample (single GPU):
+    python dataset_util/recaption_videos.py \
+        --meta_path anno_online/my_videos.json --data_root /root/datasets/... \
         --output_file recaption/detail_captions.jsonl \
         --annotation_out anno_online/detail_caption_recap.json
 
 The same, pinned to one style:
     ... --prompt_file dataset_util/prompts/scene_shift.txt
 
-Re-annotate an anno_data registry in place of its own captions, decoding the
-videos that have no feature cache (this is the old precompute_teacher_gt.py
-invocation):
-    torchrun --nproc_per_node=4 dataset_util/recaption_from_features.py \
+Re-annotate an anno_data registry in place of its own captions (the old
+precompute_teacher_gt.py invocation):
+    torchrun --nproc_per_node=4 dataset_util/recaption_videos.py \
         --model_path pretrained_models/videollama3_7b_local \
-        --meta_path anno_data/finetune_online.json --decode_video \
+        --meta_path anno_data/finetune_online.json \
         --output_file recaption/online.jsonl \
         --meta_out recaption/meta_recaption.json
 
 Multi-GPU (the work list is sorted, then sharded rank::world_size, which hands
 every rank a near-identical length distribution):
-    torchrun --nproc_per_node=4 dataset_util/recaption_from_features.py ...
+    torchrun --nproc_per_node=4 dataset_util/recaption_videos.py ...
 """
 from __future__ import annotations
 
@@ -181,8 +174,7 @@ DEFAULT_PROMPT = (
 
 # Keys this script adds to a meta entry for its own bookkeeping; stripped again
 # before an entry is written to --annotation_out.
-_INTERNAL_KEYS = ("_data_root", "_dataset", "_prompt", "_prompt_name", "_source",
-                  "vision_feat_path")
+_INTERNAL_KEYS = ("_data_root", "_dataset", "_prompt", "_prompt_name", "_source")
 
 _PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -196,11 +188,10 @@ DEFAULT_PROMPT_POOL = (
     "baseline_default",
     "scene_shift",
     "motion_scene",
-    "state_change",
     "timed_segments",
 )
 
-# Same extensions / recursive convention as extract_vision_features.py.
+# Video file extensions for the --annotate_unannotated disk walk.
 _VIDEO_EXTS = (".mp4", ".avi", ".mkv", ".mov", ".webm", ".m4v", ".flv")
 
 
@@ -252,7 +243,7 @@ def _pick_prompt(pool: List[Tuple[str, str]], video_id: str, seed: int) -> Tuple
 
 
 # ---------------------------------------------------------------------------
-# Distributed (mirrors dataset_util/extract_vision_features.py)
+# Distributed
 # ---------------------------------------------------------------------------
 
 _GLOO_PG = None
@@ -283,13 +274,6 @@ def _barrier():
 # ---------------------------------------------------------------------------
 # Sample collection
 # ---------------------------------------------------------------------------
-
-def _feat_path_for(stem: str, feat_dir: Optional[Path]) -> Optional[Path]:
-    if feat_dir is None:
-        return None
-    p = feat_dir / f"{stem}.pt"
-    return p if p.exists() else None
-
 
 def _entry_media(entry: Dict) -> Tuple[Optional[str], List[str]]:
     """(video field, image files) of a meta entry, both normalised to str."""
@@ -384,33 +368,52 @@ def _scan_unannotated(
     return extra
 
 
+def _scan_video_dir(video_dir: str) -> List[Dict]:
+    """One synthetic entry per video file found (recursively) under `video_dir`.
+
+    Used by --video_dir: caption a bare folder of clips with no annotation. Entries
+    carry no `conversations`, so they always caption with --prompt / the pool.
+    """
+    root = os.path.abspath(video_dir)
+    if not os.path.isdir(root):
+        raise NotADirectoryError(f"--video_dir {video_dir} is not a directory.")
+    entries: List[Dict] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()  # deterministic walk: the shard split depends on the order
+        for filename in sorted(filenames):
+            if os.path.splitext(filename)[1].lower() not in _VIDEO_EXTS:
+                continue
+            entries.append({
+                "video": os.path.relpath(os.path.join(dirpath, filename), root),
+                "_data_root": root,
+            })
+    return entries
+
+
 def _load_samples(
     meta_path: Optional[str],
-    feat_dir: Optional[Path],
     data_root: Optional[str],
-    decode_video: bool = False,
+    video_dir: Optional[str] = None,
     annotate_unannotated: bool = False,
     prompt: str = "",
     prompt_source: str = "fixed",
     prompt_pool: Optional[List[Tuple[str, str]]] = None,
     seed: int = 0,
 ) -> Tuple[List[Dict], Dict]:
-    """Build the work list, plus the anno_data registry it came from (empty when
-    --meta_path was a plain list) so --meta_out can be written in that shape.
+    """Build the work list, plus the anno_data registry it came from (empty for a
+    plain list or --video_dir) so --meta_out can be written in that shape.
 
-    Every item is {"video": <relative path or stem>, "feat_path": str | None,
-    "video_id": stem, "source": "feat"|"video"|"image", "prompt": str,
-    "images": [...], "raw": {...}}.
+    Every item is {"video": <relative path or stem>, "video_id": stem,
+    "source": "video"|"image", "prompt": str, "images": [...], "raw": {...}}.
     """
     samples: List[Dict] = []
     registry: Dict = {}
 
-    if meta_path is None:
-        assert feat_dir is not None, "Need --meta_path or --feat_dir."
-        entries = [
-            {"video": p.stem, "vision_feat_path": str(p)} for p in sorted(feat_dir.glob("*.pt"))
-        ]
+    if video_dir is not None:
+        entries = _scan_video_dir(video_dir)
+        logger.info("--video_dir: %d video file(s) under %s", len(entries), video_dir)
     else:
+        assert meta_path is not None, "need --meta_path or --video_dir"
         with open(meta_path) as f:
             raw = json.load(f)
         # dict-of-datasets registry (anno_data/*.json) -> flatten the annotations,
@@ -444,33 +447,18 @@ def _load_samples(
             continue
         seen.add(stem)
 
-        feat = entry.get("vision_feat_path")
-        if feat is None and video_field is not None and video_field.endswith(".pt"):
-            # A `video` field naming a .pt IS the cache (same convention as
-            # compressor_pretrain_with_videollama3.py).
-            feat = _resolve_path(entry, video_field, data_root)
-        if feat is None:
-            cached = _feat_path_for(stem, feat_dir)
-            feat = str(cached) if cached is not None else None
-
-        if feat is not None and Path(feat).exists():
-            source = "feat"
-        elif not decode_video:
-            n_no_input += 1
-            logger.warning(
-                "No feature file for %s -- skipped (pass --decode_video to decode and "
-                "encode it in this run).", key,
-            )
-            continue
-        elif image_files:
-            source, feat = "image", None
+        if image_files and video_field is None:
+            source = "image"
         else:
-            path = _resolve_path(entry, video_field, data_root)
-            if not os.path.exists(path):
-                n_no_input += 1
-                logger.warning("Neither a cached feature nor a readable video for %s -- skipped.", key)
-                continue
-            source, feat = "video", None
+            # --video_dir entries were just found by a disk walk -- skip the
+            # re-stat (matters at ~1e6 files, and every rank runs this).
+            if video_dir is None:
+                path = _resolve_path(entry, video_field, data_root)
+                if not os.path.exists(path):
+                    n_no_input += 1
+                    logger.warning("No readable video for %s -- skipped.", key)
+                    continue
+            source = "video"
 
         if prompt_pool is not None:
             prompt_name, sample_default = _pick_prompt(prompt_pool, stem, seed)
@@ -483,7 +471,6 @@ def _load_samples(
         entry["_source"] = source
         samples.append({
             "video": key,
-            "feat_path": feat,
             "video_id": stem,
             "source": source,
             "prompt": entry["_prompt"],
@@ -540,31 +527,16 @@ def _video_timestamps(video_path: str, num_frames: int) -> Optional[List[float]]
         return None
 
 
-def _meta_timestamps(
-    sample: Dict, num_frames: int, kept_indices: Optional[List[int]]
-) -> Optional[List[float]]:
-    """The frame times extract_vision_features.py recorded for this .pt file.
-
-    These are ground truth -- they come from the decode that produced the cached
-    features -- so no sampling grid has to be guessed. `kept_indices` mirrors any
-    --max_frames subsample applied on top of the cached tensor.
-    """
+def _meta_timestamps(sample: Dict, num_frames: int) -> Optional[List[float]]:
+    """A `frame_timestamps` list carried by the source annotation, if it has one
+    and its length matches the frame count actually used."""
     ts = sample["raw"].get("frame_timestamps")
     if not isinstance(ts, (list, tuple)) or not ts:
         return None
     ts = [float(x) for x in ts]
-    if kept_indices is not None:
-        if max(kept_indices) >= len(ts):
-            logger.warning(
-                "%s: frame_timestamps has %d entries but the cached tensor has more frames; "
-                "ignoring the cached timestamps.", sample["video_id"], len(ts),
-            )
-            return None
-        ts = [ts[i] for i in kept_indices]
     if len(ts) != num_frames:
         logger.warning(
-            "%s: frame_timestamps length %d != %d frames in the feature file -- the meta and "
-            "the .pt are out of sync; ignoring the cached timestamps.",
+            "%s: frame_timestamps length %d != %d frames used; ignoring it.",
             sample["video_id"], len(ts), num_frames,
         )
         return None
@@ -572,21 +544,18 @@ def _meta_timestamps(
 
 
 def fake_fps_meta(num_frames: int, fps: float = 1.0) -> Dict:
-    """Fabricate the time fields extract_vision_features.py would have recorded,
-    pretending the features were sampled at a constant `fps`.
+    """Fabricate constant-rate time fields, pretending the frames were sampled
+    at `fps`.
 
     Mirrors mm_utils.get_frame_indices(sample="fps<N>"): frame i stands for the
     clip [i/fps, (i+1)/fps), so its timestamp is that clip's *midpoint* --
-    (i + 0.5)/fps, not i/fps. Keys match the extractor's TIME_META_KEYS so the
-    result drops straight into a meta entry, plus a 'synthetic_timestamps'
-    marker so nothing downstream mistakes it for a real decode.
+    (i + 0.5)/fps -- plus a 'synthetic_timestamps' marker so nothing downstream
+    mistakes it for a real decode.
 
-    This is a deliberate LIE about wall-clock time. The extractor caps its
-    output at --max_frames, so any video longer than num_frames/fps seconds has
-    its frames spread across the entire runtime rather than the num_frames/fps
-    window claimed here; the error grows with video length and is unbounded.
-    Fine when only frame order matters (plain captioning) -- never for
-    second-referencing annotation (temporal grounding, dense captioning).
+    A deliberate LIE about wall-clock time: a video longer than num_frames/fps
+    seconds has its frames spread across the whole runtime, not the window
+    claimed here. Fine when only frame order matters (plain captioning) -- never
+    for second-referencing annotation (temporal grounding, dense captioning).
     """
     delta = 1.0 / fps
     return {
@@ -604,7 +573,6 @@ def _build_timestamps(
     mode: str,
     video_root: Optional[str],
     duration_key: str,
-    kept_indices: Optional[List[int]] = None,
     fake_fps: float = 0.0,
     decoded_ts: Optional[List[float]] = None,
 ) -> Tuple[Optional[List[float]], bool]:
@@ -612,32 +580,26 @@ def _build_timestamps(
     if mode == "none":
         return None, False
 
-    # --decode_video read these frames a moment ago, so their times are exact --
-    # better even than a cached meta, which can go stale against its .pt.
+    # The decode read these frames a moment ago, so their times are exact.
     if decoded_ts is not None and len(decoded_ts) == num_frames and mode != "fake":
         return [float(x) for x in decoded_ts], False
 
-    # 'fake' skips every real source on purpose: it exists to force a chosen
-    # frame rate onto features whose true timing is known but unwanted.
+    # 'fake' skips every real source on purpose: force a chosen frame rate even
+    # when the true timing is known.
     if mode == "fake":
         return fake_fps_meta(num_frames, fake_fps or 1.0)["frame_timestamps"], True
 
-    # Highest priority: the exact times the extractor decoded. Every other mode
-    # re-derives a sampling grid and can only ever approximate them.
-    if mode in ("auto", "meta"):
-        ts = _meta_timestamps(sample, num_frames, kept_indices)
+    # A frame_timestamps list carried by the source annotation, if any.
+    if mode == "auto":
+        ts = _meta_timestamps(sample, num_frames)
         if ts is not None:
             return ts, False
-        if mode == "meta":
-            return None, False
 
     if mode == "index":
         return [float(i) for i in range(num_frames)], False
 
     duration = sample["raw"].get(duration_key)
     if mode == "auto" and not isinstance(duration, (int, float)):
-        # Written by extract_vision_features.py even when the source annotation
-        # has no duration field of its own.
         duration = sample["raw"].get("video_duration")
     if mode in ("auto", "duration") and isinstance(duration, (int, float)) and duration > 0:
         if num_frames == 1:
@@ -665,59 +627,16 @@ def _build_timestamps(
 
 
 # ---------------------------------------------------------------------------
-# Feature loading
+# Frame decoding
 # ---------------------------------------------------------------------------
-
-def _load_feature(
-    path: str, tokens_per_frame: int, max_frames: int
-) -> Tuple[torch.Tensor, int, int, Optional[List[int]]]:
-    """Return (feat[T, HW, C], T, HW, kept_indices).
-
-    kept_indices is None when every cached frame is used, else the indices into
-    the *original* T that survived the --max_frames subsample -- the caller needs
-    them to slice the cached frame_timestamps the same way.
-    """
-    obj = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(obj, dict):
-        for key in ("feat", "feature", "features", "vision_feat"):
-            if key in obj:
-                obj = obj[key]
-                break
-    if not isinstance(obj, torch.Tensor):
-        raise TypeError(f"{path}: expected a tensor, got {type(obj)}")
-
-    if obj.dim() == 3:
-        t, hw, c = obj.shape
-    elif obj.dim() == 2:
-        n, c = obj.shape
-        hw = tokens_per_frame
-        if n % hw != 0:
-            raise ValueError(
-                f"{path}: flat feature length {n} is not divisible by "
-                f"--tokens_per_frame {hw}."
-            )
-        t = n // hw
-        obj = obj.view(t, hw, c)
-    else:
-        raise ValueError(f"{path}: unexpected feature shape {tuple(obj.shape)}")
-
-    kept: Optional[List[int]] = None
-    if max_frames > 0 and t > max_frames:
-        idx = torch.linspace(0, t - 1, max_frames).round().long()
-        obj = obj[idx]
-        kept = idx.tolist()
-        t = max_frames
-    return obj, t, hw, kept
-
 
 def _decode_media(
     sample: Dict, source: str, data_root: Optional[str], max_frames: int
 ) -> Tuple[List, Optional[List[float]]]:
-    """Decode a --decode_video sample into frames (+ their exact times).
+    """Decode a video sample into frames (+ their exact times).
 
-    Video sampling is `sample="fps1"` capped at `max_frames`, i.e. byte-for-byte
-    the grid dataset_util/extract_vision_features.py caches, so decoding here and
-    captioning from a cache see the same frames.
+    Video sampling is `sample="fps1"` capped at `max_frames` (1 FPS, then
+    uniform subsample for videos longer than that many seconds).
     """
     raw = sample["raw"]
     if source == "image":
@@ -757,7 +676,7 @@ def _build_prompt_ids(
         raise ValueError(f"tokens_per_frame={tokens_per_frame} is not a perfect square.")
     # merge_size cancels out of the expansion (process_text built the grid as
     # side*merge_size and then divided it back out), so it is kept only as a
-    # documented record of how the features were extracted.
+    # documented record of the geometry the frames were patchified at.
     del merge_size
 
     if modal == "image":
@@ -842,10 +761,9 @@ def _left_pad(
 _TEXT_TOKENS_PER_FRAME = 20
 _TEXT_TOKENS_FIXED = 256
 
-# --decode_video only: patches per vision-encoder forward. A caption batch can hold
-# far more frames than extract_vision_features.py ever puts in one encoder call, so
-# the encode is chunked independently of --max_batch_tokens. 448px frames patchify
-# to 1024 patches each, i.e. ~256 frames per forward.
+# Patches per vision-encoder forward. A caption batch can hold a lot of frames,
+# so the encode is chunked independently of --max_batch_tokens. 448px frames
+# patchify to 1024 patches each, i.e. ~256 frames per forward.
 _ENCODE_MAX_PATCHES = 1 << 18
 
 
@@ -862,25 +780,19 @@ def _probe_video_frames(path: str, cap: int) -> int:
 
 def _probe_num_frames(
     sample: Dict,
-    tokens_per_frame: int,
     max_frames: int,
-    decode_max_frames: int = 0,
     duration_key: str = "duration",
 ) -> int:
-    """Frames this sample will contribute, without reading any pixel/feature payload.
+    """Frames this sample will contribute, without decoding it.
 
-    Cached samples prefer the extractor's `num_frames` and otherwise read only the
-    .pt header (~1 ms) via a meta-device load. Decoded samples prefer `num_frames`,
-    then a duration field (1 FPS => ceil(seconds) frames), and only fall back to a
-    decord header open -- this runs for every sample on every rank, so the cheap
-    sources matter.
+    Prefers a `num_frames` field, then a duration field (1 FPS => ceil(seconds)
+    frames), and only falls back to a decord header open -- this runs for every
+    sample on every rank, so the cheap sources matter.
     """
     raw = sample["raw"]
-    source = sample.get("source", "feat")
-
-    if source == "image":
+    if sample.get("source") == "image":
         t = max(1, len(sample.get("images") or []))
-    elif source == "video":
+    else:
         t = raw.get("num_frames")
         if not isinstance(t, int) or t <= 0:
             duration = raw.get(duration_key)
@@ -891,26 +803,14 @@ def _probe_num_frames(
             else:
                 try:
                     t = _probe_video_frames(
-                        _resolve_path(raw, str(sample["video"]), None), decode_max_frames
+                        _resolve_path(raw, str(sample["video"]), None), max_frames
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.debug(
                         "frame probe failed on %s (%s); assuming the full cap.",
                         sample["video_id"], exc,
                     )
-                    t = decode_max_frames
-        if decode_max_frames > 0:
-            t = min(t, decode_max_frames)
-    else:
-        t = raw.get("num_frames")
-        if not isinstance(t, int) or t <= 0:
-            try:
-                obj = torch.load(sample["feat_path"], map_location="meta", weights_only=True, mmap=True)
-                shape = tuple(obj.shape)
-                t = shape[0] if len(shape) == 3 else max(1, shape[0] // tokens_per_frame)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("frame probe failed on %s (%s); assuming 1 frame.", sample["video_id"], exc)
-                t = 1
+                    t = max_frames
     if max_frames > 0:
         t = min(t, max_frames)
     return max(1, int(t))
@@ -985,9 +885,8 @@ def _slim_sample(sample: Dict, duration_key: str) -> Dict:
     keys = (*_WORKER_RAW_KEYS, duration_key)
     return {
         "video": sample["video"],
-        "feat_path": sample["feat_path"],
         "video_id": sample["video_id"],
-        "source": sample.get("source", "feat"),
+        "source": sample.get("source", "video"),
         "prompt": sample.get("prompt", ""),
         "prompt_name": sample.get("prompt_name", "fixed"),
         "images": sample.get("images") or [],
@@ -1008,14 +907,10 @@ def _rss_mb() -> float:
 
 
 class _FeatureBatchDataset(Dataset):
-    """Does the CPU-side prep (feature load or frame decode + patchify, timestamps,
-    prompt ids) off the main process so it overlaps with generate() instead of
-    stalling the GPU.
-
-    Cached samples come back with a ready `feat`; --decode_video samples come back
-    with `pixels` (patchified frames) for the main loop to push through the vision
-    encoder on the GPU -- the encoder forward is batched there exactly the way
-    extract_vision_features.py batches it.
+    """Does the CPU-side prep (frame decode + patchify, timestamps, prompt ids)
+    off the main process so it overlaps with generate() instead of stalling the
+    GPU. Each item comes back with `pixels` (patchified frames) for the main
+    loop to push through the vision encoder on the GPU.
     """
 
     def __init__(self, batches, processor, image_processor, args, video_root):
@@ -1030,41 +925,30 @@ class _FeatureBatchDataset(Dataset):
 
     def _prepare(self, sample: Dict) -> Dict:
         a = self.args
-        source = sample.get("source", "feat")
-        feat = pixels = None
-        kept = decoded_ts = None
+        source = sample.get("source", "video")
+        decoded_ts = None
 
-        if source == "feat":
-            feat, t, hw, kept = _load_feature(sample["feat_path"], a.tokens_per_frame, a.max_frames)
-            if hw != a.tokens_per_frame:
-                raise ValueError(
-                    f"cached tokens/frame {hw} != --tokens_per_frame {a.tokens_per_frame}"
-                )
-        else:
-            cap = a.decode_max_frames
-            if a.max_frames > 0:
-                cap = min(cap, a.max_frames)
-            frames, decoded_ts = _decode_media(
-                sample, source, a.data_root or self.video_root, cap
+        frames, decoded_ts = _decode_media(
+            sample, source, a.data_root or self.video_root, a.max_frames
+        )
+        pixels = self.image_processor(
+            images=[frames], merge_size=a.merge_size, return_tensors="pt"
+        )
+        grid = pixels["grid_sizes"][0].tolist()
+        t = int(grid[0])
+        hw = (int(grid[1]) // a.merge_size) * (int(grid[2]) // a.merge_size)
+        if hw != a.tokens_per_frame:
+            raise ValueError(
+                f"decoded {hw} tokens/frame != --tokens_per_frame {a.tokens_per_frame}; "
+                f"--force_image_size / --merge_size must match the geometry the prompt "
+                f"is built for"
             )
-            pixels = self.image_processor(
-                images=[frames], merge_size=a.merge_size, return_tensors="pt"
-            )
-            grid = pixels["grid_sizes"][0].tolist()
-            t = int(grid[0])
-            hw = (int(grid[1]) // a.merge_size) * (int(grid[2]) // a.merge_size)
-            if hw != a.tokens_per_frame:
-                raise ValueError(
-                    f"decoded {hw} tokens/frame != --tokens_per_frame {a.tokens_per_frame}; "
-                    f"--force_image_size / --merge_size must match the geometry the prompt "
-                    f"is built for"
-                )
 
         if source == "image":
             timestamps, ts_synthetic = None, False
         else:
             timestamps, ts_synthetic = _build_timestamps(
-                sample, t, a.timestamp_mode, self.video_root, a.duration_key, kept, a.fake_fps,
+                sample, t, a.timestamp_mode, self.video_root, a.duration_key, a.fake_fps,
                 decoded_ts,
             )
         input_ids = _build_prompt_ids(
@@ -1072,7 +956,7 @@ class _FeatureBatchDataset(Dataset):
             "image" if source == "image" else "video",
         )
         return {
-            "sample": sample, "feat": feat, "pixels": pixels, "t": t, "input_ids": input_ids,
+            "sample": sample, "pixels": pixels, "t": t, "input_ids": input_ids,
             "timestamps": timestamps, "ts_synthetic": ts_synthetic, "error": None,
         }
 
@@ -1133,12 +1017,11 @@ def _load_mm_projector(model_path: str, dtype: torch.dtype) -> torch.nn.Module:
 
 
 def _load_vision_encoder(model_path: str, dtype: torch.dtype):
-    """Pull just the vision tower out of the checkpoint (same trick as
-    dataset_util/extract_vision_features.py: load the full model, keep the tower,
-    drop the rest). Only needed for --decode_video under --llm_impl stock; the
+    """Pull just the vision tower out of the checkpoint (load the full model,
+    keep the tower, drop the rest). Only needed under --llm_impl stock; the
     vendored backend already has one in memory.
     """
-    logger.info("Loading the vision encoder from %s (--decode_video) ...", model_path)
+    logger.info("Loading the vision encoder from %s ...", model_path)
     full_model = Videollama3Qwen2ForCausalLM.from_pretrained(
         model_path, dtype=dtype, low_cpu_mem_usage=True,
     )
@@ -1154,11 +1037,11 @@ def _load_vision_encoder(model_path: str, dtype: torch.dtype):
 
 @torch.no_grad()
 def _encode_pixels(vision_encoder, items: List[Dict], device, dtype, hidden_size: int) -> None:
-    """Run the frozen vision encoder over every --decode_video item in this batch
-    and write the result back as `item["feat"]` (T, HW, hidden), frame-major.
+    """Run the frozen vision encoder over every item in this batch and write the
+    result back as `item["feat"]` (T, HW, hidden), frame-major.
 
     One padded forward for the whole batch, split back per sample by post-merge
-    token count -- the same accounting extract_vision_features.py does.
+    token count.
     """
     pixel_values = torch.cat([it["pixels"]["pixel_values"] for it in items], dim=0).to(
         device=device, dtype=dtype
@@ -1178,23 +1061,64 @@ def _encode_pixels(vision_encoder, items: List[Dict], device, dtype, hidden_size
         it["pixels"] = None
 
 
-def _load_model(model_path: str, dtype: torch.dtype, attn_impl: str, llm_impl: str,
-                keep_vision_encoder: bool = False):
+def _install_mlp_seq_chunking(
+    model: torch.nn.Module, chunk_tokens: int, threshold_tokens: Optional[int] = None
+) -> int:
+    """Chunk every SwiGLU MLP along the token axis for long-sequence forwards.
+
+    The generate() OOM is the MLP's `[tokens, intermediate_size]` activation at
+    prefill: intermediate_size=18944, so one big batch of long-video prompts
+    (~2.4e5 padded tokens) needs three ~8.5 GiB fp/bf16 buffers at once
+    (`gate_proj` out, `up_proj` out, their product). Splitting the token axis
+    into `chunk_tokens`-row slices caps that at chunk/total of the peak. The
+    result is bitwise identical -- each token's MLP is independent -- and decode
+    (a handful of tokens per step, below `threshold_tokens`) keeps the original
+    one-shot path, so the KV cache and the sampling loop are untouched.
+
+    Matches any submodule exposing gate_proj/up_proj/down_proj/act_fn, so it
+    covers both the stock `transformers` Qwen2MLP and the vendored `qwen2/` copy.
+    Returns the number of MLP modules patched.
+    """
+    if chunk_tokens <= 0:
+        return 0
+    threshold = threshold_tokens if threshold_tokens is not None else max(2 * chunk_tokens, 8192)
+
+    patched = 0
+    for mod in model.modules():
+        if not all(hasattr(mod, a) for a in ("gate_proj", "up_proj", "down_proj", "act_fn")):
+            continue
+        if getattr(mod, "_seq_chunk_patched", False):
+            continue
+
+        def forward(x, _m=mod):  # noqa: ANN001 - drop-in for nn.Module.forward
+            if math.prod(x.shape[:-1]) <= threshold:
+                return _m.down_proj(_m.act_fn(_m.gate_proj(x)) * _m.up_proj(x))
+            flat = x.reshape(-1, x.shape[-1])
+            out = torch.empty_like(flat)
+            for i in range(0, flat.shape[0], chunk_tokens):
+                sl = slice(i, i + chunk_tokens)
+                out[sl] = _m.down_proj(_m.act_fn(_m.gate_proj(flat[sl])) * _m.up_proj(flat[sl]))
+            return out.view_as(x)
+
+        mod.forward = forward
+        mod._seq_chunk_patched = True
+        patched += 1
+    return patched
+
+
+def _load_model(model_path: str, dtype: torch.dtype, attn_impl: str, llm_impl: str):
     """Returns (model, projector, embed_tokens, generate_fn).
 
     llm_impl="stock" loads the LLM as a plain `transformers.Qwen2ForCausalLM`
-    instead of the repo's vendored `qwen2/` copy. The two were verified to be
-    *bitwise* identical (teacher-forced, cache disabled, real features:
-    max|dlogit| == 0 over every caption position), but the vendored copy -- a
-    transformers-4.46.3-era snapshot kept only because the trainable-compressor
-    training path subclasses it -- decodes ~1.35x slower at batch 1 and ~2.25x
-    slower at batch 4. Nothing here needs the multimodal subclass: the features
-    are pre-encoded, so only the mm_projector and the plain LLM are ever run.
+    instead of the repo's vendored `qwen2/` copy (plus a standalone mm_projector;
+    the vision encoder is loaded separately). The two were verified *bitwise*
+    identical (teacher-forced, cache disabled: max|dlogit| == 0 over every caption
+    position); the vendored copy -- a transformers-4.46.3-era snapshot kept only
+    because the trainable-compressor training path subclasses it -- decodes ~1.35x
+    slower at batch 1 and ~2.25x slower at batch 4.
 
     Greedy captions still will not match a vendored run token-for-token, but that
-    is bf16 KV-cache rounding, not an implementation difference -- the vendored
-    model does not reproduce its own cache-free output either, and every observed
-    divergence sat on a top-2 logit margin at or below bf16 resolution.
+    is bf16 KV-cache rounding, not an implementation difference.
     """
     logger.info("Loading %s (llm_impl=%s) ...", model_path, llm_impl)
 
@@ -1202,10 +1126,6 @@ def _load_model(model_path: str, dtype: torch.dtype, attn_impl: str, llm_impl: s
         model = Videollama3Qwen2ForCausalLM.from_pretrained(
             model_path, dtype=dtype, attn_implementation=attn_impl, low_cpu_mem_usage=True,
         )
-        if getattr(model.get_model(), "vision_encoder", None) is not None and not keep_vision_encoder:
-            # Never invoked here: the features are already encoded.
-            model.get_model().vision_encoder = None
-            logger.info("Dropped the vision encoder (features are pre-extracted).")
         if model.config.use_cache is None:
             model.config.use_cache = True
         model = model.eval()
@@ -1271,18 +1191,16 @@ def _write_meta_registry(
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model_path", default="pretrained_models/videollama3_7b_local",
-                        help="Pretrained VideoLLaMA3 checkpoint (only LLM + mm_projector are used).")
-    parser.add_argument("--feat_dir", default=None,
-                        help="Directory of {video_stem}.pt features from extract_vision_features.py. "
-                             "Scanned directly when --meta_path is omitted.")
+                        help="Pretrained VideoLLaMA3 checkpoint (LLM + mm_projector + vision encoder).")
     parser.add_argument("--meta_path", default=None,
-                        help="meta_with_vision_feat.json, a plain sample list, or an "
-                             "anno_data-style dict-of-datasets registry. Defaults to "
-                             "--feat_dir/meta_with_vision_feat.json when that file exists.")
+                        help="A plain sample list or an anno_data-style dict-of-datasets registry. "
+                             "Exactly one of --meta_path / --video_dir is required.")
+    parser.add_argument("--video_dir", default=None,
+                        help="Caption every video file found (recursively) under this directory, "
+                             "with no annotation. Mutually exclusive with --meta_path.")
     parser.add_argument("--data_root", default=None, help="Fallback root for relative video paths.")
     parser.add_argument("--video_root", default=None,
-                        help="Video root used ONLY to recover exact timestamps via decord metadata "
-                             "(no frames are decoded). Defaults to --data_root.")
+                        help="Root for relative video paths. Defaults to --data_root.")
     parser.add_argument("--output_file", default="recaption/detail_captions.jsonl",
                         help="JSONL results; each rank streams to {stem}.rank{r}{suffix}, "
                              "rank 0 merges into this path at the end.")
@@ -1317,39 +1235,27 @@ def main():
                         help="Also caption video files found under the data roots that the "
                              "annotation never mentions. They always use --prompt.")
 
-    parser.add_argument("--decode_video", action="store_true",
-                        help="Decode + vision-encode samples that have no cached feature, instead "
-                             "of skipping them. Costs a vision-encoder load and makes the run "
-                             "decode-bound; extract_vision_features.py first is faster whenever a "
-                             "dataset is captioned more than once.")
-    parser.add_argument("--decode_max_frames", type=int, default=10,
-                        help="Frame cap for --decode_video, same meaning and default as "
-                             "extract_vision_features.py --max_frames: sampling is 1 FPS and only "
-                             "videos longer than this many seconds get their 1-FPS indices "
-                             "uniformly subsampled down to it.")
+    parser.add_argument("--max_frames", type=int, default=10,
+                        help="Frame cap: sampling is 1 FPS and only videos longer than this many "
+                             "seconds get their 1-FPS indices uniformly subsampled down to it.")
     parser.add_argument("--force_image_size", type=int, default=448,
-                        help="Square size every decoded frame is resized to before patching "
-                             "(--decode_video only). With --merge_size 2 this is what makes a "
-                             "frame 256 tokens; <=0 lets the processor resize dynamically, which "
-                             "breaks the uniform-tokens-per-frame prompt.")
-
+                        help="Square size every decoded frame is resized to before patching. "
+                             "With --merge_size 2 this is what makes a frame 256 tokens; <=0 lets "
+                             "the processor resize dynamically, which breaks the "
+                             "uniform-tokens-per-frame prompt.")
     parser.add_argument("--tokens_per_frame", type=int, default=256,
-                        help="HW per frame; must match extraction (448/(14*2) -> 16*16=256).")
+                        help="HW per frame the prompt is built for (448/(14*2) -> 16*16=256).")
     parser.add_argument("--merge_size", type=int, default=2,
-                        help="Spatial merge size used at extraction time.")
-    parser.add_argument("--max_frames", type=int, default=0,
-                        help="Uniformly subsample cached features down to this many frames "
-                             "(0 = use all cached frames).")
+                        help="Spatial merge size the frames are patchified at.")
 
     parser.add_argument("--timestamp_mode", default="auto",
-                        choices=["auto", "meta", "video", "duration", "index", "fake", "none"])
+                        choices=["auto", "video", "duration", "index", "fake", "none"])
     parser.add_argument("--fake_fps", type=float, default=1.0,
                         help="Frame rate to fabricate when no real timestamp source is available "
                              "('auto') or when forcing one ('fake'): frame i is placed at "
-                             "(i+0.5)/fps seconds, the same midpoint convention as the "
-                             "extractor's fps1 sampling. Fabricated grids are tagged synthetic in "
-                             "every output. 0 disables fabrication, so 'auto' emits no timestamps "
-                             "at all when nothing real is found.")
+                             "(i+0.5)/fps seconds. Fabricated grids are tagged synthetic in every "
+                             "output. 0 disables fabrication, so 'auto' emits no timestamps at "
+                             "all when nothing real is found.")
     parser.add_argument("--duration_key", default="duration",
                         help="Meta field holding video duration in seconds.")
 
@@ -1364,9 +1270,18 @@ def main():
                         help="Padded-token budget per generate() call -- batch_size x the longest "
                              "member. This, not --batch_size, predicts peak VRAM: measured ~199 KB "
                              "per padded token on top of the weights, consistently across shapes. "
-                             "131072 suits an 80 GB card; use ~32768 on 24 GB.")
+                             "131072 suits an 80 GB card; use ~32768 on 24 GB. With "
+                             "--mlp_chunk_tokens on, the MLP no longer sets the prefill peak, so "
+                             "this can go 2-4x higher (the KV cache becomes the limit) to grow the "
+                             "decode batch, which is what actually starves the GPU here.")
+    parser.add_argument("--mlp_chunk_tokens", type=int, default=4096,
+                        help="Split each SwiGLU MLP into this many token-rows at a time when a "
+                             "forward exceeds ~2x this (prefill only; decode is far below it). "
+                             "Caps the [tokens, 18944] MLP activation that OOMs a large batch, "
+                             "bitwise-identically, without touching the KV cache or decode loop. "
+                             "0 disables it (restores the single-shot MLP).")
     parser.add_argument("--num_workers", type=int, default=4,
-                        help="DataLoader workers prefetching features / building prompt ids.")
+                        help="DataLoader workers decoding frames / building prompt ids.")
     parser.add_argument("--prefetch_factor", type=int, default=1,
                         help="Batches each worker keeps queued ahead of the loop. Host RAM holds "
                              "num_workers x prefetch_factor whole batches of fp16 features, so "
@@ -1378,9 +1293,13 @@ def main():
                              "queue -- RSS should flatten within the first few batches.")
     parser.add_argument("--no_sort_by_length", action="store_true",
                         help="Process in meta order instead of longest-first. Sorting keeps a "
-                             "batch from being padded out to its longest member (cached T ranges "
-                             "4..100 frames), and longest-first makes an over-budget run OOM in "
-                             "the first minute rather than hours in.")
+                             "batch from being padded out to its longest member, and "
+                             "longest-first makes an over-budget run OOM in the first minute "
+                             "rather than hours in. Also skips the per-sample frame probe "
+                             "entirely: with a bare --video_dir (no num_frames / duration in the "
+                             "entries) that probe is a decord header-open of every file on every "
+                             "rank, which on a network FS costs hours before the first caption -- "
+                             "pass this when every clip will hit --max_frames anyway.")
     parser.add_argument("--llm_impl", choices=["stock", "vendored"], default="stock",
                         help="Which Qwen2 implementation runs the LLM. 'stock' uses "
                              "transformers.Qwen2ForCausalLM plus a standalone mm_projector; it is "
@@ -1415,30 +1334,13 @@ def main():
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
 
-    feat_dir = Path(args.feat_dir) if args.feat_dir else None
+    if bool(args.meta_path) == bool(args.video_dir):
+        parser.error("pass exactly one of --meta_path / --video_dir.")
     meta_path = args.meta_path
     if meta_path is not None and not Path(meta_path).exists():
-        # A typo'd path should not silently become a fabricated-timestamp run, so
-        # this only degrades to scanning when there is a --feat_dir to scan.
-        if feat_dir is None:
-            parser.error(f"--meta_path {meta_path} does not exist and there is no --feat_dir "
-                         f"to fall back on.")
-        if rank == 0:
-            logger.warning("--meta_path %s does not exist; scanning %s instead.", meta_path, feat_dir)
-        meta_path = None
-    if meta_path is None and feat_dir is not None:
-        default_meta = feat_dir / "meta_with_vision_feat.json"
-        if default_meta.exists():
-            meta_path = str(default_meta)
-            if rank == 0:
-                logger.info("Using %s", meta_path)
-        elif rank == 0 and args.timestamp_mode == "auto" and args.fake_fps > 0:
-            logger.warning(
-                "No meta next to the features (%s), so frame timestamps will be FABRICATED at "
-                "%.4g FPS. Captions stay usable for content, but their times are made up -- "
-                "pass --fake_fps 0 to emit none instead.", default_meta, args.fake_fps)
-    if meta_path is None and feat_dir is None:
-        parser.error("Pass --feat_dir and/or --meta_path.")
+        parser.error(f"--meta_path {meta_path} does not exist.")
+    if args.video_dir is not None and not Path(args.video_dir).is_dir():
+        parser.error(f"--video_dir {args.video_dir} is not a directory.")
 
     prompt = args.prompt or ""
     prompt_pool: Optional[List[Tuple[str, str]]] = None
@@ -1461,8 +1363,8 @@ def main():
         rank_file.unlink()
 
     samples, registry = _load_samples(
-        meta_path, feat_dir, args.data_root,
-        decode_video=args.decode_video,
+        meta_path, args.data_root,
+        video_dir=args.video_dir,
         annotate_unannotated=args.annotate_unannotated,
         prompt=prompt,
         prompt_source=args.prompt_source,
@@ -1479,21 +1381,23 @@ def main():
     done = set() if args.overwrite else _load_done_ids(output_file)
     todo = [s for s in samples if s["video_id"] not in done]
 
-    n_decode = sum(1 for s in todo if s["source"] != "feat")
-    if n_decode and rank == 0:
-        logger.info(
-            "%d of %d sample(s) have no cached feature and will be decoded + encoded in this run.",
-            n_decode, len(todo),
+    if args.no_sort_by_length:
+        # No sort -> est_len is only the batch planner's padded-token estimate, and
+        # every sample gets the same one, so there is nothing to gain from probing
+        # each file. Skip _probe_num_frames outright: on a bare --video_dir its
+        # fallback is a decord header-open of all N files on all W ranks.
+        flat_len = _estimate_seq_len(
+            args.max_frames if args.max_frames > 0 else 32,
+            args.tokens_per_frame, prompt_tokens,
         )
-
-    items = [
-        {"sample": s, "est_len": _estimate_seq_len(
-            _probe_num_frames(s, args.tokens_per_frame, args.max_frames,
-                              args.decode_max_frames, args.duration_key),
-            args.tokens_per_frame, prompt_tokens)}
-        for s in todo
-    ]
-    if not args.no_sort_by_length:
+        items = [{"sample": s, "est_len": flat_len} for s in todo]
+    else:
+        items = [
+            {"sample": s, "est_len": _estimate_seq_len(
+                _probe_num_frames(s, args.max_frames, args.duration_key),
+                args.tokens_per_frame, prompt_tokens)}
+            for s in todo
+        ]
         # Sort the whole list *before* sharding: round-robin over a sorted list
         # hands every rank a near-identical length distribution for free, which
         # sharding first and sorting second only achieves by luck.
@@ -1536,27 +1440,27 @@ def main():
     gc.collect()
     logger.info("rank %d: work list ready, RSS %.0f MB", rank, _rss_mb())
 
-    needs_encoder = any(it["sample"]["source"] != "feat" for batch in batches for it in batch)
     model, projector, embed_tokens, generate_fn = _load_model(
         args.model_path, dtype, args.attn_implementation, args.llm_impl,
-        keep_vision_encoder=needs_encoder,
     )
+    n_mlp = _install_mlp_seq_chunking(model, args.mlp_chunk_tokens)
+    if rank == 0 and n_mlp:
+        logger.info(
+            "MLP token-chunking on: %d MLP module(s), %d tokens/chunk above the %d-token "
+            "threshold (prefill only).", n_mlp, args.mlp_chunk_tokens, max(2 * args.mlp_chunk_tokens, 8192),
+        )
     model.to(device)
     projector.to(device)
 
-    vision_encoder = None
-    ve_hidden_size = 0
-    image_processor = None
-    if needs_encoder:
-        if args.llm_impl == "vendored":
-            vision_encoder = model.get_model().vision_encoder
-            ve_hidden_size = vision_encoder.hidden_size
-        else:
-            vision_encoder, ve_hidden_size = _load_vision_encoder(args.model_path, dtype)
-        vision_encoder = vision_encoder.to(device).eval()
-        image_processor = Videollama3ImageProcessor.from_pretrained(args.model_path)
-        if args.force_image_size > 0:
-            image_processor.force_size = [args.force_image_size] * 2
+    if args.llm_impl == "vendored":
+        vision_encoder = model.get_model().vision_encoder
+        ve_hidden_size = vision_encoder.hidden_size
+    else:
+        vision_encoder, ve_hidden_size = _load_vision_encoder(args.model_path, dtype)
+    vision_encoder = vision_encoder.to(device).eval()
+    image_processor = Videollama3ImageProcessor.from_pretrained(args.model_path)
+    if args.force_image_size > 0:
+        image_processor.force_size = [args.force_image_size] * 2
 
     processor = Videollama3Processor.from_pretrained(args.model_path)
     # from_pretrained loads the checkpoint's chat_template.jinja, which references an
@@ -1624,7 +1528,7 @@ def main():
     for n_batch, prepared in enumerate(loader, 1):
         embeds_list, metas = [], []
 
-        # --decode_video items arrive patchified but unencoded; one GPU forward for
+        # Items arrive patchified but unencoded; one GPU forward for
         # the whole batch, chunked so a batch of long videos cannot blow up the
         # encoder's activations on its own.
         to_encode = [it for it in prepared if it.get("error") is None and it.get("pixels") is not None]
@@ -1695,7 +1599,6 @@ def main():
             record = {
                 "video_id": sample["video_id"],
                 "video": sample["video"],
-                "feat_path": sample["feat_path"],
                 "num_frames": t,
                 "timestamps": [round(float(x), 2) for x in timestamps] if timestamps else None,
                 # True => the times above were made up, not decoded. Filter on this
@@ -1729,8 +1632,8 @@ def main():
     if n_no_ts:
         logger.warning(
             "rank %d: %d captions were generated with NO timestamps (the prompt carried frame "
-            "order but no wall-clock time). Re-run extract_vision_features.py so the meta has "
-            "frame_timestamps, or pass --video_root / --timestamp_mode explicitly.",
+            "order but no wall-clock time). Pass --video_root so the frame times can be "
+            "recovered from the container, or set --timestamp_mode explicitly.",
             rank, n_no_ts,
         )
 

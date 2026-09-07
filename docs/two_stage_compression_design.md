@@ -604,10 +604,13 @@ the constraint is nearly free.
       `compressor.compress_windows(gathered, compression_cu_seqlens, grid_hws)` when
       exposed, scatter via the existing `replace_mask`. No
       `prepare_inputs_labels_for_multimodal` refactor, no chunked encoder forward yet.
-   c. **DONE — `videollama3/train/stage2a_pretrain_compressor_fold.py`** (thin
-      monkeypatch over `compressor_pretrain_with_videollama3.py`): forces
-      `compressor_type` → `…+mamba`, warm-starts + freezes stage-1, trains only the
-      fold, single CE, `zero1`. Wrapper `shell/pretrain_stage2a_fold.sh`.
+   c. **DONE — `videollama3/train/stage2a_pretrain_compressor_fold.py`** (thin wrapper
+      over `compressor_pretrain_with_videollama3.py`'s `train()` via its keyword-only
+      injection hooks — `dataset_cls` / `build_token_compressor_config` /
+      `configure_image_processor` / `on_compressor_built` / `model_args_cls` /
+      `data_args_cls`; no module monkeypatching): forces `compressor_type` → `…+mamba`,
+      warm-starts + freezes stage-1, trains only the fold, single CE, `zero1`. Wrapper
+      `shell/pretrain_stage2a_fold.sh`.
    d. **TODO — collapse guardrail** on readout output; sanity that CE drops and
       `U·M ≤ 320`.
 5. **Stage-2b** — in-model causal segmenter (criterion per §6.1 sub-decision, [1, 8]
