@@ -215,6 +215,81 @@ def _finalize_compressed(module, query, ref_mean, ref_std, ref_rows):
     return query
 
 
+def adaptive_segment_count(n_frames: int, target_frames: int = 4) -> int:
+    """N = n_frames // target_frames + 1 — the Phase-1 segment count. A pure
+    function of the frame count, so the collator / arch can reserve exactly
+    ``N * num_queries`` placeholder tokens before the encoder runs. Kept in one
+    place so ``output_len_for`` and the segmenter cannot disagree."""
+    n_frames = int(n_frames)
+    if n_frames <= 1:
+        return 1
+    return max(1, min(n_frames // max(1, int(target_frames)) + 1, n_frames))
+
+
+def adaptive_segment_lengths(
+    per_frame_feat: torch.Tensor,      # (T, C) frozen-encoder per-frame mean feature
+    target_frames: int = 4,
+    force_every: int = 8,
+    sample_tau: float = 0.0,           # >0 -> Gumbel-top-k draw (per-epoch augmentation)
+    generator=None,
+) -> "list[int]":
+    """Fixed-count, adaptively-placed segmentation (design doc §4 Phase 1, validated
+    in ``eval_ablation/segmenter_validate.py``).
+
+    Returns segment frame-lengths, ``sum == T`` and ``len == adaptive_segment_count``.
+    Boundaries = a forced cut every ``force_every`` frames + the remaining budget on
+    the largest ``1 - cos(f_i, f_{i-1})`` positions. Every length lands in
+    ``[1, force_every]``.
+    """
+    T = int(per_frame_feat.shape[0])
+    if T <= 1:
+        return [T] if T == 1 else []
+    N = adaptive_segment_count(T, target_frames)
+    n_cuts = N - 1
+    if n_cuts <= 0:
+        return [T]
+
+    f = torch.nn.functional.normalize(per_frame_feat.float(), dim=-1)
+    diff = 1.0 - (f[1:] * f[:-1]).sum(-1)                     # (T-1,)
+    forced = [c for c in range(force_every, T, force_every)]
+    forced_set = set(forced)
+    cuts = set(forced)
+    budget = n_cuts - len(forced)
+    if budget > 0:
+        cand = [j + 1 for j in range(T - 1) if (j + 1) not in forced_set]
+        scores = diff[torch.tensor([c - 1 for c in cand], device=diff.device)]
+        if sample_tau and sample_tau > 0.0:
+            z = (scores - scores.mean()) / (scores.std() + 1e-6)
+            u = torch.rand(len(cand), generator=generator, device=scores.device).clamp_min(1e-12)
+            gumbel = -torch.log(-torch.log(u))
+            order = torch.argsort(-(z / sample_tau + gumbel))
+        else:
+            order = torch.argsort(-scores)
+        for i in order[:budget].tolist():
+            cuts.add(cand[i])
+    elif budget < 0:                                          # only with force_every small
+        keep = sorted(forced, key=lambda c: float(diff[c - 1]), reverse=True)[:n_cuts]
+        cuts = set(keep)
+
+    bounds = sorted(cuts)
+    # Safety: no segment longer than force_every (a no-op for the default 4/8 config,
+    # since consecutive forced cuts are exactly force_every apart).
+    fixed, prev = [], 0
+    for c in bounds:
+        while c - prev > force_every:
+            prev += force_every
+            fixed.append(prev)
+        fixed.append(c)
+        prev = c
+    while T - prev > force_every:
+        prev += force_every
+        fixed.append(prev)
+    bounds = sorted(b for b in set(fixed) if 0 < b < T)
+
+    lens = [bounds[0]] + [bounds[i + 1] - bounds[i] for i in range(len(bounds) - 1)] + [T - bounds[-1]]
+    return [int(x) for x in lens]
+
+
 class mlp(nn.Module):
     def __init__(self, hidden_size, intermediate_size):
         super().__init__()
@@ -566,11 +641,27 @@ class TransformerDecoderFlatCompressor(nn.Module):
         self.token_prune_min_tokens = int(getattr(config, "token_prune_min_tokens", 0) or 0)
         # Option A (encoder-scale match) + Option B (distribution-match aux loss).
         _init_encoder_scale_match(self, config)
+        # Phase-1 fixed-count adaptive segmenter (design doc §4 Phase 1). When on,
+        # forward() subdivides one whole-video window into N segments and emits
+        # N * num_queries tokens; output_len_for tells the arch the count.
+        self.adaptive_segmentation = bool(getattr(config, "adaptive_segmentation", False))
+        self.segment_target_frames = int(getattr(config, "segment_target_frames", 4) or 4)
+        self.segment_force_every = int(getattr(config, "segment_force_every", 8) or 8)
+        self.segment_sample_tau = float(getattr(config, "segment_sample_tau", 0.0) or 0.0)
 
     def output_hw_for(self, h: int, w: int):
         # Flat output, no 2-D grid — (1, num_queries) so callers' oh*ow arithmetic
         # (arch.py) still yields the right total token count.
         return 1, self.num_queries
+
+    def output_len_for(self, n_frames: int, h: int, w: int) -> int:
+        """Compressed token count for a window of ``n_frames`` frames — what the arch
+        reserves as placeholder slots. Fixed ``num_queries`` unless the adaptive
+        segmenter is on, then ``N * num_queries`` with ``N`` from
+        ``adaptive_segment_count`` (a pure function of the frame count)."""
+        if not self.adaptive_segmentation:
+            return int(self.num_queries)
+        return adaptive_segment_count(n_frames, self.segment_target_frames) * int(self.num_queries)
 
     def _build_cross_rotary_kv(self, compression_cu_seqlens, device, grid_hws, kept_idx=None):
         """KV-side-only counterpart of TransformerDecoderCompressor._build_cross_rotary_3d
@@ -629,14 +720,57 @@ class TransformerDecoderFlatCompressor(nn.Module):
         # original (t, h, w) in the cross-RoPE.
         if kv.dim() == 3:
             kv = kv.squeeze(0)
-        # Encoder-token reference stats (Options A/B), captured before KV pruning.
+        # Encoder-token reference stats (Options A/B), captured before KV pruning /
+        # segmentation so the target is the whole window's encoder tokens.
         ref_mean, ref_std, ref_rows = _capture_ref_stats(self, kv)
-        B = compression_cu_seqlens.size(0) - 1
         if grid_hws is None:
             raise ValueError(
                 "TransformerDecoderFlatCompressor has no 2-D output grid to fall back "
                 "on — grid_hws (one (h, w) per window) is required, not optional."
             )
+
+        # Phase-1 fixed-count adaptive segmenter: subdivide EACH input window (one
+        # per video) into N_i per-segment sub-windows, then run the ordinary
+        # multi-window path (Σ N_i * num_queries tokens). N_i matches
+        # output_len_for(T_i) by construction (both via adaptive_segment_count), so
+        # the arch's per-part placeholder count lines up. Handles the packed
+        # multi-video batch (per_device_train_batch_size > 1) too.
+        if self.adaptive_segmentation and kept_idx is None:
+            assert kept_idx is None, "adaptive_segmentation is incompatible with KV token pruning"
+            cu_in = compression_cu_seqlens.to("cpu").tolist()
+            W = len(cu_in) - 1
+            assert len(grid_hws) == W, (
+                f"adaptive_segmentation: {W} windows but {len(grid_hws)} grid_hws"
+            )
+            tau = self.segment_sample_tau if self.training else 0.0
+            gen = None
+            if tau > 0.0:
+                gen = torch.Generator(device=kv.device)
+                gen.manual_seed(int(torch.randint(0, 2 ** 31 - 1, (1,)).item()))
+            new_cu = [0]
+            new_grid = []
+            C = kv.size(-1)
+            for wi in range(W):
+                a, b = int(cu_in[wi]), int(cu_in[wi + 1])
+                hw = int(grid_hws[wi][0]) * int(grid_hws[wi][1])
+                span = b - a
+                assert span % hw == 0, (
+                    f"adaptive_segmentation: window {wi} has {span} tokens, not a multiple of h*w={hw}"
+                )
+                with torch.no_grad():
+                    per_frame = kv[a:b].view(span // hw, hw, C).float().mean(1)
+                    seg_lens = adaptive_segment_lengths(
+                        per_frame, self.segment_target_frames, self.segment_force_every, tau, gen
+                    )
+                for L in seg_lens:
+                    new_cu.append(new_cu[-1] + L * hw)
+                    new_grid.append(grid_hws[wi])
+            compression_cu_seqlens = torch.tensor(
+                new_cu, device=kv.device, dtype=compression_cu_seqlens.dtype
+            )
+            grid_hws = new_grid
+
+        B = compression_cu_seqlens.size(0) - 1
 
         query = self.query + self.pos_encoding.to(dtype=self.query.dtype)  # (1, num_queries, hidden)
         query = query.expand(B, -1, -1).contiguous().view(-1, kv.size(-1))
@@ -1026,6 +1160,18 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         match_encoder_scale=False,
         distr_loss_weight=0.0,
         distr_loss_max_ref_tokens=4096,
+        # Phase-1 fixed-count adaptive segmenter (transformer_decoder_flat only).
+        # When on, one whole-video compression window is subdivided model-side into
+        # N = n_frames // segment_target_frames + 1 segments (a pure function of the
+        # frame count, so the collator predicts the compressed length without the
+        # features); boundaries land on the largest consecutive-frame encoder-feature
+        # cosine distances, with a forced cut every segment_force_every frames. Each
+        # segment -> num_queries qbase tokens; output is N * num_queries tokens.
+        # See docs/two_stage_compression_design.md §4 Phase 1.
+        adaptive_segmentation=False,
+        segment_target_frames=4,
+        segment_force_every=8,
+        segment_sample_tau=0.0,          # >0: Gumbel-top-k boundary draw (train only)
         # Stage-2 fold (compressor_type "…+mamba" -> TwoStageCompressor). K is
         # num_queries (the stage-1 qbase's query count); these size .stage2, the
         # SegmentAggregator. See docs/two_stage_compression_design.md.
@@ -1069,6 +1215,10 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         self.match_encoder_scale = match_encoder_scale
         self.distr_loss_weight = distr_loss_weight
         self.distr_loss_max_ref_tokens = distr_loss_max_ref_tokens
+        self.adaptive_segmentation = adaptive_segmentation
+        self.segment_target_frames = segment_target_frames
+        self.segment_force_every = segment_force_every
+        self.segment_sample_tau = segment_sample_tau
         # Stage-2 fold knobs (only read when compressor_type endswith "+mamba").
         self.stage2_n_summary_tokens = stage2_n_summary_tokens
         self.stage2_frames_per_segment = stage2_frames_per_segment

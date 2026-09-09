@@ -164,6 +164,30 @@ class ModelArguments:
                           "+ token-norm), added to the CE loss by the trainer. 0 = off. Composes "
                           "with --match_encoder_scale (which only fixes the covariance diagonal)."},
     )
+    # Phase-1 fixed-count adaptive segmenter (transformer_decoder_flat only).
+    adaptive_segmentation: bool = field(
+        default=False,
+        metadata={"help": "Subdivide the one whole-video compression window into "
+                          "N = n_frames // segment_target_frames + 1 segments model-side, "
+                          "each -> num_queries qbase tokens (output N*num_queries). Boundaries: "
+                          "forced cut every segment_force_every frames + remaining budget on the "
+                          "largest consecutive-frame encoder-feature cosine distances. "
+                          "See docs/two_stage_compression_design.md §4 Phase 1."},
+    )
+    segment_target_frames: int = field(
+        default=4,
+        metadata={"help": "Adaptive segmenter: avg frames/segment; sets N = ⌊T/this⌋ + 1."},
+    )
+    segment_force_every: int = field(
+        default=8,
+        metadata={"help": "Adaptive segmenter: forced boundary every this many frames (the [1,N] clamp max)."},
+    )
+    segment_sample_tau: float = field(
+        default=0.0,
+        metadata={"help": "Adaptive segmenter: >0 draws the non-forced boundaries with Gumbel-top-k "
+                          "over softmax(diff / tau) (train only) so the segmentation varies per epoch; "
+                          "0 = deterministic top-k."},
+    )
 
 
 @dataclass
@@ -245,6 +269,11 @@ def _build_token_compressor_config(
         # Option A / Option B -- keep compressed tokens on the frozen-encoder scale.
         "match_encoder_scale": model_args.match_encoder_scale,
         "distr_loss_weight": model_args.compressor_distr_loss_weight,
+        # Phase-1 fixed-count adaptive segmenter (transformer_decoder_flat only).
+        "adaptive_segmentation": model_args.adaptive_segmentation,
+        "segment_target_frames": model_args.segment_target_frames,
+        "segment_force_every": model_args.segment_force_every,
+        "segment_sample_tau": model_args.segment_sample_tau,
     }
 
 
@@ -388,8 +417,15 @@ def train(attn_implementation=None, *,
     if model.get_model().token_compressor is None:
         raise RuntimeError("Failed to build token_compressor. Check token_compressor_config.")
     if model_args.pretrained_compressor_path:
-        state = torch.load(model_args.pretrained_compressor_path, map_location="cpu")
-        state = state.get("compressor", state) if isinstance(state, dict) else state
+        _p = model_args.pretrained_compressor_path
+        if os.path.isdir(_p):
+            # HF checkpoint dir -> pull token_compressor.* out of the safetensors
+            # shards (same loader TwoStageCompressor.load_stage1_pretrained uses).
+            from videollama3.model.compressor import _load_flat_compressor_state_dict
+            state = _load_flat_compressor_state_dict(_p)
+        else:
+            state = torch.load(_p, map_location="cpu")
+            state = state.get("compressor", state) if isinstance(state, dict) else state
         missing, unexpected = model.get_model().token_compressor.load_state_dict(state, strict=False)
         rank0_print(
             f"[INFO] Loaded pretrained compressor from {model_args.pretrained_compressor_path} "

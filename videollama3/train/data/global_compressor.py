@@ -122,7 +122,9 @@ def build_range_ts_info(content: Dict, tokenizer) -> List[Tuple[int, List[int]]]
     ``prepare_inputs_labels_for_multimodal`` cuts back the right number of tokens.
     """
     timestamps = content.get("timestamps", None)
-    if not timestamps:
+    # timestamps may be a list OR a numpy array (the decoder synthesizes per-frame
+    # seconds when the annotation carries none) — avoid `not ndarray`.
+    if timestamps is None or len(timestamps) == 0:
         return [(0, [])]
     ts_start, ts_end = float(timestamps[0]), float(timestamps[-1])
     old_ts_ids = tokenizer.encode(f"Time {round(ts_start, 1)}s:", add_special_tokens=False)

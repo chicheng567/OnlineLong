@@ -29,6 +29,17 @@ from .projector import build_vision_projector, load_mm_projector
 from .compressor import build_token_compressor
 
 
+def _compressed_len(compressor, n_frames, h, w):
+    """Number of compressed tokens a window of ``n_frames`` frames (post-merge grid
+    ``h x w``) produces. Prefers the compressor's ``output_len_for`` (frame-count
+    aware — the fixed-count adaptive segmenter's ``N * num_queries``); falls back to
+    ``prod(output_hw_for(h, w))`` for the fixed-length compressors."""
+    if hasattr(compressor, "output_len_for"):
+        return int(compressor.output_len_for(int(n_frames), int(h), int(w)))
+    oh, ow = compressor.output_hw_for(int(h), int(w))
+    return int(oh) * int(ow)
+
+
 def _grid_hw_for_compression_parts(compression_parts, grid_sizes, merge_sizes):
     """
     Map each compression part's [start, end) vision-token range to the post-merge
@@ -186,8 +197,9 @@ class Videollama3MetaForCausalLM(ABC):
         for part, (h, w) in zip(compression_parts, grid_hws):
             part_len = part[1] - part[0]
             need_compress_parts[part[0]: part[1]] = True
-            oh, ow = compressor.output_hw_for(h, w)
-            replace_mask[part[0]: part[0] + oh * ow] = True
+            n_frames = part_len // (h * w)
+            n_out = _compressed_len(compressor, n_frames, h, w)
+            replace_mask[part[0]: part[0] + n_out] = True
             compression_cu_seqlens.append(compression_cu_seqlens[-1] + part_len)
         compression_cu_seqlens = torch.tensor(compression_cu_seqlens, device=device, dtype=torch.long)
 
@@ -306,8 +318,8 @@ class Videollama3MetaForCausalLM(ABC):
             prev = 0
             parts_with_hw = sorted(zip(compression_parts, grid_hws), key=lambda pair: pair[0][0])
             for part_idx, (part, (part_h, part_w)) in enumerate(parts_with_hw):
-                out_h, out_w = compressor.output_hw_for(part_h, part_w)
-                compact_vision_token_size = out_h * out_w
+                n_frames = (part[1] - part[0]) // (part_h * part_w)
+                compact_vision_token_size = _compressed_len(compressor, n_frames, part_h, part_w)
                 part_start = image_positions[part[0]].item()
                 part_end = image_positions[part[1] - 1].item()
 

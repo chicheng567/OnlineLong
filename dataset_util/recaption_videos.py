@@ -46,8 +46,8 @@ faster at batch 1 and ~2.25x faster at batch 4.
 Prompts
 -------
 With NO --prompt and NO --prompt_file, every sample draws its own prompt from a
-pool (--prompt_pool, default: baseline_default, scene_shift, motion_scene,
-timed_segments -- see dataset_util/prompts/README.md). The draw is
+pool (--prompt_pool, default: baseline_default, scene_shift, motion_scene
+-- see dataset_util/prompts/README.md). The draw is
 per SAMPLE, not per run, so one pass over a dataset produces a mix of caption
 styles rather than one voice repeated N times, and the JSONL / --annotation_out
 entries record which style each caption is in as `prompt_name`.
@@ -188,7 +188,6 @@ DEFAULT_PROMPT_POOL = (
     "baseline_default",
     "scene_shift",
     "motion_scene",
-    "timed_segments",
 )
 
 # Video file extensions for the --annotate_unannotated disk walk.
