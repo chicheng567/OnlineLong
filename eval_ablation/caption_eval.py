@@ -46,6 +46,7 @@ from eval_ablation.common import (  # noqa: E402
     prepare_video_sample,
 )
 from eval_ablation.metrics import caption_metrics, mean_dict, pair_metrics  # noqa: E402
+from videollama3.model.videollama3_arch import _compressed_len  # noqa: E402
 
 
 def parse_models(pairs: List[str]) -> List[tuple]:
@@ -95,7 +96,8 @@ def generate_caption(model, proc, sample: Dict, gen_kwargs: Dict) -> str:
 
 def run_one_model(tag: str, model_path: str, items: List[Dict], args,
                   gen_kwargs: Dict) -> List[Dict]:
-    proc = load_processor(model_path, force_image_size=args.force_image_size)
+    proc = load_processor(model_path, force_image_size=args.force_image_size,
+                          native_max_tokens=args.native_max_tokens)
     model = load_model(model_path, device=args.device)
     rows = []
     for i, it in enumerate(items):
@@ -104,11 +106,15 @@ def run_one_model(tag: str, model_path: str, items: List[Dict], args,
             # deterministic per (video) so a rerun reproduces, but still sampled
             torch.manual_seed(args.seed + i)
             np.random.seed(args.seed + i)
+            comp = model.get_token_compressor()
             sample = prepare_video_sample(
                 proc, it["video"], prompt=it["prompt"], fps=args.fps,
                 max_frames=args.max_frames, window_size=args.window_size,
                 device=args.device,
-                out_hw_fn=model.get_token_compressor().output_hw_for,
+                out_hw_fn=comp.output_hw_for,
+                whole_video=args.whole_video,
+                out_len_fn=(lambda nf, h, w: _compressed_len(comp, nf, h, w))
+                if args.whole_video else None,
             )
             caption = generate_caption(model, proc, sample, gen_kwargs)
             rec["caption"] = caption
@@ -238,7 +244,13 @@ def main():
     ap.add_argument("--fps", type=int, default=1)
     ap.add_argument("--max_frames", type=int, default=DEFAULT_MAX_FRAMES)
     ap.add_argument("--window_size", type=int, default=DEFAULT_WINDOW_SIZE)
+    ap.add_argument("--whole_video", action="store_true",
+                    help="one compression part over the whole video (Plan-X Phase-1 / "
+                         "whole-video-qbase config) instead of window_size-frame groups")
     ap.add_argument("--force_image_size", type=int, default=DEFAULT_FORCE_IMAGE_SIZE)
+    ap.add_argument("--native_max_tokens", type=int, default=1600,
+                    help="per-video vision-token budget when --force_image_size 0 "
+                         "(training used 16384 for Plan-X dynamic HW)")
     ap.add_argument("--max_new_tokens", type=int, default=512)
     ap.add_argument("--repetition_penalty", type=float, default=1.1)
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -284,8 +296,8 @@ def main():
     summary = build_summary(all_rows, items)
     summary["generation_kwargs"] = gen_kwargs
     summary["config"] = {k: getattr(args, k) for k in
-                         ("fps", "max_frames", "window_size", "force_image_size",
-                          "manifest", "seed")}
+                         ("fps", "max_frames", "window_size", "whole_video",
+                          "force_image_size", "manifest", "seed")}
     summary["config"]["prompt"] = items[0]["prompt"]
     summary["config"]["prompt_is_training_prompt"] = (items[0]["prompt"] == TRAIN_CAPTION_PROMPT)
     with open(os.path.join(args.out, "summary.json"), "w") as f:

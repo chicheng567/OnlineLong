@@ -2,7 +2,7 @@
 
 Training entrypoints (``videollama3_chat_finetune_online.py``,
 ``videollama3_chat_finetune_compressor.py``, ``compressor_pretrain_with_videollama3.py``,
-``stage2a_pretrain_compressor_fold.py``) import from here instead of from one another.
+``phase2_pretrain_fold.py``) import from here instead of from one another.
 
 Layers, imported one direction only:
     common            -> tiny helpers (rank0_print, set_seed, ...)

@@ -48,6 +48,8 @@ class ConcatDatasetWithLengths(ConcatDataset):
         super().__init__(datasets)
         self._lengths = []
         self._modality_lengths = []
+        self._compression_depths = []
+        _all_depths = True
         for dataset in self.datasets:
             if not hasattr(dataset, "lengths") or not hasattr(dataset, "modality_lengths"):
                 raise AttributeError(
@@ -56,6 +58,13 @@ class ConcatDatasetWithLengths(ConcatDataset):
                 )
             self._lengths.extend(dataset.lengths)
             self._modality_lengths.extend(dataset.modality_lengths)
+            d = getattr(dataset, "compression_depths", None)
+            if d is None:
+                _all_depths = False
+            else:
+                self._compression_depths.extend(d)
+        if not _all_depths:
+            self._compression_depths = None
 
     @property
     def lengths(self):
@@ -64,6 +73,10 @@ class ConcatDatasetWithLengths(ConcatDataset):
     @property
     def modality_lengths(self):
         return self._modality_lengths
+
+    @property
+    def compression_depths(self):
+        return self._compression_depths
 
 
 class LazySupervisedDataset(Dataset):

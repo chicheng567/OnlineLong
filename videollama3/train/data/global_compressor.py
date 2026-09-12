@@ -1,8 +1,8 @@
-"""Whole-video ("global") compression dataset for Stage-1 CE pretraining, plus the
-frame/message helpers it shares with the Stage-2a fold script.
+"""Whole-video ("global") compression dataset for the Phase-1 qbase CE pretrain, plus
+the frame/message helpers it shares with the Phase-2 fold script.
 
 Extracted from ``compressor_pretrain_with_videollama3.py`` so
-``stage2a_pretrain_compressor_fold.py`` can subclass ``GlobalCompressorLazySupervisedDataset``
+``phase2_pretrain_fold.py`` can subclass ``GlobalCompressorLazySupervisedDataset``
 and reuse the helpers without importing (or monkeypatching) a training entrypoint module.
 
 Frames are always decoded and encoded on the fly (there is no pre-extracted
@@ -140,10 +140,15 @@ class GlobalCompressorLazySupervisedDataset(LazySupervisedDataset):
     shared with the still-image path.
     """
 
-    def __init__(self, *args, fixed_frames: int = 0, model_args=None, **kwargs):
+    def __init__(self, *args, fixed_frames: int = 0, model_args=None, qbase_only: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_args = model_args
         self.fixed_frames = fixed_frames
+        # Phase-2 pure-qbase replay: when True, this dataset's samples bypass the
+        # unit split + fold and route straight through stage-1 (N*K qbase tokens).
+        # Set per meta-JSON entry ("qbase_only": true); only Phase2FoldDataset acts
+        # on it. docs/two_stage_compression_design.md §4 Phase 2.
+        self.qbase_only = bool(qbase_only)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         try:
@@ -230,6 +235,7 @@ def make_global_compressor_data_module(
                 prefix_captioning=dataset_cfg.get("prefix_captioning", False),
                 fixed_frames=data_args.fixed_frames,
                 model_args=model_args,
+                qbase_only=dataset_cfg.get("qbase_only", False),
             )
             for dataset_name, dataset_cfg in ds_collection.items()
         ]
@@ -241,6 +247,7 @@ def make_global_compressor_data_module(
             data_args=data_args,
             fixed_frames=data_args.fixed_frames,
             model_args=model_args,
+            qbase_only=getattr(data_args, "qbase_only", False),
         )
 
     if data_args.validation_split_rate > 0:

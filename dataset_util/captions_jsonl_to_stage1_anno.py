@@ -34,7 +34,7 @@ Example
         --meta_out anno_data/internvid_qwen3vl.json \
         --data_root /share/dataset/internVid
 
-Point Stage-1 / Stage-2a at the meta file:
+Point the Phase-1 / Phase-2 training at the meta file:
 
     ... --multi_dataset True --data_path anno_data/internvid_qwen3vl.json
 """

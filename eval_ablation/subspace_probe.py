@@ -85,7 +85,7 @@ def extract_windows(model, sample: Dict) -> List[Dict]:
     parts = sample["compression_parts"]
     mm = m.get_vision_encoder()(pixel_values=pv, grid_sizes=gs, merge_sizes=ms)   # (N, C)
     grid_hws = _grid_hw_for_compression_parts(parts, gs, ms)
-    comp_all = model.compress_visual_tokens_with_compressor(mm.clone(), parts, grid_hws)  # (sum n_out, C)
+    comp_all, _ = model.compress_visual_tokens_with_compressor(mm.clone(), parts, grid_hws)  # (sum n_out, C)
 
     compressor = model.get_token_compressor()
     n_out = [int(np.prod(compressor.output_hw_for(int(h), int(w)))) for (h, w) in grid_hws]

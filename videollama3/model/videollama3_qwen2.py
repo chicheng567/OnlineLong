@@ -173,6 +173,10 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         modals: Optional[List[str]] = None,
         compression_parts: Optional[List[List[int]]] = None,
         compression_ts_info: Optional[List] = None,
+        compression_retained: Optional[List[List[int]]] = None,
+        compression_seed: Optional[List[int]] = None,
+        compression_frame_sec: Optional[List[List[int]]] = None,
+        compression_qbase_only: Optional[List[bool]] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if inputs_embeds is None:
@@ -195,6 +199,10 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 modals=modals,
                 compression_parts=compression_parts,
                 compression_ts_info=compression_ts_info,
+                compression_retained=compression_retained,
+                compression_seed=compression_seed,
+                compression_frame_sec=compression_frame_sec,
+                compression_qbase_only=compression_qbase_only,
             )
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -315,6 +323,10 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         modals: Optional[List[str]] = None,
         compression_parts: Optional[List[List[int]]] = None,
         compression_ts_info: Optional[List] = None,
+        compression_retained: Optional[List[List[int]]] = None,
+        compression_seed: Optional[List[int]] = None,
+        compression_frame_sec: Optional[List[List[int]]] = None,
+        compression_qbase_only: Optional[List[bool]] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         input_ids = kwargs.pop("input_ids", None)
@@ -354,6 +366,10 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 modals=modals,
                 compression_parts=compression_parts,
                 compression_ts_info=compression_ts_info,
+                compression_retained=compression_retained,
+                compression_seed=compression_seed,
+                compression_frame_sec=compression_frame_sec,
+                compression_qbase_only=compression_qbase_only,
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(input_ids)

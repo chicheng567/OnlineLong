@@ -245,6 +245,12 @@ class DataCollatorWithCompressor:
         new_compression_ts_info: List[tuple] = []
         new_compression_parts_full: List[List[int]] = []
         new_compression_ts_info_full: List[tuple] = []
+        # Two-stage fold side inputs (one entry per compression_part == per video;
+        # offset-independent, so just concatenate in instance order).
+        new_compression_retained: List[List[int]] = []
+        new_compression_seed: List[int] = []
+        new_compression_frame_sec: List[List[int]] = []
+        new_compression_qbase_only: List[bool] = []
         accumulated_length = 0
         image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
         for sample_idx in range(0, len(input_ids)):
@@ -265,6 +271,14 @@ class DataCollatorWithCompressor:
                 new_compression_ts_info.extend(instances[sample_idx]["compression_ts_info"])
             else:
                 new_compression_ts_info.extend([(0, []) for _ in compression_parts[sample_idx]])
+            new_compression_retained.extend(instances[sample_idx].get("compression_retained", []))
+            new_compression_seed.extend(instances[sample_idx].get("compression_seed", []))
+            new_compression_frame_sec.extend(instances[sample_idx].get("compression_frame_sec", []))
+            new_compression_qbase_only.extend(
+                instances[sample_idx].get(
+                    "compression_qbase_only", [False] * len(compression_parts[sample_idx])
+                )
+            )
             # Full compression parts (same offset logic).
             parts_full = instances[sample_idx].get("compression_parts_full", [])
             new_compression_parts_full.extend([[s + accumulated_length, e + accumulated_length] for s, e in parts_full])
@@ -292,12 +306,21 @@ class DataCollatorWithCompressor:
         batch["compression_ts_info"] = new_compression_ts_info
         batch["compression_parts_full"] = new_compression_parts_full
         batch["compression_ts_info_full"] = new_compression_ts_info_full
+        if new_compression_retained:
+            batch["compression_retained"] = new_compression_retained
+        if new_compression_seed:
+            batch["compression_seed"] = new_compression_seed
+        if new_compression_frame_sec:
+            batch["compression_frame_sec"] = new_compression_frame_sec
+        if any(new_compression_qbase_only):
+            batch["compression_qbase_only"] = new_compression_qbase_only
 
         return batch
 
 
 class SubsetWithLengths(torch.utils.data.Subset):
-    """Subset that preserves `lengths` and `modality_lengths` for grouped sampling."""
+    """Subset that preserves `lengths`, `modality_lengths` and `compression_depths`
+    for grouped sampling."""
 
     def __init__(self, dataset, indices):
         super().__init__(dataset, indices)
@@ -305,6 +328,12 @@ class SubsetWithLengths(torch.utils.data.Subset):
         parent_modality = dataset.modality_lengths
         self._lengths = [parent_lengths[i] for i in indices]
         self._modality_lengths = [parent_modality[i] for i in indices]
+        # Keep the depth-class grouped sampler (--group_by_compression_depth) working
+        # through a validation split; the parent list is in global-index order.
+        parent_depths = getattr(dataset, "compression_depths", None)
+        self._compression_depths = (
+            [parent_depths[i] for i in indices] if parent_depths is not None else None
+        )
 
     @property
     def lengths(self):
@@ -313,6 +342,10 @@ class SubsetWithLengths(torch.utils.data.Subset):
     @property
     def modality_lengths(self):
         return self._modality_lengths
+
+    @property
+    def compression_depths(self):
+        return self._compression_depths
 
 
 def _collect_val_video_paths(dataset, val_indices: List[int]) -> List[str]:

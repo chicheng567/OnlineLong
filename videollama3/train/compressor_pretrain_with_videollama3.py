@@ -227,12 +227,24 @@ class TrainingArguments(transformers.TrainingArguments):
     vision_encoder_lr: Optional[float] = field(default=0.0)
     mm_projector_lr: Optional[float] = field(default=0.0)
     compressor_lr: Optional[float] = field(default=1e-4)
-    # When > 0, token_compressor.stage1.* (the qbase) gets its own optimizer group
-    # at this LR instead of sharing compressor_lr -- used by the joint-polish run
-    # that unfreezes the qbase and moves it ~10x slower than the Stage-2 fold.
-    stage1_lr: Optional[float] = field(default=0.0)
+    # Two-stage compressor (qbase + Mamba-2/SSD fold) LR split -- both no-ops for a
+    # single-stage compressor (Phase 1: just leave them at 0, compressor_lr is the
+    # qbase's only rate):
+    #   qbase_lr  > 0 -> token_compressor.stage1.* (the qbase) gets its OWN
+    #     optimizer group at this LR instead of sharing the fold's rate -- used by
+    #     the joint-polish window that unfreezes the qbase and moves it ~10x
+    #     slower than the fold.
+    #   mamba_lr  > 0 -> the rate for everything else in the compressor
+    #     (token_compressor.stage2.* / embed_tokens), overriding compressor_lr.
+    #     0 -> falls back to compressor_lr.
+    qbase_lr: Optional[float] = field(default=0.0)
+    mamba_lr: Optional[float] = field(default=0.0)
     llm_lr: Optional[float] = field(default=0.0)
     group_by_modality_length: bool = field(default=False)
+    # Two-stage fold: fill each grad-accum window from one depth class (N = ⌊T/4⌋+1)
+    # so max_u N_u — the SSD recurrence depth / backward-graph depth — stays
+    # homogeneous. Needs the dataset to expose `compression_depths`.
+    group_by_compression_depth: bool = field(default=False)
     model_max_length: int = field(default=32768)
     double_quant: bool = field(default=True)
     quant_type: str = field(default="nf4")
@@ -284,15 +296,15 @@ def train(attn_implementation=None, *,
           build_token_compressor_config=None,
           configure_image_processor=None,
           on_compressor_built=None):
-    """Stage-1 CE compressor pretraining.
+    """Phase-1 qbase CE pretraining (and, via the hooks, the Phase-2 fold script).
 
-    The keyword-only hooks let a thin wrapper (stage2a_pretrain_compressor_fold.py)
+    The keyword-only hooks let a thin wrapper (phase2_pretrain_fold.py)
     swap pieces without monkeypatching this module:
       model_args_cls / data_args_cls   -- dataclasses handed to HfArgumentParser
       dataset_cls                      -- dataset class make_global_compressor_data_module builds
       build_token_compressor_config    -- fn(model_config, model_args, data_args) -> dict
       configure_image_processor        -- fn(image_processor, model_args, data_args) -> None, run pre-wrap
-      on_compressor_built              -- fn(compressor_module, model_args, data_args) -> None, run after requires_grad is set
+      on_compressor_built              -- fn(compressor_module, model_args, data_args, training_args) -> None, run after requires_grad is set
     """
     global local_rank
     set_seed(42)
@@ -398,7 +410,17 @@ def train(attn_implementation=None, *,
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.unk_token
 
+    # initialize_vision_modules unconditionally overwrites config.mm_projector_type
+    # with model_args.mm_projector_type (default "linear"), but it only *rebuilds*
+    # the projector when there is none — and from_pretrained already built the base
+    # model's projector (mlp2x_gelu). This script never swaps the projector, so keep
+    # the base config's label; otherwise the saved checkpoint's config says "linear"
+    # while the weights are the mlp2x_gelu `readout.*` and every reload builds a
+    # random Linear.
+    _base_mm_projector_type = getattr(model.config, "mm_projector_type", None)
     model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
+    if _base_mm_projector_type is not None:
+        model.config.mm_projector_type = _base_mm_projector_type
     vision_encoder = model.get_vision_encoder()
     vision_encoder.to(dtype=compute_dtype, device=training_args.device)
 
@@ -463,7 +485,7 @@ def train(attn_implementation=None, *,
 
     token_compressor = getattr(model.get_model(), "token_compressor", None)
     if on_compressor_built is not None and token_compressor is not None:
-        on_compressor_built(token_compressor, model_args, data_args)
+        on_compressor_built(token_compressor, model_args, data_args, training_args)
 
     total_param_count = sum(p.numel() for p in model.parameters())
     trainable_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -515,6 +537,11 @@ def train(attn_implementation=None, *,
     model.config.image_token_index = tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
     model.config.compression_start_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_START_TOKEN)
     model.config.compression_end_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_END_TOKEN)
+    # Pre-tokenise the "Time:{a}s-{b}s:" pieces onto the config so the arch can build
+    # the per-unit range string with no tokenizer at forward time (two-stage fold).
+    from videollama3.model.compressor import bake_time_tokens
+    bake_time_tokens(model.config, tokenizer,
+                     max_seconds=max(2048, int(getattr(data_args, "max_frames", 0) or 0) + 64))
 
     if data_args.force_image_size is not None:
         vision_encoder.image_processor.force_size = [data_args.force_image_size] * 2
@@ -527,9 +554,19 @@ def train(attn_implementation=None, *,
     assert model.config._attn_implementation == "flash_attention_2"
     assert version.parse(transformers.__version__) >= version.parse("4.44.0")
 
+    if model_args.compressor_type == "transformer_decoder_flat":
+        if model_args.adaptive_segmentation:
+            _out_tokens = (
+                f"N*{model_args.num_queries} tokens "
+                f"(N = T//{model_args.segment_target_frames}+1 adaptive segments, "
+                f"force_every={model_args.segment_force_every}, tau={model_args.segment_sample_tau})"
+            )
+        else:
+            _out_tokens = f"{model_args.num_queries} tokens (flat query bank)"
+    else:
+        _out_tokens = f"{model_args.compress_image_w * model_args.compress_image_h} tokens (h*w grid)"
     rank0_print(
-        f"[INFO] Whole-video compression: 1 window per sample -> "
-        f"{model_args.compress_image_w * model_args.compress_image_h} tokens "
+        f"[INFO] Whole-video compression: 1 window per sample -> {_out_tokens} "
         f"(compressor_type={model_args.compressor_type}, "
         f"max_frames={data_args.max_frames}, "
         f"fixed_frames={data_args.fixed_frames or 'off'}, "
@@ -554,6 +591,32 @@ def train(attn_implementation=None, *,
         full_loss_weight=0.0,
         **data_module,
     )
+
+    # Feed (epoch, training progress) into the dataset so its per-(epoch, index)
+    # seeded draws advance and the compression-variance curriculum can anneal.
+    # Harmless when the dataset does not use them.
+    import transformers as _tf
+
+    class _DatasetProgressCallback(_tf.TrainerCallback):
+        def _targets(self, ds):
+            subs = getattr(ds, "datasets", None)
+            return list(subs) if subs else ([ds] if ds is not None else [])
+
+        def _set(self, ds, **kw):
+            for t in self._targets(ds):
+                inner = getattr(t, "dataset", t)  # unwrap SubsetWithLengths
+                for k, v in kw.items():
+                    if hasattr(inner, k):
+                        setattr(inner, k, v)
+
+        def on_epoch_begin(self, args, state, control, **kw):
+            self._set(trainer.train_dataset, _epoch=int(state.epoch or 0))
+
+        def on_step_begin(self, args, state, control, **kw):
+            total = max(1, state.max_steps or 1)
+            self._set(trainer.train_dataset, _progress=float(state.global_step) / total)
+
+    trainer.add_callback(_DatasetProgressCallback())
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

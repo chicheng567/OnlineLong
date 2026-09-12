@@ -31,7 +31,9 @@ if _REPO_ROOT not in sys.path:
 from videollama3.constants import DEFAULT_IMAGE_TOKEN  # noqa: E402
 from videollama3.model import Videollama3Qwen2ForCausalLM  # noqa: E402
 from videollama3.model.processor import Videollama3Processor  # noqa: E402
-from videollama3.model.videollama3_arch import _grid_hw_for_compression_parts  # noqa: E402
+from videollama3.model.videollama3_arch import (  # noqa: E402
+    _compressed_len, _grid_hw_for_compression_parts,
+)
 from videollama3.mm_utils import load_video  # noqa: E402
 from videollama3.train.data.compressor import (  # noqa: E402
     select_full_compression_parts,
@@ -141,6 +143,8 @@ def prepare_video_sample(
     device: str = "cuda:0",
     dtype: torch.dtype = torch.bfloat16,
     out_hw_fn=None,
+    whole_video: bool = False,
+    out_len_fn=None,
 ) -> Dict:
     """Decode `video_path` and package it the training way.
 
@@ -148,6 +152,18 @@ def prepare_video_sample(
     output grid; pass `model.get_token_compressor().output_hw_for` so the logged
     token counts are exact (transformer_decoder_flat emits num_queries, not h*w).
     Defaults to identity for a model-free call.
+
+    `whole_video=True` — one compression part covering every vision token (the
+    Plan-X Phase-1 / whole-video-qbase config), instead of consecutive
+    `window_size`-frame groups. The model still does the placeholder rewrite; with
+    the fixed-count adaptive segmenter one part -> N = floor(T/4)+1 sub-segments
+    model-side.
+
+    `out_len_fn(n_frames, h, w) -> int` — exact compressed length for a part
+    (pass `lambda nf, h, w: _compressed_len(model.get_token_compressor(), nf, h, w)`
+    for `transformer_decoder_flat + --adaptive_segmentation`, whose output count is
+    `N * num_queries`, not `prod(output_hw_for)`). Used only for the logged
+    `window_out_hw` / `compressed_tokens_total`.
 
     Returns a dict with the model.generate kwargs plus `meta` (num_frames,
     timestamps, per-window frame spans, per-window input (h, w) and output grids,
@@ -180,11 +196,14 @@ def prepare_video_sample(
         )
     tokens_per_frame = total_vision_tokens // num_frames
 
-    parts = select_full_compression_parts(
-        total_frames=num_frames,
-        total_vision_tokens=total_vision_tokens,
-        window_size=window_size,
-    )
+    if whole_video:
+        parts = [[0, total_vision_tokens]]
+    else:
+        parts = select_full_compression_parts(
+            total_frames=num_frames,
+            total_vision_tokens=total_vision_tokens,
+            window_size=window_size,
+        )
     if not parts:
         raise RuntimeError(
             f"{video_path}: only {num_frames} frames (< window_size {window_size}); "
@@ -197,8 +216,13 @@ def prepare_video_sample(
                                               inputs["merge_sizes"])
 
     window_frames = [[s // tokens_per_frame, e // tokens_per_frame] for s, e in parts]
-    window_out_hw = [[int(a), int(b)] for (a, b) in
-                     (out_hw_fn(int(h), int(w)) for (h, w) in grid_hws)]
+    if out_len_fn is not None:
+        n_out = [int(out_len_fn(fe - fs, int(h), int(w)))
+                 for (fs, fe), (h, w) in zip(window_frames, grid_hws)]
+        window_out_hw = [[1, k] for k in n_out]
+    else:
+        window_out_hw = [[int(a), int(b)] for (a, b) in
+                         (out_hw_fn(int(h), int(w)) for (h, w) in grid_hws)]
     compressed_tokens_total = int(sum(oh * ow for oh, ow in window_out_hw))
     out = {
         "input_ids": inputs["input_ids"].to(device),
@@ -258,7 +282,7 @@ def extract_features(model, sample: Dict) -> Dict[str, np.ndarray]:
     mm = m.get_vision_encoder()(pixel_values=pv, grid_sizes=gs, merge_sizes=ms)  # (N, Cvis)
     grid_hws = _grid_hw_for_compression_parts(parts, gs, ms)
 
-    comp = model.compress_visual_tokens_with_compressor(mm.clone(), parts, grid_hws)  # (n_out, Cvis)
+    comp, _ = model.compress_visual_tokens_with_compressor(mm.clone(), parts, grid_hws)  # (n_out, Cvis)
     comp_proj = m.mm_projector(comp)                                                  # (n_out, Cllm)
 
     n_raw = min(mm.shape[0], 2000)
@@ -266,10 +290,17 @@ def extract_features(model, sample: Dict) -> Dict[str, np.ndarray]:
     raw = mm.index_select(0, idx)
     raw_proj = m.mm_projector(raw)
 
-    # tokens per window: compressor.output_hw_for(h, w) product, in part order
+    # tokens per window, in part order. `_compressed_len` prefers the compressor's
+    # frame-count-aware `output_len_for` (the adaptive segmenter's N * num_queries)
+    # and falls back to `prod(output_hw_for)` for the fixed-length compressors, so
+    # this is correct for both.
     compressor = model.get_token_compressor()
+    part_hw = [int(h) * int(w) for (h, w) in grid_hws]
     n_per_window = np.array(
-        [int(np.prod(compressor.output_hw_for(int(h), int(w)))) for (h, w) in grid_hws],
+        [
+            _compressed_len(compressor, (p[1] - p[0]) // hw, int(h), int(w))
+            for p, hw, (h, w) in zip(parts, part_hw, grid_hws)
+        ],
         dtype=np.int64,
     )
 

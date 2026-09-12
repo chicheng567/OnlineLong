@@ -180,41 +180,55 @@ class Videollama3MetaForCausalLM(ABC):
         vision_tokens: torch.FloatTensor,
         compression_parts: List[List[int]],
         grid_hws: List[Tuple[int, int]],
-    ) -> Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]:
-        # compression_parts: [[start, end], [start, end], ...]
-        # grid_hws: [(h, w), ...], one per compression part, same order as
-        # compression_parts — the ACTUAL input frame grid for that part (see
-        # _grid_hw_for_compression_parts). Determines each part's compressed OUTPUT
-        # length via the compressor's own output_hw_for (fixed for
-        # TransformerDecoderCompressor, == input (h, w) for SiglipAECompressor).
-        # vision_tokens: [1, num_tokens, dim]
+        retained_counts: Optional[List[List[int]]] = None,
+        seed: Optional[int] = None,
+        qbase_only: Optional[List[bool]] = None,
+    ) -> Tuple[torch.FloatTensor, Optional[List[dict]]]:
+        # compression_parts: [[start, end], [start, end], ...] — index into the
+        # vision (image) tokens only.  Single-stage compressors: one part == one
+        # compressed block of _compressed_len tokens.  TwoStageCompressor: one part
+        # == one WHOLE-VIDEO window that is split model-side into U content-adaptive
+        # units (§ docs/two_stage_compression_design.md §4 Phase 2); the compressor
+        # returns unit_meta and this method scatters sum_u (M + r_u*K) rows per part.
+        # retained_counts / seed: forwarded to compress_windows (per-window r_u list;
+        # Gumbel seed).  grid_hws: one (h, w) per part.
         device = vision_tokens.device
-        vision_tokens = vision_tokens.squeeze(0) # [num_tokens, dim]
+        vision_tokens = vision_tokens.squeeze(0)  # [num_tokens, dim]
         compressor = self.get_token_compressor()
+        two_stage = hasattr(compressor, "compress_windows")
+
         compression_cu_seqlens = [0]
         need_compress_parts = torch.zeros(vision_tokens.shape[0], device=device, dtype=torch.bool)
         replace_mask = torch.zeros(vision_tokens.shape[0], device=device, dtype=torch.bool)
+        part_starts: List[int] = []
         for part, (h, w) in zip(compression_parts, grid_hws):
             part_len = part[1] - part[0]
             need_compress_parts[part[0]: part[1]] = True
-            n_frames = part_len // (h * w)
-            n_out = _compressed_len(compressor, n_frames, h, w)
-            replace_mask[part[0]: part[0] + n_out] = True
+            part_starts.append(part[0])
             compression_cu_seqlens.append(compression_cu_seqlens[-1] + part_len)
+            if not two_stage:
+                n_frames = part_len // (h * w)
+                n_out = _compressed_len(compressor, n_frames, h, w)
+                replace_mask[part[0]: part[0] + n_out] = True
         compression_cu_seqlens = torch.tensor(compression_cu_seqlens, device=device, dtype=torch.long)
 
-        # compressed vision tokens should have shape: [n, dim]
         original_tokens_to_reconstruct = vision_tokens[need_compress_parts]
-        if hasattr(compressor, "compress_windows"):
-            # Two-stage (Stage-1 per-segment lift + Stage-2 Mamba fold): each part is
-            # one readout unit, subdivided into <= frames_per_segment-frame segments
-            # inside the compressor. Output is (sum_parts M, dim), part-major — same
-            # layout the single-stage call returns, so the scatter below is unchanged.
-            compressed = compressor.compress_windows(
+        unit_meta = None
+        if two_stage:
+            compressed, unit_meta = compressor.compress_windows(
                 original_tokens_to_reconstruct,
                 compression_cu_seqlens,
                 grid_hws,
+                retained_counts=retained_counts,
+                seed=seed,
+                qbase_only=qbase_only,
             )
+            # Per part (== window), reserve sum of its units' n_out rows.
+            n_out_per_part = [0] * len(compression_parts)
+            for m in unit_meta:
+                n_out_per_part[m["window"]] += int(m["n_out"])
+            for pi, ps in enumerate(part_starts):
+                replace_mask[ps: ps + n_out_per_part[pi]] = True
         else:
             compressed = compressor(
                 original_tokens_to_reconstruct,
@@ -224,7 +238,8 @@ class Videollama3MetaForCausalLM(ABC):
         keeping_masks = ~need_compress_parts | replace_mask
         vision_tokens[replace_mask] = compressed
         vision_tokens = vision_tokens[keeping_masks]
-        return vision_tokens
+        return vision_tokens, unit_meta
+
     def encode_images(
         self,
         pixel_values: torch.FloatTensor,
@@ -232,23 +247,43 @@ class Videollama3MetaForCausalLM(ABC):
         merge_sizes: torch.LongTensor,
         compression_parts: Optional[List[List[int]]] = None,
         grid_hws: Optional[List[Tuple[int, int]]] = None,
-    ) -> Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]:
-        reconstruction_mse_loss = None
+        retained_counts: Optional[List[List[int]]] = None,
+        seed: Optional[int] = None,
+        qbase_only: Optional[List[bool]] = None,
+    ) -> Tuple[torch.FloatTensor, Optional[List[dict]]]:
+        unit_meta = None
         mm_features = self.get_model().get_vision_encoder()(
             pixel_values=pixel_values,
             grid_sizes=grid_sizes,
             merge_sizes=merge_sizes,
         )
         if getattr(self.config, "trainable_mm_compressor", False) and compression_parts is not None and len(compression_parts) > 0:
-            assert compression_parts is not None, "compression_parts is required for trainable token compression."
-            mm_features = self.compress_visual_tokens_with_compressor(
+            mm_features, unit_meta = self.compress_visual_tokens_with_compressor(
                 mm_features,
                 compression_parts,
                 grid_hws,
+                retained_counts=retained_counts,
+                seed=seed,
+                qbase_only=qbase_only,
             )
         mm_features = self.get_model().mm_projector(mm_features)
-        return mm_features
+        return mm_features, unit_meta
     
+    def _time_range_token_ids(self, a_sec: int, b_sec: int) -> List[int]:
+        """`Time:{a}s-{b}s:` as token ids, assembled from the digit / fragment
+        tables baked into config at setup (bake_time_tokens). Returns [] when the
+        tables are absent (e.g. an old checkpoint) so the range string is simply
+        omitted, matching the single-stage empty-`new_ts_ids` path."""
+        cfg = self.config
+        digits = getattr(cfg, "time_tok_digits", None)
+        if not digits:
+            return []
+        hi = len(digits) - 1
+        a = max(0, min(int(a_sec), hi))
+        b = max(0, min(int(b_sec), hi))
+        return (list(cfg.time_tok_open) + list(digits[a]) + list(cfg.time_tok_mid)
+                + list(digits[b]) + list(cfg.time_tok_close))
+
     def prepare_inputs_labels_for_multimodal(
         self,
         input_ids: torch.LongTensor = None,
@@ -262,6 +297,10 @@ class Videollama3MetaForCausalLM(ABC):
         modals: Optional[torch.LongTensor] = None, # This parameter is currently not used in the model, but can be used to indicate the modality of each token for more flexible multimodal modeling.
         compression_parts: Optional[List[List[int]]] = None,
         compression_ts_info: Optional[List[Tuple[int, List[int]]]] = None,
+        compression_retained: Optional[List[List[int]]] = None,
+        compression_seed: Optional[List[int]] = None,
+        compression_frame_sec: Optional[List[List[int]]] = None,
+        compression_qbase_only: Optional[List[bool]] = None,
     ):
         B, N = input_ids.shape
         device = input_ids.device
@@ -288,18 +327,35 @@ class Videollama3MetaForCausalLM(ABC):
         grid_hws = None
         if compression_parts is not None and len(compression_parts) > 0:
             grid_hws = _grid_hw_for_compression_parts(compression_parts, grid_sizes, merge_sizes)
-        mm_features = self.encode_images(
-            pixel_values, grid_sizes, merge_sizes, compression_parts, grid_hws
+        _seed = None
+        if compression_seed is not None and len(compression_seed) > 0:
+            _seed = list(compression_seed)
+        _qbase_only = None
+        if compression_qbase_only is not None and len(compression_qbase_only) > 0:
+            _qbase_only = list(compression_qbase_only)
+        mm_features, unit_meta = self.encode_images(
+            pixel_values, grid_sizes, merge_sizes, compression_parts, grid_hws,
+            retained_counts=compression_retained, seed=_seed, qbase_only=_qbase_only,
         )
 
         if compression_parts is not None and len(compression_parts) > 0:
             compressor = self.get_token_compressor()
-            # List-based construction: build the new token sequence piece-by-piece.
-            # This lets us replace the per-frame "Time X.0s:" text with a range
-            # "Time:Xs-Ye:" before each compression block.
-            ids_segs, lbl_segs, attn_segs, is_start_segs = [], [], [], []
+            two_stage = unit_meta is not None
+            # unit_meta grouped by window index (== part index; parts are collator-sorted).
+            units_by_win: dict = {}
+            if two_stage:
+                for m in unit_meta:
+                    units_by_win.setdefault(m["window"], []).append(m)
 
-            def _append_seg(tok_ids, lbl_fill, attn_fill, is_sample_start_mask=None):
+            # List-based construction: build the new token sequence piece-by-piece.
+            # Single-stage: replace the per-frame "Time X.0s:" text with one range
+            # "Time:{a}s-{b}s:" before the compressed block. Two-stage: the model
+            # split each whole-video part into U units, so emit U {range-ts, <cs>,
+            # M+r_u*K placeholders, <ce>} blocks; placeholder blocks carry a
+            # `pos_block` = (slot offsets, unit_span) for the strided position_ids.
+            ids_segs, lbl_segs, attn_segs, is_start_segs, pos_plan = [], [], [], [], []
+
+            def _append_seg(tok_ids, lbl_fill, attn_fill, is_sample_start_mask=None, pos_block=None):
                 if tok_ids is None or len(tok_ids) == 0:
                     return
                 ids_segs.append(tok_ids)
@@ -307,81 +363,83 @@ class Videollama3MetaForCausalLM(ABC):
                     lbl_segs.append(lbl_fill)
                 if attention_mask is not None:
                     attn_segs.append(attn_fill)
-                # Track which positions are sample-starts (position_id == 0) so we can
-                # re-number positions correctly after insertion of new tokens.
                 if position_ids is not None:
                     if is_sample_start_mask is not None:
                         is_start_segs.append(is_sample_start_mask)
                     else:
                         is_start_segs.append(torch.zeros(len(tok_ids), device=device, dtype=torch.bool))
+                    pos_plan.append(pos_block)
 
+            def _append_ids(ids_list):
+                if not ids_list:
+                    return
+                t = torch.tensor(ids_list, device=device, dtype=input_ids.dtype)
+                _append_seg(
+                    t,
+                    torch.full([len(ids_list)], IGNORE_INDEX, device=device, dtype=labels.dtype) if labels is not None else None,
+                    torch.ones(len(ids_list), device=device, dtype=attention_mask.dtype) if attention_mask is not None else None,
+                )
+
+            def _append_placeholders(n_out, pos_block):
+                img_toks = torch.full([n_out], self.config.image_token_index, device=device, dtype=input_ids.dtype)
+                _append_seg(
+                    img_toks,
+                    torch.full([n_out], IGNORE_INDEX, device=device, dtype=labels.dtype) if labels is not None else None,
+                    torch.ones(n_out, device=device, dtype=attention_mask.dtype) if attention_mask is not None else None,
+                    pos_block=pos_block,
+                )
+
+            cs_id, ce_id = self.config.compression_start_token_id, self.config.compression_end_token_id
             prev = 0
             parts_with_hw = sorted(zip(compression_parts, grid_hws), key=lambda pair: pair[0][0])
             for part_idx, (part, (part_h, part_w)) in enumerate(parts_with_hw):
-                n_frames = (part[1] - part[0]) // (part_h * part_w)
-                compact_vision_token_size = _compressed_len(compressor, n_frames, part_h, part_w)
                 part_start = image_positions[part[0]].item()
                 part_end = image_positions[part[1] - 1].item()
 
-                # How many tokens does the old "Time X.0s:" string occupy before part_start?
                 old_ts_len = 0
-                new_ts_ids: List[int] = []
+                ts_extra = None
                 if compression_ts_info is not None and part_idx < len(compression_ts_info):
-                    old_ts_len, new_ts_ids = compression_ts_info[part_idx]
+                    old_ts_len, ts_extra = compression_ts_info[part_idx]
 
-                # 1. Keep everything from prev up to (but not including) old timestamp text.
-                # Clamp: if old_ts_len is somehow larger than the gap (shouldn't happen with
-                # well-formed data), fall back to keeping up to part_start (no replacement).
+                # 1. Keep everything up to (but not including) the old "Time X.0s:" text.
                 keep_end = max(prev, part_start - old_ts_len)
                 if keep_end > prev:
-                    seg = input_ids[prev:keep_end]
                     _append_seg(
-                        seg,
+                        input_ids[prev:keep_end],
                         labels[prev:keep_end] if labels is not None else None,
                         attention_mask[prev:keep_end] if attention_mask is not None else None,
                         (position_ids[prev:keep_end] == 0) if position_ids is not None else None,
                     )
 
-                # 2. Insert new range timestamp tokens (replaces old "Time X.0s:" text).
-                if new_ts_ids:
-                    ts_tensor = torch.tensor(new_ts_ids, device=device, dtype=input_ids.dtype)
-                    _append_seg(
-                        ts_tensor,
-                        torch.full([len(new_ts_ids)], IGNORE_INDEX, device=device, dtype=labels.dtype) if labels is not None else None,
-                        torch.ones(len(new_ts_ids), device=device, dtype=attention_mask.dtype) if attention_mask is not None else None,
-                    )
-
-                # 3. <compression_start>
-                cs_tok = torch.tensor([self.config.compression_start_token_id], device=device, dtype=input_ids.dtype)
-                _append_seg(
-                    cs_tok,
-                    torch.tensor([IGNORE_INDEX], device=device, dtype=labels.dtype) if labels is not None else None,
-                    torch.ones(1, device=device, dtype=attention_mask.dtype) if attention_mask is not None else None,
-                )
-
-                # 4. Compressed image token placeholders (features filled in later by embed step).
-                img_toks = torch.full([compact_vision_token_size], self.config.image_token_index, device=device, dtype=input_ids.dtype)
-                _append_seg(
-                    img_toks,
-                    torch.full([compact_vision_token_size], IGNORE_INDEX, device=device, dtype=labels.dtype) if labels is not None else None,
-                    torch.ones(compact_vision_token_size, device=device, dtype=attention_mask.dtype) if attention_mask is not None else None,
-                )
-
-                # 5. <compression_end>
-                ce_tok = torch.tensor([self.config.compression_end_token_id], device=device, dtype=input_ids.dtype)
-                _append_seg(
-                    ce_tok,
-                    torch.tensor([IGNORE_INDEX], device=device, dtype=labels.dtype) if labels is not None else None,
-                    torch.ones(1, device=device, dtype=attention_mask.dtype) if attention_mask is not None else None,
-                )
+                if two_stage:
+                    frame_sec = None
+                    if compression_frame_sec is not None and part_idx < len(compression_frame_sec):
+                        frame_sec = compression_frame_sec[part_idx]
+                    for m in units_by_win.get(part_idx, []):
+                        if frame_sec:
+                            nfs = len(frame_sec)
+                            a_sec = frame_sec[min(m["a_frame"], nfs - 1)]
+                            b_sec = frame_sec[min(max(m["b_frame"] - 1, 0), nfs - 1)]
+                        else:  # fps = 1 -> frame index is seconds
+                            a_sec, b_sec = m["a_frame"], max(m["b_frame"] - 1, m["a_frame"])
+                        _append_ids(self._time_range_token_ids(a_sec, b_sec))
+                        _append_ids([cs_id])
+                        _append_placeholders(int(m["n_out"]), (m["pos_offsets"], int(m["unit_span"])))
+                        _append_ids([ce_id])
+                else:
+                    n_frames = (part[1] - part[0]) // (part_h * part_w)
+                    compact = _compressed_len(compressor, n_frames, part_h, part_w)
+                    _append_ids(list(ts_extra) if ts_extra else [])
+                    _append_ids([cs_id])
+                    _append_placeholders(compact, None)
+                    _append_ids([ce_id])
 
                 prev = part_end + 1
 
-            # 6. Everything after the last compression part.
+            # last text run
             if prev < input_ids.shape[0]:
-                seg = input_ids[prev:]
                 _append_seg(
-                    seg,
+                    input_ids[prev:],
                     labels[prev:] if labels is not None else None,
                     attention_mask[prev:] if attention_mask is not None else None,
                     (position_ids[prev:] == 0) if position_ids is not None else None,
@@ -393,16 +451,32 @@ class Videollama3MetaForCausalLM(ABC):
             if attention_mask is not None:
                 attention_mask = torch.cat(attn_segs)
             if position_ids is not None:
-                is_start = torch.cat(is_start_segs)
-                start = torch.nonzero(is_start, as_tuple=False).squeeze(-1)
-                if start.dim() == 0:
-                    start = start.unsqueeze(0)
-                ends = torch.cat([start[1:], torch.tensor([input_ids.shape[0]], device=device)])
-                new_position_ids = torch.zeros(input_ids.shape[0], device=device, dtype=torch.long)
-                for i in range(start.shape[0]):
-                    new_position_ids[start[i]:ends[i]] = torch.arange(ends[i] - start[i], device=device)
-                position_ids = new_position_ids
-            
+                # Text runs: stride 1, resetting to 0 at each sample start. Placeholder
+                # blocks: `base + slot offsets`, then advance the counter by the unit's
+                # full slot span (N_u*K) so the compressed region keeps its Phase-1
+                # RoPE footprint (design doc §1 / §5 item 11).
+                pieces = []
+                cur = 0
+                for seg_ids, is_start, pblock in zip(ids_segs, is_start_segs, pos_plan):
+                    n = len(seg_ids)
+                    if pblock is None:
+                        starts = torch.nonzero(is_start, as_tuple=False).squeeze(-1).tolist()
+                        if not starts:
+                            pieces.append(torch.arange(cur, cur + n, device=device, dtype=torch.long))
+                            cur += n
+                        else:
+                            p = torch.arange(n, device=device, dtype=torch.long)
+                            off = torch.full((n,), cur, device=device, dtype=torch.long)
+                            for s in starts:
+                                off[s:] = -s
+                            pieces.append(p + off)
+                            cur = n - starts[-1]
+                    else:
+                        offsets, span = pblock
+                        pieces.append(cur + offsets.to(device=device, dtype=torch.long))
+                        cur = cur + int(span)
+                position_ids = torch.cat(pieces).to(torch.long)
+
         # 3. embed text tokens
         inputs_embeds = self.get_model().embed_tokens(input_ids).clone()
 

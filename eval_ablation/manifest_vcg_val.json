@@ -1,0 +1,212 @@
+[
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_MldEr60j33M.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video begins in a dimly lit gym with a man wearing a white t-shirt and dark shorts. He positions himself in front of a barbell on the ground and bends over to grasp it. With both hands, he lifts the weight to his shoulders, showcasing his strength and steady posture. Following this, he performs a controlled motion where he bends his knees slightly and then extends his body to press the barbell above his head. His body is dynamically positioned, one leg extended forward and the other bent at the knee. The man successfully completes the lift, holding the weight above his head. The video emphasizes the technique, lighting the man and the barbell, and concludes with him demonstrating his physical capability and the end of his exercise routine.",
+  "source": "vcg_20k",
+  "duration": 26.3
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_nhky9RGjzwc.mp4",
+  "prompt": "Can you provide a detailed walkthrough of the arm wrestling competition captured in the video?",
+  "reference": "The video captures a tense moment at an arm wrestling competition indoors, likely in a sports facility. Two women are seen facing each other across a table, fully engaged in the match. One participant is wearing a red and white sports jersey labeled 'JUMPER' with the number '02-400' and a logo resembling the letter 'J', while the other woman wears a blue and yellow jersey marked 'UKRAINE'. They both have their hair tied back and display intense concentration on their faces. Behind the competitors stands a third woman in a black and white striped shirt, typical of a referee's uniform, overseeing the match closely. Logos like 'SPORT.UA' and 'THE CHAMPIONS' on a black backdrop indicate potential sponsorship and international significance, with mentions of places like 'DRUSKININKAI' and 'LIETUVA' possibly placing the event in Lithuania. The ambiance is charged with energy and competitiveness as one participant, with a jersey marked 'OZ-FIT', exhibits heightened excitement, while the referee maintains a professional demeanor. The competition reaches a climax as one of the participants, unable to win, concedes defeat and walks away from the table, leaving her opponent victorious.",
+  "source": "vcg_20k",
+  "duration": 27.3
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_srARxP_ocyg.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video depicts a martial arts or self-defense training session in a multifunctional indoor gym with a green floor and white line markings. A woman with blonde hair, dressed in a white long-sleeve shirt and black pants, initiates the action by kicking a man wearing gloves in his hands. Following the kick, the man starts walking in a circular path around the training area. As he continues his walk, other individuals from the training session take turns hitting him. The participants, all in training attire, engage in an interactive practice focusing on movement and defense techniques within a structured environment.",
+  "source": "vcg_20k",
+  "duration": 31.3
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_bkRQgwbP0WM.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video showcases a competitive event where individuals are participating in solving Rubik's Cubes. It starts with a young boy, wearing a white jacket and glasses, intently focusing on solving a Rubik's Cube at a table with a digital timer set at '00:00' or just finishing its count to indicate the timed competition. Concurrently, a man in a striped shirt and lanyard completes the puzzle, with the timer showing '362' seconds for his solve. Spectators, including other players and observers, move around the tables to watch the participants. During the event, a boy is seen grabbing a pen, likely for scoring or marking timings. The setting includes blue tablecloths, a bicycle, and a potted plant, creating a casual and organized environment typical of community centers. The competition revolves around speed and accuracy, emphasized by the 'SPEED STACKS' brand associated with such competitive events.",
+  "source": "vcg_20k",
+  "duration": 35.0
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_K8G5CBJtluY.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video begins with a young man lying prone on a tiled floor in a domestic indoor setting, surrounded by a few friends. He positions his hands behind his head and bends his knees to attempt performing sit-ups. During his first sit-up, a loud crack is heard, leading him to laugh and exclaim, 'That hurt my ass.' Undeterred, he proceeds to a second attempt, where another cracking sound causes him to exclaim in pain and grab his buttocks. He then declares 'one more' and makes a third attempt, expressing how horrible it felt. Throughout the video, he struggles through a total of twelve attempts, exhibiting signs of physical exertion, discomfort, and slight agony. The man's friends are present, reacting with amusement to his efforts and the sounds accompanying each attempt. Ultimately, after the series of attempts, he gives up on completing any more sit-ups.",
+  "source": "vcg_20k",
+  "duration": 69.7
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_vtYbJD2J8Tw.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video starts with a woman talking to the camera while smiling, setting a friendly and engaging tone. She then proceeds to work on another woman's hair, parting it into sections and placing rollers. The indoor setting features beige walls, a window with white blinds, and various office or home-like backgrounds. Throughout the video, the stylist wears a blue and white striped shirt and can be identified in multiple frames. Tools such as a hairbrush, a round brush, a hairdryer, and other hairstyling tools are used in the process. The stylist's professional skills are highlighted as she meticulously styles the client's rich, dark hair, maintaining interactions with both the client and the camera. The session captures a blend of professionalism and casual engagement in a multi-functional space reminiscent of a salon and a home setting.",
+  "source": "vcg_20k",
+  "duration": 71.7
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_JMrfe-UVA0Y.mp4",
+  "prompt": "Can you describe the actions of both the man and the woman in the video from start to finish?",
+  "reference": "Throughout the video, a man dressed in a red medical uniform, with a badge and a 'Royal Canin' logo, stands in front of a screen engaging with the camera by gesturing and speaking, indicating an instructional or informative context. Simultaneously, a woman in a blue uniform, also with a badge, is seated at a table with a cat. She is carefully cutting the cat's nails using a nail clipper, showcasing precision and pet care skills. These actions by the man and woman are consistent through the entire video, blending educational dialogue with a practical demonstration of pet care.",
+  "source": "vcg_20k",
+  "duration": 73.3
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_lipavQnHm_g.mp4",
+  "prompt": "Can you walk us through the entire video, detailing all the actions and events that take place?",
+  "reference": "The video starts with a young adult male standing on an indoor court, holding a tennis racket in his right hand and a racquetball in his left hand. He engages in extensive communication, possibly explaining racquetball-related content to the audience. Subsequently, he drops the ball on the court, strikes it with the racket, catches it upon its return, showcasing skill and control. Throughout, he continues talking and gesturing while holding the ball and racket. The video concludes as the screen fades to black while the man is still engaged in conversation, wrapping up the instructional session.",
+  "source": "vcg_20k",
+  "duration": 75.3
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_Y76yy0chbhU.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video begins on an open field where two teams, distinguishable by their blue and white jerseys, are engaged in a lively lacrosse game. Players are seen running around, vigorously playing to hit the ball. Throughout the game, there are dynamic scenes showcasing players dodging opponents and making strategic plays with the lacrosse stick. One pivotal moment captures a player with a red headband skillfully navigating the field with the ball. The video also highlights a player in a yellow jersey taking a crucial shot at the goal, defended by a goalkeeper in a green jersey. Additionally, there are side scenes showing a referee in a red shirt making calls and a coach in a yellow shirt providing guidance to the players. Various camera angles capture the overall field view and close-ups of individual player actions, emphasizing the strategic movements, possession transitions, and intense scoring attempts in the game.",
+  "source": "vcg_20k",
+  "duration": 99.0
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_T8P52q1gCNA.mp4",
+  "prompt": "Can you walk me through the entire video, detailing all the actions and events from start to finish?",
+  "reference": "The video begins with a close-up of a metal bowl on a white surface, where ingredients are mixed to create a creamy yellow dough, featuring dark brown chocolate chips. The mixture is stirred with a silver whisk until well combined, highlighting the addition of chocolate chips. Hands then scoop the dough onto a cookie sheet, arranging it neatly for baking. Moving forward, the video shows the cookie dough balls placed on a baking sheet and placed in the oven to bake. Subsequently, the baked cookies, golden-brown with melted chocolate chips, are presented on a white plate. The video concludes with a visual of two hands breaking a cookie in half, showing its soft, chocolate-studded interior, followed by a simple orange graphic thanking viewers for watching and encouraging them to subscribe to 'LDJ KITCHEN'.",
+  "source": "vcg_20k",
+  "duration": 99.3
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_nHkVfEKklJA.mp4",
+  "prompt": "Can you provide a detailed description of the setting and characters in the video?",
+  "reference": "The video features a young boy seated at a drum set in a cozy, home-like practice space. He is wearing a blue baseball cap turned backwards and a dark-colored jersey with a white design. The drum set is adult-sized and predominantly black with silver hardware. The room is cluttered yet inviting, with a guitar, keyboard, and various items around. The boy's parents, particularly the father in a light-colored top and dark pants, are seen standing in the background, observing his drumming session.",
+  "source": "vcg_20k",
+  "duration": 100.7
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_dFSGN8U8EnA.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video begins on a sunny beach with two women; one blonde woman in a blue bikini is applying sunscreen on the back of another woman in a pink bikini. The camera captures various angles as it pans around, showing different women rubbing lotion on themselves in seductive poses. Scenes include women in red bikinis with metallic details and maroon tops paired with blue bottoms applying lotion while gazing into the distance. The beach setting is detailed with colorful surfboards, umbrellas, and a blue cooler. Different women are depicted adjusting their bikinis, sitting on towels, and interacting subtly. The video ends with groups of women casually engaging with each other near beach chairs and umbrellas, creating a sense of winding down.",
+  "source": "vcg_20k",
+  "duration": 106.7
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_3gQsAKZ71tU.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video opens showcasing an indoor tennis court with white lines on a green surface, divided by a net, and brightly lit. A man in tennis attire stands on the court, hitting a ball with a racket. Various athletes, including men and women in similar sports gear, are then shown taking turns hitting balls. Scenes capture players making powerful swings, with one shot focusing on a woman with blonde hair in action. Text overlays like 'We don't cut corners' and brand logos like 'Mathias Baruffaldi' intermittently appear. A scoreboard displaying 'National Squash Championships' and 'GHEMEC' is briefly shown, hinting at a crossover with squash tournament elements. The video concludes with joyous scenes of athletes celebrating, including two individuals laughing together and a group showing gestures of victory after a game.",
+  "source": "vcg_20k",
+  "duration": 107.0
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_w-6Oo3bgms4.mp4",
+  "prompt": "Can you describe the various teams and players in action during the indoor soccer matches in the video?",
+  "reference": "The video showcases multiple indoor soccer matches involving several teams of men. Players are shown wearing kits that consist of jerseys and shorts in different colors such as blue, white, yellow, and orange, helping to differentiate between teams. Many players are captured engaging energetically in the game, with scenes of players either defending their goals or making strategic plays to score. Goalkeepers in action are dressed distinctly, some in black jerseys, making athletic saves with the soccer ball captured in mid-air, signaling intense moments within the matches.",
+  "source": "vcg_20k",
+  "duration": 115.0
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_aQHGZzqZLxs.mp4",
+  "prompt": "Can you walk me through the entire video, describing each step of the demonstration on how to kindle a small pit of fire?",
+  "reference": "The video begins with a man showcasing a piece of flint used for starting the fire before proceeding to place the flint into a prepared pile of wood which includes logs, twigs, and branches. Subsequently, he ignites the fire, allowing it to slowly spread across the wood pile, intensifying as it consumes the materials. The man then uses flat pieces of wood and paper to manipulate and enhance the flames, while also shaking small twigs over the fire to add a textured fuel to aid the spreading of the fire. Throughout the entire demonstration, the focus is on the careful preparation, ignition, management, and enhancement of the fire within a rock-encircled fire pit outdoors.",
+  "source": "vcg_20k",
+  "duration": 120.7
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_ThRbaI4pGIs.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video begins with a serene coastal scene featuring calm blue waves washing against rocky shores under an overcast sky. The rugged terrain with patches of grass and shrubs adds to the picturesque setting. A male figure dressed in dark clothing suddenly appears carrying a white surfboard and heads towards the water. He confidently enters the choppy ocean, paddles out, and skillfully catches waves while surfing in a black wetsuit. As the man surfs, several individuals on the beach watch him intently. After some time, he leaves the water, sits on a grassy hill with his surfboard, gazes out at the sea, stands up, picks up his surfboard, and walks away, marking the end of the video. The setting sun adds a warm glow to the landscape, creating a beautiful cinematic conclusion.",
+  "source": "vcg_20k",
+  "duration": 126.0
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_E9hFBWDR12A.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video begins with a person walking inside a house, moving through a corridor surrounded by metal structures, and then stepping out into an open field while holding a baseball bat and a handle stick. Proceeding to the outdoor sports field, the scene shifts to show men engaging in a lacrosse game, equipped with lacrosse sticks characterized by white netting and colorful handles. Concurrently, there are scenes of women selling lacrosse t-shirts and various activities happening around the field. Players transition from dressing rooms to the field, play a game, and at the end, line up clapping in a display of sportsmanship. The video concludes by showing the results of the game and promoting an upcoming event for the Swedish Lacrosse team, all under the backdrop of a sunny day casting shadows on the field.",
+  "source": "vcg_20k",
+  "duration": 130.0
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_Z2wZr0Beq9c.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video begins with a scene at an indoor poker table where a woman is serving as the dealer. She is seated behind the table, equipped with poker accessories such as cards and chips. The woman, dressed professionally, shuffles and deals cards to players while maintaining a calm demeanor. In the background, other tables are visible with similar activities happening, implying a bustling casino or gambling establishment. Throughout the video, the focus remains on the woman as she proficiently deals cards, occasionally looking up and smiling at the camera. She interacts with the players and the camera, showcasing her skill and creating a connection. The video captures a routine session of a card game with the dealer's engaging interactions and the standard casino setting.",
+  "source": "vcg_20k",
+  "duration": 133.0
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_WYjtYDyHUxY.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video begins with a young girl in a sporty outfit standing against a gray wall with a logo and a shield. She is equipped with a pink and black paintball gun, ready for a game. The scene then transitions to various images showcasing different guns, including a toy gun with a red and black color scheme and a paintball marker with black, pink, and white features. Textual images with gun names like '#7 Boblong victus,' 'DLX LUXE 2.0,' '#3 DM14,' and '#4 Ego Lv1' are displayed. Digitally rendered gun images follow, such as the DM14 rifle and a camouflaged rifle with the phrase 'And The Best is ...'. The video later shifts back to paintball action, featuring a snapshot of three individuals in camouflage playing the game, with one aiming a gun. The video concludes with a text overlay saying 'And The Best is ...', leaving the message open-ended.",
+  "source": "vcg_20k",
+  "duration": 140.7
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_ZvVnXvKlKbQ.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video captures a lively sequence at a bowling event in a brightly lit bowling alley. It begins with a scene showing a black bowling ball rolling down the lane, striking the arranged bowling pins which scatter. The crowd cheers enthusiastically, expressing diverse reactions through clapping and raising hands. As the crowd's excitement peaks, a man dressed in a dark-colored shirt raises his arms in celebration, indicating a victory moment. He then proceeds to affectionately kiss a trophy, symbolizing his win or special recognition during the U.S. Women's Open bowling event. Throughout the video, the atmosphere remains charged and focused on bowling, celebration, and the competitive sports event theme without distractions like texts or logos.",
+  "source": "vcg_20k",
+  "duration": 144.0
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_-JhWjGDPHMY.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video starts with a middle-aged man seated on the rooftop, dressed in a striped shirt and dark pants, looking into the camera with a slight smile. He is later joined by another man wearing a white short-sleeved shirt and blue jeans who climbs a ladder onto the roof. The scenery includes mountains, green trees, and a street, indicating a residential area. Tools and materials like roofing felt, shingles, gloves, and a pry bar are used in the repair process. The men engage in removing old and damaged roofing material, using specialized tools like a rotary tool. Safety precautions and a methodical approach are evident in how debris and materials are handled systematically. The video captures the progression of a roofing repair job in a thoughtful and careful manner against the backdrop of a clear daytime sky.",
+  "source": "vcg_20k",
+  "duration": 149.7
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_VBY8feOQgy4.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video showcases a fencing competition held indoors in a gymnasium. The setting is a basketball court adapted for fencing, marked with red lettering and a vibrant yellow floor displaying the word 'FENCING.' Two pairs of contestants, all dressed in white fencing gear with helmets, engage in duels. A referee in black oversees the matches closely. The fencers demonstrate offensive and defensive maneuvers, with one scene capturing a fencer lunging forward with his sword extended. The concurrent matches create a lively atmosphere, with spectators seated on wooden benches around the court. The gym retains aspects of its original use, with visible basketball hoops, boundary lines, banners, and posters contributing to the competitive ambiance. The referee stands out in his black attire against the white uniformed fencers while maintaining a close eye on the matches for accurate calls. The high ceiling and large windows allow natural light in, enhancing visibility. A blue scoreboard and a water cooler are present in the background to provide modernity and convenience for the competitors and officials.",
+  "source": "vcg_20k",
+  "duration": 159.7
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_zLbSEo4xhVY.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video begins with a captivating special effect intro featuring a man airborne on a waterboard, introducing the MMXIV HYPERLITE COLLECTION. It transitions to a group of men gathering by a serene lake, showcasing their energetic waterboarding performances with fast-paced glides, flips, and jumps while holding onto tow ropes attached to speeding boats. A woman in pink shorts briefly joins in, demonstrating her waterboarding skills. A suspenseful moment unfolds as a man on a boat faces a remote-controlled airplane approaching him, but another participant quickly intercepts, preventing a potential collision. The video then revisits the waterboarding enthusiasts displaying impressive acrobatics and control on the boards, culminating in an outro that mirrors the intro, emphasizing the thematic cohesion of the HYPERLITE COLLECTION presentation.",
+  "source": "vcg_20k",
+  "duration": 160.3
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_hOdSTik8_nw.mp4",
+  "prompt": "Can you describe the key events that unfold in the video from start to finish?",
+  "reference": "The video begins with a coach energetically coaching his team on a grassy sports field. A man in black walks off in the background, followed by the coach engaging with parents. Two new individuals arrive before the focus shifts back to the coach interacting with the team. A yellow bus drives past as the red team listens intently to the coach, who is providing strategic guidance. The kids play the game with enthusiasm, showcasing their skills. The coach then gathers the kids for more instructions, and the game resumes. Towards the end, a white bus passes by as the day progresses.",
+  "source": "vcg_20k",
+  "duration": 166.3
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_63Zt34YuyRk.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video features a segment on NBC showcasing 'Scissor Wizards,' a dog grooming company known for its creative grooming services and participation in dog shows. It begins with an NBC news reporter wearing a red sweater and white shirt introducing the feature, highlighting the company's specialization. Throughout the segment, a representative from Scissor Wizards discusses the range of grooming services offered, while a groomer demonstrates intricate grooming techniques on a predominantly white dog. The groomer creatively styles the dog's hair into a wizard's hat design complete with a blue band and a white puff. Another dog is shown with a vibrant, multicolored coat dyed in shades of red, green, yellow, and blue, emphasizing the company's theatrical grooming styles. Attendees and participants at the event are also featured, with a focus on their reactions and interactions. The video includes text overlays like 'Creative Ways to Groom Your Dog' and prominently displays the Scissor Wizards logo. The NBC logo is consistently visible, indicating the network's sponsorship and involvement in broadcasting the segment.",
+  "source": "vcg_20k",
+  "duration": 169.7
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_PQgydNnSggw.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video opens with a young woman in a green tank top sitting in a chair, smiling and interacting with the camera by waving and showing hand gestures. She then looks into a mirror, revealing both her and the camera man. Subsequently, a tattoo artist with long dark hair and wearing a white t-shirt enters the frame to begin tattooing a symbol on the woman's neck. Throughout the tattooing process, the woman remains neutral-faced while lying on a black tattoo chair. The video wraps up with a close-up of the freshly inked circular tattoo behind the woman's ear, showcasing its artistic detail. Finally, pictures of the woman's tattoo are displayed, completing the sequence.",
+  "source": "vcg_20k",
+  "duration": 170.0
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_DQXJ8OU7Ox4.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video starts with an introduction for a female weightlifting competition. It is set outdoors on a grassy field with wooden platforms marked with weight categories ranging from 205 to 240 pounds. The focus is on a female athlete in a white tank top and black shorts, progressing through different weight lifts. She begins with lighter weights and gradually moves to heavier ones. Each lift showcases her strength and agility, with background numbers indicating weight increments. As she attempts the highest weight of 240 pounds, she struggles but ultimately steps back, unable to lift it. The video concludes with her leaving the challenge, while competitors continue their attempts, capturing the competitive atmosphere of the event.",
+  "source": "vcg_20k",
+  "duration": 171.0
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_1VmqefkNV_8.mp4",
+  "prompt": "Can you walk me through the entire video, detailing all the key events and actions that take place?",
+  "reference": "The video begins in a vibrant nightclub setting where a man in a neon yellow shirt is energetically dancing on a central stage, capturing the attention of the audience. The dimly lit room is illuminated by purple and blue lights, creating a dynamic atmosphere. People in bright colors surround the stage, dancing in sync with the music. Another individual in a green shirt is seen away from the stage, possibly interacting with different parts of the crowd. Amidst the lively crowd, a man walks in front of them, crossing the neon-lit dance floor. The scene includes security or staff wearing high-visibility vests to ensure a smooth event operation. A big screen in the background adds visual entertainment. The video captures a night at a club with dancing, audience interaction, and vibrant energy throughout.",
+  "source": "vcg_20k",
+  "duration": 172.0
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_kuPWb9E4aUQ.mp4",
+  "prompt": "Can you walk me through the entire video, detailing all the actions and events that unfold from start to finish?",
+  "reference": "The video begins with two divers in black wetsuits and scuba tanks swimming underwater while holding onto a sturdy rope, indicating they are on a guided expedition. As they dive deeper into the water, the scene transitions to them approaching a coral bed, surrounded by sea life including sea urchins. Meanwhile, on the surface, a person in a light blue top and pink shorts is seen organizing various items near the dive site, followed by individuals on a white boat preparing for marine activities. The video encapsulates a sequence of events from underwater exploration to surface-level preparations and boat activities, showcasing a complete marine expedition.",
+  "source": "vcg_20k",
+  "duration": 173.7
+ },
+ {
+  "video": "/root/datasets/videoxl/Finetuning/vqa/Activity_Videos/v_DkouAjobzac.mp4",
+  "prompt": "Can you describe the entire video in detail from start to finish?",
+  "reference": "The video starts with an intro featuring a man confidently talking and smiling into the camera. It then transitions to a sailing boat with a single-mast labeled 'MACK' moving over choppy waters. Onboard, four individuals are shown, with one steering the boat in a blue cap and another managing the sail in a red jacket. As the video progresses, a woman in a black jacket and blue beanie talks expressively to the camera about sailing techniques. The scenes showcase the white boat sailing along the water, with close-up shots of the mast and individuals performing their roles. The visual narrative continues with a woman sitting on the bow holding an oar, followed by dynamic views of the sailboat cruising rapidly with billowing sails. It concludes with the sailboat cutting through the water against gray skies, encapsulating the technical details and the thrilling sailing experience.",
+  "source": "vcg_20k",
+  "duration": 178.3
+ }
+]

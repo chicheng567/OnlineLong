@@ -329,6 +329,19 @@ class VideoLLaMA3Trainer(Trainer):
         if dataset is None or not has_length(dataset):
             return None
 
+        if getattr(self.args, "group_by_compression_depth", False):
+            depths = getattr(dataset, "compression_depths", None)
+            if depths is not None and len(depths) == len(dataset):
+                return LengthGroupedSampler(
+                    self.args.train_batch_size,
+                    world_size=self.args.world_size * self.args.gradient_accumulation_steps,
+                    lengths=list(depths),
+                    group_by_modality=False,
+                )
+            if self.args.local_rank in (-1, 0):
+                print("[trainer] group_by_compression_depth set but dataset has no usable "
+                      "`compression_depths` (durations_json?); falling back to default sampler.")
+
         if self.args.group_by_modality_length:
             lengths = dataset.modality_lengths
             return LengthGroupedSampler(
@@ -388,7 +401,12 @@ class VideoLLaMA3Trainer(Trainer):
                 ])
 
             if compressor_lr is not None and compressor_lr > 0:
-                stage1_lr = getattr(self.args, "stage1_lr", None)
+                qbase_lr = getattr(self.args, "qbase_lr", None)
+                mamba_lr = getattr(self.args, "mamba_lr", None)
+                # mamba_lr overrides compressor_lr as the fold/embed rate when set;
+                # single-stage compressors (no "+mamba") never set it, so this is a
+                # no-op fallback to compressor_lr for them.
+                fold_lr = mamba_lr if (mamba_lr is not None and mamba_lr > 0) else compressor_lr
                 compressor_parameters = [name for name, _ in optimized_parameters if "token_compressor" in name]
                 # When the LLM is frozen (llm_lr=0) but embed_tokens was extended
                 # for new compression tokens, route embed_tokens into this group so
@@ -400,16 +418,16 @@ class VideoLLaMA3Trainer(Trainer):
                         name for name, _ in optimized_parameters
                         if "embed_tokens" in name and name not in compressor_parameters
                     ]
-                # Optional Stage-1/Stage-2 LR split: the qbase (token_compressor.stage1.*)
-                # gets its own group at stage1_lr; everything else (the Stage-2 fold +
-                # embed_tokens) stays at compressor_lr. stage1_lr <= 0 -> single group.
-                use_stage1_group = stage1_lr is not None and stage1_lr > 0 and any(
+                # Optional qbase/mamba LR split: the qbase (token_compressor.stage1.*)
+                # gets its own group at qbase_lr; everything else (the Mamba-2/SSD
+                # fold + embed_tokens) stays at fold_lr. qbase_lr <= 0 -> single group.
+                use_qbase_group = qbase_lr is not None and qbase_lr > 0 and any(
                     "token_compressor.stage1" in n for n in compressor_parameters
                 )
-                if use_stage1_group:
-                    stage1_parameters = [n for n in compressor_parameters if "token_compressor.stage1" in n]
-                    rest_parameters = [n for n in compressor_parameters if n not in stage1_parameters]
-                    for grp_names, grp_lr in ((rest_parameters, compressor_lr), (stage1_parameters, stage1_lr)):
+                if use_qbase_group:
+                    qbase_parameters = [n for n in compressor_parameters if "token_compressor.stage1" in n]
+                    rest_parameters = [n for n in compressor_parameters if n not in qbase_parameters]
+                    for grp_names, grp_lr in ((rest_parameters, fold_lr), (qbase_parameters, qbase_lr)):
                         decay_grp = [n for n in grp_names if n in decay_parameters]
                         nodecay_grp = [n for n in grp_names if n not in decay_parameters]
                         optimizer_grouped_parameters.extend([
@@ -424,8 +442,8 @@ class VideoLLaMA3Trainer(Trainer):
                                 "lr": grp_lr,
                             },
                         ])
-                    print(f"[create_optimizer] stage1 LR split: {len(stage1_parameters)} qbase params @ "
-                          f"{stage1_lr}, {len(rest_parameters)} fold/embed params @ {compressor_lr}")
+                    print(f"[create_optimizer] qbase/mamba LR split: {len(qbase_parameters)} qbase params @ "
+                          f"{qbase_lr}, {len(rest_parameters)} fold/embed params @ {fold_lr}")
                 else:
                     decay_compressor_parameters = [name for name in compressor_parameters if name in decay_parameters]
                     nodecay_compressor_parameters = [name for name in compressor_parameters if name not in decay_parameters]
@@ -433,12 +451,12 @@ class VideoLLaMA3Trainer(Trainer):
                         {
                             "params": [p for n, p in optimized_parameters if n in decay_compressor_parameters],
                             "weight_decay": self.args.weight_decay,
-                            "lr": compressor_lr,
+                            "lr": fold_lr,
                         },
                         {
                             "params": [p for n, p in optimized_parameters if n in nodecay_compressor_parameters],
                             "weight_decay": 0.0,
-                            "lr": compressor_lr,
+                            "lr": fold_lr,
                         }
                     ])
 

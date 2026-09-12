@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Find the Stage-2 training bottleneck.
+"""Find the Phase-2 fold training bottleneck.
 
 Two modes:
 
   --mode data   (no GPU / no torchrun)
-      Build the REAL Stage-2 dataset + collator and measure how fast ONE rank's
+      Build the REAL Phase-2 dataset + collator and measure how fast ONE rank's
       DataLoader can supply samples at a given worker/prefetch setting, plus the
       per-sample decode-time distribution (num_workers=0 pass) broken down by
       source dataset. Compare "samples/s supplied" against "samples/s the 8-GPU
@@ -16,8 +16,8 @@ Two modes:
       data-wait vs compute, and inside compute: vision-encoder fwd vs compressor
       fwd vs LLM(fwd+bwd)+opt.
 
-    python eval_ablation/profile_stage2.py --mode data --workers 16 --prefetch 8 --n 60
-    torchrun --standalone --nproc_per_node=1 eval_ablation/profile_stage2.py --mode train --workers 8
+    python eval_ablation/profile_phase2.py --mode data --workers 16 --prefetch 8 --n 60
+    torchrun --standalone --nproc_per_node=1 eval_ablation/profile_phase2.py --mode train --workers 8
 """
 from __future__ import annotations
 
@@ -31,9 +31,9 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 MODEL_DIR = "pretrained_models/videollama3_7b_local"
-META = "anno_data/stage2_videoxl_full.json"
+META = "anno_data/phase2_training.json"
 MAX_FRAMES = 160
-OBSERVED_S_PER_IT = 55.0            # stage2b steady-state median
+OBSERVED_S_PER_IT = 55.0            # steady-state s/it median (set from your run)
 GLOBAL_BATCH = 512
 
 
@@ -42,8 +42,8 @@ def _mk_dataset(workers_for_args: int):
     import transformers
     from videollama3.model.processor import Videollama3Processor, DEFAULT_CHAT_TEMPLATE
     from videollama3.train.compressor_pretrain_with_videollama3 import DataArguments
-    from videollama3.train.stage2a_pretrain_compressor_fold import (
-        Stage2DataArguments, Stage2ModelArguments, Stage2UnitDataset,
+    from videollama3.train.phase2_pretrain_fold import (
+        Phase2DataArguments, Phase2ModelArguments, Phase2FoldDataset,
     )
     from videollama3.train.data.global_compressor import make_global_compressor_data_module
 
@@ -60,15 +60,14 @@ def _mk_dataset(workers_for_args: int):
     proc.image_processor.max_tokens = 16384
     proc.image_processor.min_tokens = 16
 
-    da = Stage2DataArguments(
+    da = Phase2DataArguments(
         data_path=[META], multi_dataset=True, fps=1, max_frames=MAX_FRAMES,
-        video_merge_size=2, use_batch_flattening=True, frames_per_segment=4,
-        segs_per_unit=6, stage2_max_units=5,
+        video_merge_size=2, use_batch_flattening=True, stage2_max_units=5,
     )
-    ma = Stage2ModelArguments(stage2_n_summary_tokens=64)
+    ma = Phase2ModelArguments(stage2_n_summary_tokens=64)
     dm = make_global_compressor_data_module(
         vlprocessor=proc, data_args=da, output_dir=None,
-        dataset_cls=Stage2UnitDataset, model_args=ma,
+        dataset_cls=Phase2FoldDataset, model_args=ma,
     )
     return dm["train_dataset"], dm["data_collator"], proc
 
@@ -149,7 +148,7 @@ _T = defaultdict(list)
 def mode_train(args):
     import torch
     import videollama3.train.compressor_pretrain_with_videollama3 as base
-    import videollama3.train.stage2a_pretrain_compressor_fold as s2
+    import videollama3.train.phase2_pretrain_fold as s2
     from videollama3.model.videollama3_arch import Videollama3MetaForCausalLM
     from videollama3.train.videollama3_trainer import VideoLLaMA3Trainer
 
@@ -200,10 +199,8 @@ def mode_train(args):
         "--compressor_type", "transformer_decoder_flat", "--num_queries", "64",
         "--compressor_num_layers", "8", "--compressor_num_attention_heads", "8",
         "--match_encoder_scale", "True", "--compressor_distr_loss_weight", "0.05",
-        "--freeze_stage1", "True",
         "--stage1_pretrained", "pretrained_models/compressor_pretrain_video_norm",
-        "--stage2_n_summary_tokens", "64", "--frames_per_segment", "4",
-        "--segs_per_unit", "6", "--stage2_max_units", "5",
+        "--stage2_n_summary_tokens", "64", "--stage2_max_units", "5",
         "--multi_dataset", "True", "--data_path", META,
         "--fps", "1", "--max_frames", str(MAX_FRAMES), "--video_merge_size", "2",
         "--use_batch_flattening", "True", "--bf16", "True", "--tf32", "True",
@@ -220,8 +217,8 @@ def mode_train(args):
     try:
         base.train(
             attn_implementation="flash_attention_2",
-            model_args_cls=s2.Stage2ModelArguments, data_args_cls=s2.Stage2DataArguments,
-            dataset_cls=s2.Stage2UnitDataset,
+            model_args_cls=s2.Phase2ModelArguments, data_args_cls=s2.Phase2DataArguments,
+            dataset_cls=s2.Phase2FoldDataset,
             build_token_compressor_config=s2._build_stage2_token_compressor_config,
             configure_image_processor=s2._configure_stage2_image_processor,
             on_compressor_built=s2._warmstart_and_freeze_stage1,

@@ -49,6 +49,7 @@ from eval_ablation.common import (  # noqa: E402
     describe_grid, extract_features, free_model, load_model, load_processor,
     prepare_video_sample,
 )
+from videollama3.model.videollama3_arch import _compressed_len  # noqa: E402
 
 try:
     from scipy.stats import kurtosis as _scipy_kurtosis
@@ -222,15 +223,20 @@ def run_one_model(model_path: str, videos: List[str], args) -> Dict:
     # harness sanity check), and any `comp` difference is purely the compressor.
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    proc = load_processor(model_path, force_image_size=args.force_image_size)
+    proc = load_processor(model_path, force_image_size=args.force_image_size,
+                          native_max_tokens=args.native_max_tokens)
     model = load_model(model_path, device=args.device)
     per_video, buf = [], {"comp": [], "comp_proj": [], "raw": [], "raw_proj": [], "npw": []}
     for vp in videos:
         try:
+            comp_mod = model.get_token_compressor()
             sample = prepare_video_sample(
                 proc, vp, fps=args.fps, max_frames=args.max_frames,
                 window_size=args.window_size, device=args.device,
-                out_hw_fn=model.get_token_compressor().output_hw_for,
+                out_hw_fn=comp_mod.output_hw_for,
+                whole_video=args.whole_video,
+                out_len_fn=(lambda nf, h, w: _compressed_len(comp_mod, nf, h, w))
+                if args.whole_video else None,
             )
             feats = extract_features(model, sample)
             per_video.append({"video": vp, "grid": describe_grid(sample["meta"]),
@@ -280,7 +286,7 @@ def to_markdown(report: Dict) -> str:
     L.append("- models: " + model_list)
     L.append(f"- videos: {report['config']['n_videos']} | "
              f"frames/clip: {report['config']['max_frames']} | "
-             f"window: {report['config']['window_size']} | "
+             f"window: {'whole-video' if report['config'].get('whole_video') else str(report['config']['window_size']) + ' frames'} | "
              f"force_image_size: {report['config']['force_image_size']}")
     L.append(f"- dynamic HW: per-window (h,w) taken from the encoder grid and passed "
              f"to the compressor for every window (see per-video grids in the JSON)\n")
@@ -347,8 +353,14 @@ def main():
     ap.add_argument("--fps", type=int, default=1)
     ap.add_argument("--max_frames", type=int, default=DEFAULT_MAX_FRAMES)
     ap.add_argument("--window_size", type=int, default=DEFAULT_WINDOW_SIZE)
+    ap.add_argument("--whole_video", action="store_true",
+                    help="one compression part over the whole video (Plan-X Phase-1 / "
+                         "whole-video-qbase config) instead of window_size-frame groups")
     ap.add_argument("--force_image_size", type=int, default=DEFAULT_FORCE_IMAGE_SIZE,
                     help="0 = native aspect-ratio resolution (off-distribution, varies (h,w))")
+    ap.add_argument("--native_max_tokens", type=int, default=1600,
+                    help="per-video vision-token budget when --force_image_size 0 "
+                         "(training used 16384 for Plan-X dynamic HW)")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 

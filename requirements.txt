@@ -29,10 +29,23 @@ einops==0.6.1
 einops-exts==0.0.4
 safetensors>=0.4                     # Stage-2 qbase warm-start reads token_compressor.* from HF shards
 # Stage-2 segment fold (videollama3/model/segment_aggregator.py) runs on a pure-PyTorch
-# SSD scan — no extra dep. Optional fused Mamba-2 kernel for throughput (build against
-# the pinned Torch/CUDA; not imported anywhere, safe to skip):
-#   mamba-ssm==2.2.2
-#   causal-conv1d==1.4.0
+# SSD scan by default -- no extra dep needed, safe to skip. If both of the below are
+# importable, Mamba2Mixer.forward() (CUDA only) auto-swaps in the fused causal_conv1d +
+# mamba_ssm.ops.triton.ssd_combined kernels (verified to agree with the reference to
+# bf16 noise). The Triton kernels only pay off at batch>=8 (~3.8-4x; a wash at batch=1,
+# launch overhead ~= the reference einsum path there) -- compress_windows() in
+# compressor.py batches every unit in one call (front-padded + dt-masked, arbitrary
+# per-unit N_u) into ONE SegmentAggregator call instead of one per unit, so real Phase-2
+# steps (per_device_train_batch_size videos x up to stage2_max_units each) land well
+# into the batch>=8 regime.
+# PyPI only ships sdist (source build); use the matching prebuilt wheel from each
+# project's GitHub Releases instead (pick the asset matching your torch/cuda/cp/abi):
+#   https://github.com/Dao-AILab/causal-conv1d/releases  (this stack: causal-conv1d==1.7.0)
+#   https://github.com/state-spaces/mamba/releases        (this stack: mamba-ssm==2.3.2.post1)
+# mamba-ssm>=2.3 also pulls in tilelang==0.1.8 / apache-tvm-ffi<=0.1.9 / quack-kernels
+# (all have matching wheels for cp312/x86_64). pip may resolve numpy up past the pin
+# above (1.26.4) via that chain -- reinstall numpy==1.26.4 after if so; decord/opencv
+# were confirmed still working under numpy 2.5.3 too, but stick to the pin regardless.
 pydantic>=2.7,<3
 markdown2[all]
 httpx==0.24.1

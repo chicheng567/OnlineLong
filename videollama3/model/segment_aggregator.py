@@ -34,12 +34,14 @@ conv, so their outputs match to ~1e-3 (checked in ``__main__``).
 
 Kernels
 -------
-Pure PyTorch + einops, CPU-testable, no ``mamba_ssm`` / Triton / flash-attn needed.
-The SSD scan (``_ssd_chunk_scan``) is the reference "minimal SSD" from the Mamba-2
-paper. For production training you can drop in the fused ``mamba_ssm.Mamba2`` kernel
-(same math, ~same weight layout) — not required and not imported here.
-
-Not wired into any training script — this file only builds the module.
+Pure PyTorch + einops reference path (``_ssd_chunk_scan``, the "minimal SSD" from
+the Mamba-2 paper) — CPU-testable, no extra deps. On CUDA, ``Mamba2Mixer.forward()``
+(the chunk-parallel training path only; ``.step()`` streaming stays pure PyTorch)
+auto-swaps in the fused ``causal_conv1d`` + ``mamba_ssm.ops.triton.ssd_combined``
+Triton kernels when both packages are importable (``_HAS_FUSED_MAMBA``); same math,
+verified to agree with the reference to bf16 noise (~5e-3 rel). Neither package is a
+hard dependency -- absent, or on CPU, this falls straight back to the reference path.
+Set ``SegmentAggregatorConfig.use_fused_kernel=False`` to force the reference path.
 """
 
 from __future__ import annotations
@@ -55,6 +57,21 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 __all__ = ["SegmentAggregatorConfig", "SegmentAggregator", "Mamba2Mixer", "AggregatorState"]
+
+# Optional fused Mamba-2 kernels (mamba_ssm + causal_conv1d). Only used by
+# Mamba2Mixer.forward() (the chunk-parallel training/offline path) on CUDA; the
+# streaming .step() recurrence and the CPU path are untouched pure PyTorch, so
+# this module stays importable/CPU-testable with neither package installed.
+try:
+    from causal_conv1d import causal_conv1d_fn as _fused_causal_conv1d_fn
+    from mamba_ssm.ops.triton.ssd_combined import (
+        mamba_chunk_scan_combined as _fused_mamba_chunk_scan_combined,
+    )
+    _HAS_FUSED_MAMBA = True
+except ImportError:
+    _fused_causal_conv1d_fn = None
+    _fused_mamba_chunk_scan_combined = None
+    _HAS_FUSED_MAMBA = False
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +89,30 @@ class RMSNorm(nn.Module):
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return (self.weight * x.to(dtype))
+
+
+class _AffineScale(nn.Module):
+    """Learnable per-dim gain, no normalization (does not pin the row norm)."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.weight.to(x.dtype)
+
+
+def _build_readout_norm(kind: str, dim: int) -> nn.Module:
+    kind = (kind or "rmsnorm").lower()
+    if kind == "rmsnorm":
+        return RMSNorm(dim)
+    if kind == "layernorm":
+        return nn.LayerNorm(dim)
+    if kind == "scale":
+        return _AffineScale(dim)
+    if kind == "none":
+        return nn.Identity()
+    raise ValueError(f"unknown final_norm {kind!r}")
 
 
 class RMSNormGated(nn.Module):
@@ -178,6 +219,7 @@ class Mamba2Mixer(nn.Module):
         dt_max: float = 1e-1,
         dt_init_floor: float = 1e-4,
         A_init_range: Tuple[float, float] = (1.0, 16.0),
+        use_fused_kernel: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
@@ -186,6 +228,11 @@ class Mamba2Mixer(nn.Module):
         self.ngroups = ngroups
         self.d_conv = d_conv
         self.chunk_size = chunk_size
+        # forward() only: on CUDA, with mamba_ssm + causal_conv1d importable, swap the
+        # pure-PyTorch conv1d+SiLU and _ssd_chunk_scan for their fused Triton kernels
+        # (same math -- see test in segment_aggregator __main__ / docs). CPU and the
+        # streaming .step() recurrence are never affected.
+        self.use_fused_kernel = use_fused_kernel and _HAS_FUSED_MAMBA
 
         self.d_inner = expand * d_model
         assert self.d_inner % headdim == 0, "d_inner must be divisible by headdim"
@@ -225,7 +272,22 @@ class Mamba2Mixer(nn.Module):
         u: torch.Tensor,                              # (b, l, d_model)
         ssm_state: Optional[torch.Tensor] = None,     # (b, nheads, headdim, d_state)
         return_state: bool = False,
+        valid_mask: Optional[torch.Tensor] = None,    # (b, l) bool -- True = real token,
+                                                       # False = batch padding (see note below)
     ):
+        # valid_mask lets several ragged-length sequences share one batched call: a
+        # False position gets dt forced to exactly 0, which makes it a state no-op
+        # (decay = exp(A*0) = 1, input contribution = x*0 = 0) regardless of its
+        # (possibly nonzero, e.g. from Linear bias + RMSNorm on a zero-padded input
+        # token) feature values -- so its own output is garbage but it neither reads
+        # nor perturbs any other position's state. Pad at the FRONT of a sequence
+        # (mask = False, True, True, ...) so real content stays immediately adjacent
+        # to any read-out positions appended after it (see SegmentAggregator.forward).
+        if self.use_fused_kernel and u.is_cuda:
+            return self._forward_fused(u, ssm_state, return_state, valid_mask)
+        return self._forward_reference(u, ssm_state, return_state, valid_mask)
+
+    def _forward_reference(self, u, ssm_state, return_state, valid_mask=None):
         b, seqlen, _ = u.shape
         zxbcdt = self.in_proj(u)
         z, xBC, dt = torch.split(
@@ -239,6 +301,8 @@ class Mamba2Mixer(nn.Module):
 
         A = -torch.exp(self.A_log.float())                       # (nheads,)
         dt = F.softplus(dt.float() + self.dt_bias.float())       # (b, l, nheads)
+        if valid_mask is not None:
+            dt = dt * valid_mask[..., None].to(dt.dtype)
         x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim).float()
         B = rearrange(B, "b l (g n) -> b l g n", g=self.ngroups).float()
         C = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups).float()
@@ -251,6 +315,55 @@ class Mamba2Mixer(nn.Module):
         Y, final_state = _ssd_chunk_scan(X, A_dt, B, C, self.chunk_size, initial_states=init)
         Y = Y + x * rearrange(self.D.float(), "h -> h 1")
         Y = rearrange(Y, "b l h p -> b l (h p)").to(u.dtype)
+        Y = self.norm(Y, z)
+        out = self.out_proj(Y)
+        if return_state:
+            return out, final_state.to(u.dtype)
+        return out
+
+    # Same math as _forward_reference, via the fused causal_conv1d + mamba_chunk_scan
+    # Triton kernels (mamba_ssm's own dt/A/D handling replaces our manual fp32 casts +
+    # softplus + repeat-to-heads -- B/C stay at ngroups, the kernel broadcasts them).
+    # Verified to agree with _forward_reference to bf16 noise (~5e-3 rel) offline.
+    def _forward_fused(self, u, ssm_state, return_state, valid_mask=None):
+        seqlen = u.shape[1]
+        zxbcdt = self.in_proj(u)
+        z, xBC, dt = torch.split(
+            zxbcdt, [self.d_inner, self.conv_dim, self.nheads], dim=-1
+        )
+        conv_w = rearrange(self.conv1d.weight, "d 1 k -> d k")
+        xBC = _fused_causal_conv1d_fn(
+            rearrange(xBC, "b l d -> b d l"), conv_w, self.conv1d.bias, activation="silu",
+        )
+        xBC = rearrange(xBC, "b d l -> b l d")[:, :seqlen]
+
+        x, B, C = torch.split(
+            xBC, [self.d_inner, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1
+        )
+        x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim)
+        B = rearrange(B, "b l (g n) -> b l g n", g=self.ngroups)
+        C = rearrange(C, "b l (g n) -> b l g n", g=self.ngroups)
+        A = -torch.exp(self.A_log.float())
+
+        # masked batching needs an exact dt=0 at padded positions (see forward()'s
+        # docstring note) -- do the softplus+bias ourselves instead of the kernel's
+        # internal dt_softplus fusion so we can zero it before the scan.
+        if valid_mask is not None:
+            dt = F.softplus(dt.float() + self.dt_bias.float())
+            dt = dt * valid_mask[..., None].to(dt.dtype)
+            dt_bias, dt_softplus = None, False
+        else:
+            dt_bias, dt_softplus = self.dt_bias, True
+
+        out = _fused_mamba_chunk_scan_combined(
+            x, dt, A, B, C, self.chunk_size,
+            D=self.D, z=None, dt_bias=dt_bias, dt_softplus=dt_softplus,
+            initial_states=ssm_state, return_final_states=return_state,
+        )
+        final_state = None
+        if return_state:
+            out, final_state = out
+        Y = rearrange(out, "b l h p -> b l (h p)").to(u.dtype)
         Y = self.norm(Y, z)
         out = self.out_proj(Y)
         if return_state:
@@ -328,6 +441,7 @@ class Mamba2Block(nn.Module):
             d_conv=cfg.d_conv,
             expand=cfg.expand,
             chunk_size=cfg.chunk_size,
+            use_fused_kernel=getattr(cfg, "use_fused_kernel", True),
         )
         self.dropout = nn.Dropout(cfg.dropout)
         self.mlp = None
@@ -335,8 +449,8 @@ class Mamba2Block(nn.Module):
             self.norm2 = RMSNorm(cfg.d_model)
             self.mlp = _MLP(cfg.d_model, cfg.mlp_ratio)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.dropout(self.mixer(self.norm(x)))
+    def forward(self, x: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x + self.dropout(self.mixer(self.norm(x), valid_mask=valid_mask))
         if self.mlp is not None:
             x = x + self.dropout(self.mlp(self.norm2(x)))
         return x
@@ -369,9 +483,14 @@ class AggregatorState:
 
 @dataclass
 class SegmentAggregatorConfig:
-    d_input: int = 3584            # dim of a stage-1 compressor token (LLM hidden for Qwen2-7B)
-    d_model: int = 1024           # aggregator working width
-    d_output: Optional[int] = None  # None -> d_input (project back so it drops into the LLM stream)
+    # d_input == a stage-1 (qbase) token dim. Under TwoStageCompressor this is the
+    # COMPRESSOR hidden (SigLIP-NaViT 1152), NOT the LLM hidden: the fold runs
+    # before mm_projector, in encoder space, and output_proj decodes the readout
+    # back to d_output so it re-enters the same frozen mm_projector as the qbase
+    # tokens. The bare default below is only for standalone use of this module.
+    d_input: int = 1152           # qbase token dim (TwoStageCompressor sets = compressor hidden)
+    d_model: int = 1024           # fold working width (bottleneck); != d_input -> input/output proj are Linear
+    d_output: Optional[int] = None  # None -> d_input (readout decoded back to the projector's input space)
     tokens_per_segment: int = 64  # K
     n_summary_tokens: int = 32    # M
     n_layers: int = 4
@@ -383,13 +502,32 @@ class SegmentAggregatorConfig:
     d_conv: int = 4
     expand: int = 2
     chunk_size: int = 128
+    # forward() (chunk-parallel training path) only: use the fused mamba_ssm /
+    # causal_conv1d Triton kernels when available and running on CUDA. True is a
+    # no-op (silently falls back to pure PyTorch) when either package is missing
+    # or the tensors are on CPU -- see _HAS_FUSED_MAMBA at the top of this file.
+    use_fused_kernel: bool = True
 
     mlp_ratio: float = 0.0        # 0 = pure Mamba stack; e.g. 4.0 for interleaved MLP
     dropout: float = 0.0
     input_norm: bool = True
 
-    # segment-level temporal encoding, broadcast over the K tokens of a segment
-    time_embed: str = "index_sincos"   # "index_sincos" | "seconds_mlp" | "none"
+    # readout norm applied to the M summary rows before output_proj. Switchable so
+    # its effect can be measured rather than assumed:
+    #   "rmsnorm"  -- RMSNorm (unit RMS per row)
+    #   "layernorm"-- LayerNorm (zero-mean unit-var per row)
+    #   "scale"    -- learnable per-dim gain only, no normalization
+    #   "none"     -- identity
+    final_norm: str = "rmsnorm"
+
+    # segment-level temporal encoding, broadcast over the K tokens of a segment.
+    #   "index_sincos" -- absolute segment-index sinusoid (Phase-1 / superseded)
+    #   "seconds_mlp"  -- MLP over (start, end, end-start) seconds
+    #   "rel_gap_mlp"  -- MLP over per-segment (gap_from_prev_start, duration) seconds
+    #                     (design doc §4 Phase 2: content-adaptive segments make the
+    #                      gap informative; absolute index is not)
+    #   "none"         -- lean on the SSD's implicit ordering + the retained set
+    time_embed: str = "index_sincos"
 
 
 class SegmentAggregator(nn.Module):
@@ -412,16 +550,17 @@ class SegmentAggregator(nn.Module):
         )
         self.input_norm = RMSNorm(cfg.d_model) if cfg.input_norm else nn.Identity()
 
-        if cfg.time_embed == "seconds_mlp":
+        _time_in = {"seconds_mlp": 3, "rel_gap_mlp": 2}.get(cfg.time_embed)
+        if _time_in is not None:
             self.time_mlp = nn.Sequential(
-                nn.Linear(3, cfg.d_model), nn.GELU(), nn.Linear(cfg.d_model, cfg.d_model)
+                nn.Linear(_time_in, cfg.d_model), nn.GELU(), nn.Linear(cfg.d_model, cfg.d_model)
             )
         else:
             self.time_mlp = None
 
         self.summary_tokens = nn.Parameter(torch.randn(cfg.n_summary_tokens, cfg.d_model) * 0.02)
         self.layers = nn.ModuleList(Mamba2Block(cfg) for _ in range(cfg.n_layers))
-        self.final_norm = RMSNorm(cfg.d_model)
+        self.final_norm = _build_readout_norm(getattr(cfg, "final_norm", "rmsnorm"), cfg.d_model)
         self.output_proj = (
             nn.Identity() if cfg.d_model == d_out else nn.Linear(cfg.d_model, d_out)
         )
@@ -453,6 +592,11 @@ class SegmentAggregator(nn.Module):
             elif s.shape[-1] == 2:                 # (B, n_seg, 2) start,end
                 s = torch.cat([s, (s[..., 1:] - s[..., :1])], dim=-1)
             return self.time_mlp(s.to(dtype))
+        if mode == "rel_gap_mlp":
+            assert segment_seconds is not None and segment_seconds.shape[-1] == 2, (
+                "time_embed='rel_gap_mlp' needs segment_seconds (..., 2) = (gap, duration) seconds"
+            )
+            return self.time_mlp(segment_seconds.float().to(dtype))
         raise ValueError(f"unknown time_embed {mode!r}")
 
     # -- offline / training ---------------------------------------------
@@ -461,6 +605,10 @@ class SegmentAggregator(nn.Module):
         segment_tokens: torch.Tensor,                 # (B, N, K, d_input) or (B, N*K, d_input)
         segment_seconds: Optional[torch.Tensor] = None,
         return_hidden: bool = False,
+        segment_valid_mask: Optional[torch.Tensor] = None,   # (B, N) bool -- True = real
+                                                               # segment, False = front-padding
+                                                               # (batching ragged N per sample;
+                                                               # see Mamba2Mixer.forward's note)
     ) -> torch.Tensor:
         K = self.cfg.tokens_per_segment
         if segment_tokens.dim() == 3:
@@ -469,17 +617,49 @@ class SegmentAggregator(nn.Module):
             segment_tokens = segment_tokens.view(B, S // K, K, -1)
         B, N, k, _ = segment_tokens.shape
         assert k == K, f"expected K={K} tokens/segment, got {k}"
+        if segment_valid_mask is not None and self.cfg.time_embed == "index_sincos":
+            # index_sincos encodes the padded ARRAY position, not the real segment
+            # index. Front-padding shifts every real segment's absolute index by
+            # however much padding precedes it, which depends on what else happens
+            # to share this batched call (N_max = max N over the batch) -- so the
+            # same unit's output would silently depend on incidental batch
+            # composition. rel_gap_mlp/seconds_mlp are anchored to real seconds, not
+            # array position, so they don't have this failure mode.
+            raise ValueError(
+                "time_embed='index_sincos' is incompatible with segment_valid_mask "
+                "batching (see comment above) -- use 'rel_gap_mlp', 'seconds_mlp', or "
+                "'none'."
+            )
 
         x = self.input_norm(self.input_proj(segment_tokens))          # (B, N, K, D)
         te = self._seg_time_embed(N, x.device, x.dtype, segment_seconds)
         if te is not None:
             x = x + (te[:, :, None, :] if te.dim() == 3 else te[None, :, None, :])
+        if segment_valid_mask is not None:
+            # Force padded segments to a literal zero row, not just dt=0 in the SSD
+            # scan below: input_proj / time_mlp carry a bias, so a raw-zero padded
+            # segment is NOT zero after them, and that nonzero value would otherwise
+            # leak into the first few real tokens' causal conv1d receptive field.
+            x = x * segment_valid_mask[:, :, None, None].to(x.dtype)
 
         seq = rearrange(x, "b n k d -> b (n k) d")
         sm = self.summary_tokens.to(seq.dtype).expand(B, -1, -1)
         seq = torch.cat([seq, sm], dim=1)                            # (B, N*K + M, D)
+        valid_mask = None
+        if segment_valid_mask is not None:
+            tok_mask = repeat(segment_valid_mask, "b n -> b (n k)", k=K)
+            m_mask = tok_mask.new_ones(B, self.cfg.n_summary_tokens)   # readout is always valid
+            valid_mask = torch.cat([tok_mask, m_mask], dim=1)
         for blk in self.layers:
-            seq = blk(seq)
+            seq = blk(seq, valid_mask=valid_mask)
+            if valid_mask is not None:
+                # Re-zero padded rows after every block. RMSNormGated's silu(z) gate
+                # already drives an all-zero-input block's own output back to zero
+                # (z comes from the same no-bias in_proj), so this is redundant today
+                # -- but that cancellation is incidental, not enforced, and silently
+                # breaks (e.g. an MLP branch's fc1 bias would reintroduce nonzero
+                # padding here) if the block internals ever change. Keep it explicit.
+                seq = seq * valid_mask[..., None].to(seq.dtype)
         summary = self.final_norm(seq[:, -self.cfg.n_summary_tokens:])
         out = self.output_proj(summary)
         return (out, seq) if return_hidden else out
@@ -505,7 +685,7 @@ class SegmentAggregator(nn.Module):
 
         if self.cfg.time_embed == "index_sincos":
             x = x + self._index_sincos(state.n_seen + 1, x.device, x.dtype)[-1]      # (D,)
-        elif self.cfg.time_embed == "seconds_mlp":
+        elif self.cfg.time_embed in ("seconds_mlp", "rel_gap_mlp"):
             secs = None if segment_seconds is None else segment_seconds[:, None]     # (B, 1, ·)
             te = self._seg_time_embed(1, x.device, x.dtype, secs)                    # (B, 1, D)
             if te is not None:
@@ -600,4 +780,69 @@ if __name__ == "__main__":
     assert g_sm is not None and torch.isfinite(g_sm).all() and g_sm.abs().sum() > 0
     assert g_mix is not None and torch.isfinite(g_mix).all() and g_mix.abs().sum() > 0
     print(f"backward ok  |grad summary_tokens|={g_sm.norm():.3e}  |grad mixer.in_proj|={g_mix.norm():.3e}")
+
+    # -- batched ragged-N (segment_valid_mask) regression --------------------
+    # compress_windows() (compressor.py) batches multiple units of DIFFERENT
+    # segment counts into one forward() call by front-padding to N_max and
+    # passing segment_valid_mask, instead of one SegmentAggregator call per unit.
+    # That must reproduce exactly what running a unit alone (its own N, no
+    # padding) gives -- otherwise the folded summary silently depends on
+    # incidental batch composition (which other units happened to share the
+    # call). d_input != d_model below is deliberate: it makes input_proj a real
+    # (biased) Linear, the case that actually leaks padding into real content.
+    cfg_pad = SegmentAggregatorConfig(
+        d_input=96, d_model=64, tokens_per_segment=8, n_summary_tokens=4,
+        n_layers=3, d_state=32, headdim=16, chunk_size=32, d_conv=4,
+        time_embed="rel_gap_mlp",
+    )
+    agg_pad = SegmentAggregator(cfg_pad).to(dev).eval()
+    Kp = cfg_pad.tokens_per_segment
+    N_short, N_long = 5, 9
+    seg_short = torch.randn(1, N_short, Kp, cfg_pad.d_input, device=dev)
+    seg_long = torch.randn(1, N_long, Kp, cfg_pad.d_input, device=dev)
+    secs_short = torch.rand(1, N_short, 2, device=dev)
+    secs_long = torch.rand(1, N_long, 2, device=dev)
+
+    pad = N_long - N_short
+    padded_short = torch.cat([torch.zeros(1, pad, Kp, cfg_pad.d_input, device=dev), seg_short], dim=1)
+    secs_padded_short = torch.cat([torch.zeros(1, pad, 2, device=dev), secs_short], dim=1)
+    mask_short = torch.zeros(1, N_long, dtype=torch.bool, device=dev)
+    mask_short[:, pad:] = True
+    mask_long = torch.ones(1, N_long, dtype=torch.bool, device=dev)
+
+    batch_tok = torch.cat([padded_short, seg_long], dim=0)               # (2, N_long, Kp, d_input)
+    batch_secs = torch.cat([secs_padded_short, secs_long], dim=0)
+    batch_mask = torch.cat([mask_short, mask_long], dim=0)
+
+    with torch.no_grad():
+        out_alone = agg_pad(seg_short, segment_seconds=secs_short)
+        out_batched = agg_pad(batch_tok, segment_seconds=batch_secs, segment_valid_mask=batch_mask)
+    pad_diff = (out_alone - out_batched[0:1]).abs().max().item()
+    print(f"batched (front-padded, N_max={N_long}) vs alone (N={N_short})  max|Δ|={pad_diff:.2e}")
+    assert pad_diff < 1e-5, (
+        f"segment_valid_mask batching diverges from running the unit alone (Δ={pad_diff:.2e}) "
+        "-- padding is leaking into real content"
+    )
+
+    # dummy (zero) padded rows must never receive a training signal
+    batch_tok_g = batch_tok.clone().requires_grad_(True)
+    agg_pad.train()
+    agg_pad(batch_tok_g, segment_seconds=batch_secs, segment_valid_mask=batch_mask).sum().backward()
+    agg_pad.eval()
+    pad_grad = batch_tok_g.grad[0, :pad].abs().max().item()
+    assert pad_grad == 0.0, f"gradient leaked into padded rows: {pad_grad:.2e}"
+    print("padded-row gradient is exactly zero -- ok")
+
+    # index_sincos encodes the padded ARRAY position, not the real segment
+    # index -- combining it with segment_valid_mask must fail loudly, not
+    # silently drift with whatever else shares the batch.
+    cfg_bad = SegmentAggregatorConfig(**{**cfg_pad.__dict__, "time_embed": "index_sincos"})
+    agg_bad = SegmentAggregator(cfg_bad).to(dev).eval()
+    try:
+        with torch.no_grad():
+            agg_bad(batch_tok, segment_valid_mask=batch_mask)
+        raise AssertionError("index_sincos + segment_valid_mask should have raised ValueError")
+    except ValueError:
+        print("index_sincos + segment_valid_mask correctly rejected")
+
     print("all checks passed")

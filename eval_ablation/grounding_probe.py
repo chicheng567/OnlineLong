@@ -10,8 +10,16 @@ whether it does, per model, on a handful of videos:
   FEATURE level (encoder -> compressor, pre-LLM)
     * temporal_blindness   mean row-cosine  C(video) vs C(frames reversed).
                            ~1.0  -> output ignores frame order.
-    * content_collapse     mean cosine between DIFFERENT videos' mean-pooled C.
-                           ~1.0  -> same tokens regardless of input (mode collapse).
+    * struct_rho           Spearman of this rep's video-to-video cosine ranking
+                           against the encoder's. >=0.95 -> geometry preserved;
+                           <0.9 -> discriminative residual scrambled. GATE.
+    * xcos_cen             content_collapse after removing the across-video mean
+                           vector. Should sit near the encoder's (~ -0.08). GATE.
+    * cc_frac              ||mean_v p_v|| / mean_v ||p_v|| -- shared-component
+                           energy. ~0.94 on the encoder; ~1.0 -> collinear. GATE.
+    * content_collapse     mean cosine between DIFFERENT videos' mean-pooled C
+                           (== xcos_raw). ~0.9 on the raw encoder itself, so it is
+                           NOT a gate on its own (design doc §2.3).
     * token_collapse       mean pairwise cosine among one video's output tokens.
                            ~1.0  -> the M readout tokens are all the same vector.
 
@@ -24,10 +32,10 @@ whether it does, per model, on a handful of videos:
 Verdict thresholds are conservative; borderline numbers are reported, not hidden.
 
     PYTHONPATH=. python eval_ablation/grounding_probe.py \
-        --models stage2a=work_dirs/stage2a_fold_videoxl \
-                 stage2b=work_dirs/stage2_unfreeze_full \
-        --manifest work_dirs/stage2_analysis/manifest.json \
-        --out work_dirs/stage2_analysis/grounding --device cuda:0
+        --models qbase=work_dirs/phase1_qbase_internvid \
+                 fold=work_dirs/phase2_fold_internvid \
+        --manifest eval_ablation/manifest_probe.json \
+        --out work_dirs/phase2_probe/grounding --device cuda:0
 """
 from __future__ import annotations
 
@@ -47,6 +55,7 @@ from eval_ablation.common import (  # noqa: E402
     free_model, load_model, load_processor, prepare_video_sample,
 )
 from eval_ablation.metrics import rouge_l, tokenize  # noqa: E402
+from eval_ablation.struct_probe import _pool_stats, _spearman, _vv_cos  # noqa: E402
 from videollama3.model.videollama3_arch import _grid_hw_for_compression_parts  # noqa: E402
 
 GEN = dict(do_sample=False, num_beams=1, max_new_tokens=200, repetition_penalty=1.1)
@@ -78,11 +87,13 @@ def _reverse_frames(pv: torch.Tensor, num_frames: int) -> torch.Tensor:
 
 @torch.no_grad()
 def _compress(model, pv, gs, ms, parts):
+    """(compressor output tokens, raw-encoder pooled vector) for the sample."""
     m = model.get_model()
     mm = m.get_vision_encoder()(pixel_values=pv, grid_sizes=gs, merge_sizes=ms)
     grid_hws = _grid_hw_for_compression_parts(parts, gs, ms)
-    c = model.compress_visual_tokens_with_compressor(mm.clone(), parts, grid_hws)
-    return c.detach().float().cpu().numpy()
+    c, _ = model.compress_visual_tokens_with_compressor(mm.clone(), parts, grid_hws)
+    enc_pooled = mm.detach().float().mean(0).cpu().numpy()
+    return c.detach().float().cpu().numpy(), enc_pooled
 
 
 @torch.no_grad()
@@ -102,6 +113,7 @@ def run_model(tag: str, path: str, items: List[Dict], device: str, max_frames: i
     model = load_model(path, device=device)
     per: List[Dict] = []
     pooled: List[np.ndarray] = []
+    enc_pooled: List[np.ndarray] = []
     caps_real: List[str] = []
     refs: List[str] = []
     for i, it in enumerate(items):
@@ -114,8 +126,8 @@ def run_model(tag: str, path: str, items: List[Dict], device: str, max_frames: i
             nf = s["meta"]["num_frames"]
             pv = s["pixel_values"]
             pv_rev = _reverse_frames(pv, nf)
-            c_real = _compress(model, pv, s["grid_sizes"], s["merge_sizes"], s["compression_parts"])
-            c_rev = _compress(model, pv_rev, s["grid_sizes"], s["merge_sizes"], s["compression_parts"])
+            c_real, enc_real = _compress(model, pv, s["grid_sizes"], s["merge_sizes"], s["compression_parts"])
+            c_rev, _ = _compress(model, pv_rev, s["grid_sizes"], s["merge_sizes"], s["compression_parts"])
             cap_real = _caption(model, proc, s, pv)
             cap_rev = _caption(model, proc, s, pv_rev)
             per.append({
@@ -128,6 +140,7 @@ def run_model(tag: str, path: str, items: List[Dict], device: str, max_frames: i
                 "cap_real": cap_real, "cap_rev": cap_rev,
             })
             pooled.append(c_real.mean(0))
+            enc_pooled.append(enc_real)
             caps_real.append(cap_real)
             refs.append(it.get("reference") or "")
             print(f"  [{tag}] {per[-1]['video']}: temporal_blind={per[-1]['temporal_blindness']:.3f} "
@@ -137,14 +150,17 @@ def run_model(tag: str, path: str, items: List[Dict], device: str, max_frames: i
             print(f"  [{tag}] [skip] {it['video']}\n{traceback.format_exc()}")
     free_model(model)
 
-    # cross-video content collapse (mean-pooled feature cosine, all off-diagonal pairs)
-    content_collapse = float("nan")
-    if len(pooled) >= 2:
-        P = np.stack(pooled)
-        P = P / (np.linalg.norm(P, axis=-1, keepdims=True) + 1e-8)
-        G = P @ P.T
-        iu = np.triu_indices(len(P), k=1)
-        content_collapse = float(np.mean(G[iu]))
+    # cross-video geometry: raw off-diagonal cosine (== content_collapse), the
+    # common-component-removed version (xcos_cen), the shared-component energy
+    # fraction (cc_frac), and the Spearman of this rep's video-to-video cosine
+    # ranking against the encoder's (struct_rho). Gate on xcos_cen / cc_frac /
+    # struct_rho, NOT on raw content_collapse (design doc §2.3).
+    cmp_s = _pool_stats(pooled)
+    enc_s = _pool_stats(enc_pooled)
+    content_collapse = cmp_s["xcos_raw"]
+    struct_rho = float("nan")
+    if len(pooled) >= 3 and len(pooled) == len(enc_pooled):
+        struct_rho = _spearman(_vv_cos(pooled), _vv_cos(enc_pooled))
 
     # caption specificity: own-ref rougeL vs other-refs rougeL
     spec_gap = float("nan")
@@ -172,6 +188,11 @@ def run_model(tag: str, path: str, items: List[Dict], device: str, max_frames: i
         "token_collapse": _m("token_collapse"),
         "caption_order_sim": _m("caption_order_sim"),
         "content_collapse": content_collapse,
+        "xcos_cen": cmp_s["xcos_cen"],
+        "cc_frac": cmp_s["cc_frac"],
+        "struct_rho": struct_rho,
+        "xcos_cen_enc": enc_s["xcos_cen"],
+        "cc_frac_enc": enc_s["cc_frac"],
         "specificity_gap": spec_gap,
     }
     return {"aggregate": agg, "per_video": per}
@@ -181,16 +202,34 @@ def verdict(a: Dict) -> List[str]:
     out = []
     tb, cc, tc = a["temporal_blindness"], a["content_collapse"], a["token_collapse"]
     cos_, sg = a["caption_order_sim"], a["specificity_gap"]
+    sr = a.get("struct_rho", float("nan"))
+    xc, xce = a.get("xcos_cen", float("nan")), a.get("xcos_cen_enc", float("nan"))
+    cf, cfe = a.get("cc_frac", float("nan")), a.get("cc_frac_enc", float("nan"))
     if not np.isnan(tb):
         out.append(f"- temporal_blindness={tb:.3f}  "
                    + ("⚠ output nearly frame-order-invariant" if tb > 0.98
                       else "△ weak temporal sensitivity" if tb > 0.90
                       else "✓ frame order changes the output"))
+    if not np.isnan(sr):
+        out.append(f"- struct_rho={sr:.3f} vs encoder  "
+                   + ("✓ encoder video-to-video geometry preserved" if sr >= 0.95
+                      else "△ geometry partly scrambled" if sr >= 0.90
+                      else "⚠ discriminative geometry scrambled (gate fail)"))
+    if not np.isnan(xc) and not np.isnan(xce):
+        out.append(f"- xcos_cen={xc:+.3f} (encoder {xce:+.3f})  "
+                   + ("✓ tracks the encoder" if abs(xc - xce) <= 0.05
+                      else "△ drifting from encoder" if abs(xc - xce) <= 0.10
+                      else "⚠ centered cross-video structure lost"))
+    if not np.isnan(cf) and not np.isnan(cfe):
+        out.append(f"- cc_frac={cf:.3f} (encoder {cfe:.3f})  "
+                   + ("⚠ pinned to one shared direction" if cf >= 0.995
+                      else "△" if cf >= 0.99 or abs(cf - cfe) > 0.04
+                      else "✓ near the encoder's shared-component energy"))
     if not np.isnan(cc):
-        out.append(f"- content_collapse={cc:.3f}  "
-                   + ("⚠ different videos -> near-identical features (mode collapse)" if cc > 0.95
-                      else "△ videos only weakly separated" if cc > 0.80
-                      else "✓ features separate videos"))
+        out.append(f"- content_collapse={cc:.3f} (raw xcos; ~0.9 on the encoder itself — not a gate)  "
+                   + ("⚠ very high" if cc > 0.98
+                      else "△" if cc > 0.95
+                      else "✓"))
     if not np.isnan(tc):
         out.append(f"- token_collapse={tc:.3f}  "
                    + ("⚠ the M readout tokens are ~one vector" if tc > 0.98
@@ -211,7 +250,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--models", nargs="+", required=True, help="tag=path")
     ap.add_argument("--manifest", required=True)
-    ap.add_argument("--out", default="work_dirs/stage2_analysis/grounding")
+    ap.add_argument("--out", default="work_dirs/phase2_probe/grounding")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--num_videos", type=int, default=8)
     ap.add_argument("--max_frames", type=int, default=160)
@@ -232,13 +271,19 @@ def main():
     lines = ["## 4. Visual grounding probe\n",
              "_Does the compressed representation depend on the video, or is the "
              "low CE just the frozen LLM autocompleting templated captions?_\n",
-             "| model | temporal_blindness | content_collapse | token_collapse | caption_order_sim | specificity_gap |",
-             "|---|---|---|---|---|---|"]
+             "| model | struct_rho | xcos_cen (enc) | cc_frac (enc) | temporal_blindness | "
+             "content_collapse | token_collapse | caption_order_sim | specificity_gap |",
+             "|---|--:|--:|--:|--:|--:|--:|--:|--:|"]
     for tag, r in results.items():
         a = r["aggregate"]
-        lines.append(f"| `{tag}` | {a['temporal_blindness']:.3f} | {a['content_collapse']:.3f} | "
+        lines.append(f"| `{tag}` | {a['struct_rho']:.3f} | "
+                     f"{a['xcos_cen']:+.3f} ({a['xcos_cen_enc']:+.3f}) | "
+                     f"{a['cc_frac']:.3f} ({a['cc_frac_enc']:.3f}) | "
+                     f"{a['temporal_blindness']:.3f} | {a['content_collapse']:.3f} | "
                      f"{a['token_collapse']:.3f} | {a['caption_order_sim']:.3f} | {a['specificity_gap']:+.3f} |")
-    lines.append("\n_lower temporal_blindness / content_collapse / token_collapse / "
+    lines.append("\n_gate: struct_rho >= 0.95, xcos_cen within ~0.05 of the encoder's, "
+                 "cc_frac near the encoder's (not ~1.0). raw content_collapse is ~0.9 on "
+                 "the encoder itself — not a gate. lower temporal_blindness / token_collapse / "
                  "caption_order_sim is better; higher specificity_gap is better._\n")
     for tag, r in results.items():
         lines.append(f"\n**`{tag}`**")
