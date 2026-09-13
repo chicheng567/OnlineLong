@@ -108,7 +108,7 @@ def _caption(model, proc, sample, pv) -> str:
 
 
 def run_model(tag: str, path: str, items: List[Dict], device: str, max_frames: int,
-              window_size: int) -> Dict:
+              window_size: int, whole_video: bool = False) -> Dict:
     proc = load_processor(path, force_image_size=0)          # dynamic HW
     model = load_model(path, device=device)
     per: List[Dict] = []
@@ -122,6 +122,7 @@ def run_model(tag: str, path: str, items: List[Dict], device: str, max_frames: i
                 proc, it["video"], prompt=it.get("prompt") or "Describe this video in detail.",
                 fps=1, max_frames=max_frames, window_size=window_size, device=device,
                 out_hw_fn=model.get_token_compressor().output_hw_for,
+                whole_video=whole_video,
             )
             nf = s["meta"]["num_frames"]
             pv = s["pixel_values"]
@@ -255,6 +256,9 @@ def main():
     ap.add_argument("--num_videos", type=int, default=8)
     ap.add_argument("--max_frames", type=int, default=160)
     ap.add_argument("--window_size", type=int, default=24)
+    ap.add_argument("--whole_video", action="store_true",
+                    help="one compression part covering the whole clip (Plan-X "
+                         "training geometry) instead of consecutive window_size groups")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -263,7 +267,8 @@ def main():
     for pair in args.models:
         tag, path = pair.split("=", 1)
         print(f"=== grounding probe: {tag} ({path}) ===")
-        results[tag] = run_model(tag, path, items, args.device, args.max_frames, args.window_size)
+        results[tag] = run_model(tag, path, items, args.device, args.max_frames,
+                                 args.window_size, whole_video=args.whole_video)
 
     with open(os.path.join(args.out, "grounding.json"), "w") as f:
         json.dump(results, f, indent=1)

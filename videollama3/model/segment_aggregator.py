@@ -326,6 +326,21 @@ class Mamba2Mixer(nn.Module):
     # softplus + repeat-to-heads -- B/C stay at ngroups, the kernel broadcasts them).
     # Verified to agree with _forward_reference to bf16 noise (~5e-3 rel) offline.
     def _forward_fused(self, u, ssm_state, return_state, valid_mask=None):
+        # Triton's autotuner benchmarks each kernel config via `torch.cuda.current_stream()`
+        # / current_device(), NOT the device the input tensors actually live on. A caller
+        # that places the model on a non-default GPU (`model.to("cuda:1")`) without ever
+        # calling `torch.cuda.set_device(1)` -- true of every eval/inference script here,
+        # and the reason training (torchrun/DeepSpeed calls `set_device(local_rank)` itself)
+        # never hit this -- leaves current_device() at its process-default 0, so the
+        # autotuner launches against the wrong CUDA context and dies with `ValueError:
+        # Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)` on an
+        # otherwise perfectly valid cuda:1 tensor. Reproduced directly (deterministic on
+        # any non-zero device, not a race) and fixed by pinning the ambient device for the
+        # duration of the fused call to wherever `u` actually lives.
+        with torch.cuda.device(u.device):
+            return self._forward_fused_impl(u, ssm_state, return_state, valid_mask)
+
+    def _forward_fused_impl(self, u, ssm_state, return_state, valid_mask=None):
         seqlen = u.shape[1]
         zxbcdt = self.in_proj(u)
         z, xBC, dt = torch.split(
