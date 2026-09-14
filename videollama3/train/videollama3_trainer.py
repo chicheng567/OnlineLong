@@ -292,8 +292,19 @@ class VideoLLaMA3Trainer(Trainer):
         # during the CE forward (compressor._distribution_match_loss). Added here so
         # it shows up as its own logged term. No-op unless
         # --compressor_distr_loss_weight > 0.
+        #
+        # compute_loss() runs once per gradient-accumulation micro-batch. The CE
+        # term above is already correctly batch-averaged via num_items_in_batch
+        # (sum-reduced over the whole accumulated batch, so summing GAS micro-batch
+        # contributions reproduces the true mean). `aux` has no such built-in
+        # normalization -- each call adds this micro-batch's own raw distr loss at
+        # full weight -- so without dividing by GAS it is effectively counted GAS
+        # times (empirically confirmed: reported step loss == sum of per-micro-batch
+        # loss_partial + loss_distr, so a GAS=16 run applies distr_loss_weight as if
+        # it were 16x larger than configured).
         aux = self._compressor_distr_loss(model)
         if aux is not None and loss is not None:
+            aux = aux / self.args.gradient_accumulation_steps
             loss = loss + aux
             log_dict["loss_distr"] = aux.detach().item()
 

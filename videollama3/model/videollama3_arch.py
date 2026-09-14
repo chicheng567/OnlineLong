@@ -13,6 +13,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import copy
 import os
 import math
 from abc import ABC, abstractmethod
@@ -112,7 +113,27 @@ class Videollama3MetaModel:
             self.mm_projector = build_vision_projector(config, self.vision_encoder.hidden_size)
         if hasattr(config, "trainable_mm_compressor") and config.trainable_mm_compressor:
             self.token_compressor = build_token_compressor(config)
-            
+            self._maybe_build_split_projectors()
+
+    def _maybe_build_split_projectors(self):
+        """TwoStageCompressor (`+mamba`) output is two distributions -- the
+        qbase-only replay stream and the fold readout -- that used to share one
+        `mm_projector` (it had to "track two moving compressor manifolds",
+        CLAUDE.md). Give each its own copy instead. Only declared for two-stage
+        checkpoints; single-stage (Phase 1) / no-compressor models are untouched
+        and `get_mm_projector_{qbase,fold}()` fall back to the shared projector.
+        Random init here (a fresh deepcopy of whatever `mm_projector` currently
+        is, itself not yet loaded at __init__ time) only needs to have the right
+        shape for `from_pretrained`'s state-dict load to fill in on a genuine
+        split-projector checkpoint; a fresh training run overwrites both with a
+        real copy of the (by-then loaded) `mm_projector` explicitly -- see
+        compressor_pretrain_with_videollama3.py.
+        """
+        compressor = getattr(self, "token_compressor", None)
+        if compressor is not None and hasattr(compressor, "compress_windows"):
+            self.mm_projector_qbase = copy.deepcopy(self.mm_projector)
+            self.mm_projector_fold = copy.deepcopy(self.mm_projector)
+
     def get_vision_encoder(self):
         vision_encoder = getattr(self, 'vision_encoder', None)
         if type(vision_encoder) is list:
@@ -121,6 +142,12 @@ class Videollama3MetaModel:
 
     def get_mm_projector(self):
         return self.mm_projector
+
+    def get_mm_projector_qbase(self):
+        return getattr(self, "mm_projector_qbase", None) or self.mm_projector
+
+    def get_mm_projector_fold(self):
+        return getattr(self, "mm_projector_fold", None) or self.mm_projector
 
     def get_token_compressor(self):
         compressor = getattr(self, 'token_compressor', None)
@@ -172,6 +199,13 @@ class Videollama3MetaForCausalLM(ABC):
 
     def get_mm_projector(self):
         return self.get_model().get_mm_projector()
+
+    def get_mm_projector_qbase(self):
+        return self.get_model().get_mm_projector_qbase()
+
+    def get_mm_projector_fold(self):
+        return self.get_model().get_mm_projector_fold()
+
     def get_token_compressor(self):
         return self.get_model().get_token_compressor()
 
@@ -214,6 +248,7 @@ class Videollama3MetaForCausalLM(ABC):
 
         original_tokens_to_reconstruct = vision_tokens[need_compress_parts]
         unit_meta = None
+        self._last_compression_kind = None
         if two_stage:
             compressed, unit_meta = compressor.compress_windows(
                 original_tokens_to_reconstruct,
@@ -223,10 +258,22 @@ class Videollama3MetaForCausalLM(ABC):
                 seed=seed,
                 qbase_only=qbase_only,
             )
-            # Per part (== window), reserve sum of its units' n_out rows.
+            # Per part (== window), reserve sum of its units' n_out rows, and mark
+            # which projector each of those rows wants (design doc; qbase-only vs
+            # fold-readout are two distributions -- see get_mm_projector_{qbase,fold}).
+            # 0 = raw/uncompressed (never touched below -- the shared mm_projector,
+            # same as pre-split), 1 = qbase-only replay, 2 = fold readout.
+            # NOTE: Phase 3's retained-K (r_u > 0) interleaves raw qbase rows into a
+            # "fold" unit's own n_out rows; this per-unit granularity would then need
+            # to become per-row. Inert in Phase 2 (r_u == 0 everywhere).
             n_out_per_part = [0] * len(compression_parts)
+            kind = torch.zeros(vision_tokens.shape[0], dtype=torch.uint8, device=device)
             for m in unit_meta:
-                n_out_per_part[m["window"]] += int(m["n_out"])
+                pi = m["window"]
+                start = part_starts[pi] + n_out_per_part[pi]
+                n_out = int(m["n_out"])
+                kind[start: start + n_out] = 2 if m.get("kind") == "fold" else 1
+                n_out_per_part[pi] += n_out
             for pi, ps in enumerate(part_starts):
                 replace_mask[ps: ps + n_out_per_part[pi]] = True
         else:
@@ -238,6 +285,8 @@ class Videollama3MetaForCausalLM(ABC):
         keeping_masks = ~need_compress_parts | replace_mask
         vision_tokens[replace_mask] = compressed
         vision_tokens = vision_tokens[keeping_masks]
+        if two_stage:
+            self._last_compression_kind = kind[keeping_masks]
         return vision_tokens, unit_meta
 
     def encode_images(
@@ -257,6 +306,7 @@ class Videollama3MetaForCausalLM(ABC):
             grid_sizes=grid_sizes,
             merge_sizes=merge_sizes,
         )
+        kind = None
         if getattr(self.config, "trainable_mm_compressor", False) and compression_parts is not None and len(compression_parts) > 0:
             mm_features, unit_meta = self.compress_visual_tokens_with_compressor(
                 mm_features,
@@ -266,8 +316,48 @@ class Videollama3MetaForCausalLM(ABC):
                 seed=seed,
                 qbase_only=qbase_only,
             )
-        mm_features = self.get_model().mm_projector(mm_features)
+            kind = self._last_compression_kind
+        mm_features = self._apply_mm_projector(mm_features, kind)
         return mm_features, unit_meta
+
+    def _apply_mm_projector(self, mm_features: torch.FloatTensor, kind: Optional[torch.Tensor]):
+        """Route each row to the projector for its compressor stream. `kind` (from
+        `compress_visual_tokens_with_compressor`) is None for single-stage
+        compressors / uncompressed input -- the plain shared `mm_projector`, same
+        as before this split existed. For a TwoStageCompressor: 0 = raw/uncompressed
+        rows (e.g. a partial-window split) -> the shared `mm_projector`, same as
+        always; 1 = qbase-only replay rows; 2 = fold-readout rows -- each of the
+        latter two gets its own projector (both initialized as a copy of
+        `mm_projector`, see _maybe_build_split_projectors).
+
+        Runs ALL THREE projectors on the FULL `mm_features` unconditionally and
+        selects per-row with `torch.where`, rather than boolean-indexing only the
+        rows each kind actually has. This is single-video-per-forward (batch size
+        1), so which kinds are even present is decided entirely by that one
+        video's data -- with a skip-if-absent (`if qbase_rows.any(): ...`) some
+        ranks would call e.g. get_mm_projector_qbase() this step and others
+        wouldn't (qbase-only replay is ~6.6% of Phase-2 data, and
+        group_by_compression_depth deliberately makes each grad-accum window
+        depth-homogeneous, so an all-fold or all-qbase-only window per rank is
+        common, not an edge case). Under ZeRO stage 1 (overlap_comm=false, one
+        flat-buffer allreduce per accumulation window) that makes the flattened
+        gradient buffer a DIFFERENT SIZE on ranks that touched the param that step
+        vs ranks that didn't -- the same numbered collective call then disagrees
+        on element count across ranks, which is a NCCL hang / "invalid peer GPU
+        memory access" waiting to happen (reproduced deterministically at a fixed
+        step). mm_projector is a small linear/MLP, so always running all three is
+        cheap next to the LLM forward, and keeps every rank's graph identical
+        regardless of data composition.
+        """
+        if kind is None:
+            return self.get_model().mm_projector(mm_features)
+        raw_out = self.get_model().mm_projector(mm_features)
+        qbase_out = self.get_mm_projector_qbase()(mm_features)
+        fold_out = self.get_mm_projector_fold()(mm_features)
+        kind = kind.unsqueeze(-1)
+        out = torch.where(kind == 1, qbase_out, raw_out)
+        out = torch.where(kind == 2, fold_out, out)
+        return out
     
     def _time_range_token_ids(self, a_sec: int, b_sec: int) -> List[int]:
         """`Time:{a}s-{b}s:` as token ids, assembled from the digit / fragment

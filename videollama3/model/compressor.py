@@ -1103,9 +1103,13 @@ class TwoStageCompressor(nn.Module):
         # SegmentAggregator.output_proj (d_model -> d_output) is the learned
         # readout DECODE -- the M summary tokens come out of the fold's working
         # space (stage2_d_model, a bottleneck below `hidden`) and output_proj maps
-        # them onto the encoder scale the SHARED frozen mm_projector expects
-        # (Option A/B then pull them onto its manifold). One projector, no
-        # separate fold projector; the SSM state stays its own (nheads, headdim,
+        # them onto the encoder scale mm_projector expects (Option A/B then pull
+        # them onto its manifold). The qbase-only replay stream and this fold
+        # readout are two distinct, independently-moving distributions, so each
+        # gets its OWN mm_projector copy (both start identical, deepcopied from
+        # the shared one -- see Videollama3MetaModel._maybe_build_split_projectors
+        # / videollama3_arch.py's _apply_mm_projector) rather than forcing one
+        # projector to track both. The SSM state stays its own (nheads, headdim,
         # d_state) object, distinct from this readout.
         agg_cfg = SegmentAggregatorConfig(
             d_input=hidden,
@@ -1266,6 +1270,7 @@ class TwoStageCompressor(nn.Module):
                     "pos_offsets": torch.arange(N * K, dtype=torch.long, device=kv.device),
                     "unit_span": int(N * K),
                     "window": wi,
+                    "kind": "qbase",
                 }))
                 continue
 
@@ -1403,6 +1408,7 @@ class TwoStageCompressor(nn.Module):
                 "pos_offsets": pos_offsets,
                 "unit_span": int(span),
                 "window": wi,
+                "kind": "fold",
             })
 
         # Option B: sum the fold-readout terms and fold in stage-1's own term

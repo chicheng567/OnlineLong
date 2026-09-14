@@ -148,6 +148,32 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
 
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        # Videollama3MetaModel.__init__ speculatively builds mm_projector_qbase /
+        # mm_projector_fold (as a deepcopy of the not-yet-loaded mm_projector, so
+        # just a shape placeholder) whenever the compressor is a TwoStageCompressor
+        # -- needed so a checkpoint that DOES have them loads its real trained
+        # weights into a matching slot. Loading a checkpoint that predates the
+        # split (no mm_projector_{qbase,fold}.* in its safetensors) leaves that
+        # placeholder at random init instead, which would silently corrupt the
+        # qbase / fold output paths. Detect that via missing_keys and drop the
+        # attribute so get_mm_projector_{qbase,fold}() fall back to the real,
+        # correctly-loaded shared mm_projector instead.
+        want_info = kwargs.pop("output_loading_info", False)
+        result = super().from_pretrained(*args, output_loading_info=True, **kwargs)
+        model, loading_info = result[0], result[1]
+        missing = set(loading_info.get("missing_keys", ()))
+        mm = model.get_model()
+        for name in ("mm_projector_qbase", "mm_projector_fold"):
+            sub = getattr(mm, name, None)
+            if sub is None:
+                continue
+            qualified = {f"model.{name}.{p}" for p, _ in sub.named_parameters()}
+            if qualified and qualified <= missing:
+                delattr(mm, name)
+        return result if want_info else model
+
     def get_model(self):
         return self.model
 

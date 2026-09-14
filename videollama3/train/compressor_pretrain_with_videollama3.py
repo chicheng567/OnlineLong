@@ -457,6 +457,22 @@ def train(attn_implementation=None, *,
             rank0_print(f"[WARN] missing keys: {missing}\n[WARN] unexpected keys: {unexpected}")
     model.get_model().token_compressor.to(dtype=compute_dtype, device=training_args.device)
 
+    # TwoStageCompressor (`+mamba`): the qbase-only replay stream and the fold
+    # readout are two distinct distributions that used to share one mm_projector.
+    # Give each a fresh, independent copy of the (now correctly loaded) shared
+    # mm_projector -- unconditionally, same as token_compressor's own rebuild
+    # above: a genuine resume (same OUTPUT_DIR) has the Trainer's own checkpoint
+    # load restore the real, by-then-diverged weights over this right afterwards.
+    if hasattr(model.get_model().token_compressor, "compress_windows"):
+        import copy
+        mm_projector = model.get_mm_projector()
+        model.get_model().mm_projector_qbase = copy.deepcopy(mm_projector)
+        model.get_model().mm_projector_fold = copy.deepcopy(mm_projector)
+        model.get_model().mm_projector_qbase.to(dtype=compute_dtype, device=training_args.device)
+        model.get_model().mm_projector_fold.to(dtype=compute_dtype, device=training_args.device)
+        rank0_print("[INFO] TwoStageCompressor: split mm_projector_qbase / mm_projector_fold "
+                    "from the shared mm_projector")
+
     model.config.llm_lr = training_args.llm_lr
     model.config.vision_encoder_lr = training_args.vision_encoder_lr
     model.config.mm_projector_lr = training_args.mm_projector_lr
@@ -476,11 +492,15 @@ def train(attn_implementation=None, *,
                     param.requires_grad = False
         _set_module_trainable(model.get_vision_encoder(), vision_trainable)
         _set_module_trainable(model.get_mm_projector(), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "mm_projector_qbase", None), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "mm_projector_fold", None), projector_trainable)
         _set_module_trainable(getattr(model.get_model(), "token_compressor", None), compressor_trainable)
     else:
         _set_module_trainable(model.get_model(), llm_trainable)
         _set_module_trainable(model.get_vision_encoder(), vision_trainable)
         _set_module_trainable(model.get_mm_projector(), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "mm_projector_qbase", None), projector_trainable)
+        _set_module_trainable(getattr(model.get_model(), "mm_projector_fold", None), projector_trainable)
         _set_module_trainable(getattr(model.get_model(), "token_compressor", None), compressor_trainable)
 
     token_compressor = getattr(model.get_model(), "token_compressor", None)

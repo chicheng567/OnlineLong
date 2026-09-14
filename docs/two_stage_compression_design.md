@@ -23,7 +23,7 @@ for the modules they address: `--qbase_lr` (was `--stage1_lr`) and `--mamba_lr`
 | video length | ≤160 f, caps most clips | **length-bucketed curriculum**, fps=1, real depth |
 | qbase segments | whole-video window, or uniform 4-frame (superseded runs) | **fixed count `⌊T/4⌋+1`, adaptively placed** 1–8 frame segments (forced-8 + top-`diff`) |
 | LLM | frozen | frozen (unchanged) |
-| `mm_projector` | frozen | **unfrozen** (tracks the compressor manifold; low risk) |
+| `mm_projector` | frozen | **unfrozen**; Phase 2 on gives the qbase-only replay stream and the fold readout their own copy each (`mm_projector_qbase`/`mm_projector_fold`, both deepcopied from the shared one at build time) instead of forcing one projector to track both moving manifolds |
 | fold-readout regularization | none | **Option A + Option B** |
 | collapse gate | `feature_distribution.py` (missed it) | **grounding probe: centered cross-video cosine + `struct_ρ` vs encoder** |
 
@@ -219,8 +219,15 @@ example, T = 240: N = 61; draw `N̄_u = 13` ⇒ U = 5; partition e.g.
   decode + frozen-encoder forward, **no feature cache**.
 - Single CE forward, `B == 1` flattened collator, `use_dual_forward=False`.
   `zero1` for Phase 1, `zero2` from Phase 2 (qbase + fold + projector trainable).
-- **`mm_projector` unfrozen** every phase (it must be free to track two moving
-  compressor manifolds; small, low risk). **LLM frozen** every phase.
+- **`mm_projector` unfrozen** every phase. Phase 1 has one compressed-token
+  manifold (qbase), so it keeps the single shared `mm_projector`. Phase 2 on has
+  two independently-moving manifolds (qbase-only replay, fold readout) sharing
+  the vision-encoder scale but not the same distribution, so `TwoStageCompressor`
+  models get `mm_projector_qbase` / `mm_projector_fold` instead — both start as a
+  deepcopy of the shared projector (`Videollama3MetaModel._maybe_build_split_projectors`,
+  `compress_visual_tokens_with_compressor`'s per-row routing in `videollama3_arch.py`)
+  and are free to diverge; a raw/uncompressed row (partial-window callers) still
+  uses the plain shared `mm_projector`. **LLM frozen** every phase.
 - **Option A + Option B on every compressor output** — qbase output (already wired)
   *and*, from Phase 2, the fold readout (new code, §5).
 - Length buckets from `anno_data/internVid_durations.json` (built by the full
