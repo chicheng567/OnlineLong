@@ -20,7 +20,7 @@ import transformers
 
 from videollama3.constants import DEFAULT_IMAGE_TOKEN
 from videollama3.train.data import common
-from videollama3.train.data.common import logger, rank0_print
+from videollama3.train.data.common import cast_pixel_values_, logger, rank0_print
 from videollama3.train.data.compressor import (
     DataCollatorWithCompressor,
     SubsetWithLengths,
@@ -175,6 +175,9 @@ class GlobalCompressorLazySupervisedDataset(LazySupervisedDataset):
                 return_labels=self.return_label,
                 return_tensors="pt",
             )
+            # fp32 patches are what crosses worker -> main through /dev/shm; see
+            # cast_pixel_values_.
+            cast_pixel_values_(data_dict, getattr(self.data_args, "pixel_values_dtype", None))
             data_dict["modals"] = [modal] * len(images)
 
             total_frames = int(content["num_frames"])

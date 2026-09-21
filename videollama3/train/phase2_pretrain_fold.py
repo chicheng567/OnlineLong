@@ -22,7 +22,11 @@ collator/trainer — with these changes:
   stream (no unit split, no fold — ``N*K`` qbase tokens straight to the projector),
   so the unfrozen projector / qbase stay anchored to the raw-qbase manifold.
 
-Retained-K (``r_u``) is deferred to Phase 3; the dataset passes ``r_u ≡ 0``.
+There is no retained-K mechanism: a unit's fold readout (``M`` tokens) is the
+*only* representation of its segments the LLM sees. (An earlier design reserved a
+per-unit raw-qbase escape hatch for Phase 3; dropped -- with ``M == K`` it gave the
+LLM a cheap incentive to read the verbatim tokens instead of the fold summary,
+undermining the reason the fold exists. See docs/two_stage_compression_design.md.)
 
 Everything else (token add / embed resize / DeepSpeed / trainable-LR wiring / save)
 is reused from the base script via ``base.train()``'s keyword-only injection hooks
@@ -61,7 +65,7 @@ from videollama3.model.compressor import TwoStageCompressor, adaptive_segment_co
 from videollama3.train.compressor_pretrain_with_videollama3 import (
     _build_token_compressor_config as _orig_build_cfg,
 )
-from videollama3.train.data.common import rank0_print
+from videollama3.train.data.common import cast_pixel_values_, rank0_print
 from videollama3.train.data.global_compressor import (
     GlobalCompressorLazySupervisedDataset,
     _rewrite_image_block_as_single_frame_video,
@@ -81,9 +85,8 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
     """Plan-X Phase 2 dataset. Emits ONE whole-video ``compression_part`` per video
     plus the seeded per-``(epoch, index)`` draw the model consumes: ``U`` (via a
     depth-class ``N̄_u``) and a reproducible ``compression_seed`` for the model-side
-    Gumbel (segment + unit boundaries). ``compression_retained`` is passed as
-    ``[0]*U`` -- the retained set moved to Phase 3. ``N = ⌊T/segment_target_frames⌋+1``
-    is a pure function of the frame count, so no feature decode is needed here.
+    Gumbel (segment + unit boundaries). ``N = ⌊T/segment_target_frames⌋+1`` is a
+    pure function of the frame count, so no feature decode is needed here.
     Content-adaptive segmentation and unit-boundary placement happen model-side in
     ``TwoStageCompressor`` (unit grouping on the qbase segment tokens, not the raw
     encoder feature).
@@ -165,6 +168,13 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
             k,                                               # K qbase tokens / segment
         )
 
+    def _segment_count(self, n_frames: int) -> int:
+        """``N`` for a clip — Phase 2's fixed-frames rule. A pure function of the
+        frame count, identical to the model's (``compressor.segment_count_for``), so
+        no decode is needed here. Phase 3 overrides it with the target-``N`` rule."""
+        target_f, _, _, _ = self._fold_knobs()
+        return adaptive_segment_count(int(n_frames), target_f)
+
     @staticmethod
     def _depth_class_range(n: int) -> "Tuple[int, int]":
         """Narrow N̄_u draw range by total segment count (design doc §4 Phase 2)."""
@@ -175,11 +185,9 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
         return 12, 16            # deep
 
     def _draw_units(self, i: int, N: int, tpf: int, total_vision_tokens: int):
-        """Return (U, r_u list, seed). ``U`` seeded by (epoch, index): a depth-class
-        ``N̄_u`` draw -> ``round(N / N̄_u)``; the cold-fold window narrows it to
-        ``min(3, ⌊N/4⌋)``. ``r_u`` is always ``[0]*U`` -- the retained set moved to
-        Phase 3 (docs/two_stage_compression_design.md §4 Phase 2 / Phase 3); the
-        ``compress_windows`` r_u>0 path stays but is inert here."""
+        """Return (U, seed). ``U`` seeded by (epoch, index): a depth-class ``N̄_u``
+        draw -> ``round(N / N̄_u)``; the cold-fold window narrows it to
+        ``min(3, ⌊N/4⌋)``."""
         _, max_units, M, _K = self._fold_knobs()
         da = self.data_args
         cold_frac = float(getattr(da, "variance_cold_frac", 0.15))
@@ -195,20 +203,16 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
             n_bar = max(1, min(rng.randint(lo, hi), N))
             U = max(1, min(round(N / n_bar), u_cap))
 
-        r_u = [0] * U
-
         # The compressed region must fit inside the video's vision-token slots
         # (arch reserves replace_mask[ps : ps + sum n_out]).
         while U > 1 and U * M > total_vision_tokens:
             U -= 1
-            r_u = r_u[:U]
-        return U, r_u, seed
+        return U, seed
 
     @property
     def compression_depths(self):
         if not self._durations:
             return None
-        target_f, _, _, _ = self._fold_knobs()
         # Grouping N must match the N the model actually cuts: --max_frames caps the
         # decoded frame count, so a 400 s clip run at --max_frames 320 has N from 320,
         # not 400. Clamp here so the depth-class megabatch stays homogeneous.
@@ -223,7 +227,7 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
                 out.append(32)
                 continue
             T = min(int(T), cap) if cap > 0 else int(T)
-            out.append(adaptive_segment_count(T, target_f))
+            out.append(self._segment_count(T))
         return out
 
     def _convert_normal(self, data_dict):
@@ -272,6 +276,10 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
                 return_labels=self.return_label,
                 return_tensors="pt",
             )
+            # This class overrides GlobalCompressorLazySupervisedDataset.__getitem__
+            # wholesale, so the cast has to be repeated here -- fp32 patches are what
+            # crosses worker -> main through /dev/shm. See cast_pixel_values_.
+            cast_pixel_values_(data_dict, getattr(self.data_args, "pixel_values_dtype", None))
             data_dict["modals"] = [modal] * len(images)
 
             total_frames = int(content["num_frames"])
@@ -294,26 +302,51 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
                 f"Total vision tokens {total_vision_tokens} should be divisible by total frames {total_frames}."
             )
 
-            target_f, _max_units, m_tok, _k = self._fold_knobs()
+            _target_f, _max_units, m_tok, _k = self._fold_knobs()
             if total_vision_tokens < m_tok:
                 raise ValueError(
                     f"sample {i}: {total_vision_tokens} image tokens (< M={m_tok}); too small to fold"
                 )
             tpf = total_vision_tokens // total_frames
-            N = adaptive_segment_count(total_frames, target_f)
+            N = self._segment_count(total_frames)
             seed = (int(self._epoch) * 1_000_003 + int(i)) & 0x7FFFFFFF
 
             # One whole-video part.
             data_dict["compression_parts"] = [[0, total_vision_tokens]]
             data_dict["compression_seed"] = [seed]
-            if getattr(self, "qbase_only", False):
+            qbase_only_sample = bool(getattr(self, "qbase_only", False))
+            if qbase_only_sample and N * _k > total_vision_tokens:
+                # The arch reserves replace_mask[ps : ps + n_out] INSIDE the part it
+                # replaces, so a window can never emit more rows than it has vision
+                # tokens. The fold path is clamped in _draw_units (U*M); the
+                # qbase-only path emits N*K rows, which fits only while the per-frame
+                # grid holds at least K tokens (N <= T => N*K <= T*K <= T*hw). Phase
+                # 2's N ~ T/4 made that automatic against the min_tokens=16 floor;
+                # Phase 3's target-N rule pushes N to ~min(target_n, T), so a
+                # low-resolution clip (hw < K) now overflows into the next part and
+                # the scatter in compress_visual_tokens_with_compressor dies on a
+                # shape mismatch. Demote the sample to the (clamped) fold path rather
+                # than pay another decode to resample it.
+                if not getattr(type(self), "_qbase_fit_warned", False):
+                    type(self)._qbase_fit_warned = True
+                    logger.warning(
+                        "Sample %s: qbase-only replay wants N*K = %d*%d = %d rows but the clip "
+                        "holds only %d vision tokens (%d frames x %d tok/frame). Demoting clips "
+                        "this low-resolution to the fold path; pass --vision_min_tokens >= K "
+                        "(%d) to keep them on the replay stream.",
+                        i, N, _k, N * _k, total_vision_tokens, total_frames, tpf, _k,
+                    )
+                qbase_only_sample = False
+            if qbase_only_sample:
                 # Pure-qbase replay: no unit split, no fold -- the model routes this
                 # window straight through stage-1 (N*K qbase tokens, Phase-1 layout).
-                data_dict["compression_retained"] = [[0]]
+                # unit_counts[wi] is never read on this path (compress_windows
+                # returns early for qbase_only windows) -- None is a placeholder.
+                data_dict["compression_units"] = [None]
                 data_dict["compression_qbase_only"] = [True]
             else:
-                U, r_u, _seed = self._draw_units(i, N, tpf, total_vision_tokens)
-                data_dict["compression_retained"] = [r_u]        # r_u == [0]*U (retained is Phase 3)
+                U, _seed = self._draw_units(i, N, tpf, total_vision_tokens)
+                data_dict["compression_units"] = [U]
                 data_dict["compression_qbase_only"] = [False]
 
             # timestamps may be a list OR a numpy array (the decoder synthesises
@@ -375,9 +408,11 @@ class Phase2ModelArguments(base.ModelArguments):
         metadata={"help": "Fold dropout (Mamba2Block residual branches + MLP). docs §4 Phase 2 "
                           "readout-regularization recommends 0.1; set 0.0 to disable."},
     )
-    stage2_time_embed: str = field(default="none", metadata={"help": "rel_gap_mlp (per-segment (gap,duration) seconds, "
+    stage2_time_embed: str = field(default="rel_gap_mlp", metadata={"help": "rel_gap_mlp (per-segment (gap,duration) seconds, "
                                                                      "built model-side from the adaptive cut) | seconds_mlp | "
-                                                                     "index_sincos | none. Phase 2 first runs: none."})
+                                                                     "index_sincos | none. First runs used none; temporal_blindness "
+                                                                     "0.955->0.998 (qbase->fold) on eval_ablation/grounding_probe.py "
+                                                                     "motivated switching the default to rel_gap_mlp."})
     stage2_final_norm: str = field(default="rmsnorm", metadata={"help": "readout norm: rmsnorm|layernorm|scale|none (ablatable)."})
     stage2_rope_slot_scale: str = field(default="ratio", metadata={"help": "'ratio' (readout stride N_u*K/M) or float S slots/sec."})
 
@@ -431,6 +466,9 @@ def _build_phase2_token_compressor_config(model_config, model_args, data_args) -
         stage2_time_embed=model_args.stage2_time_embed,
         stage2_final_norm=model_args.stage2_final_norm,
         stage2_rope_slot_scale=model_args.stage2_rope_slot_scale,
+        compressor_gradient_checkpointing=bool(
+            getattr(model_args, "compressor_gradient_checkpointing", False)
+        ),
     )
     return d
 

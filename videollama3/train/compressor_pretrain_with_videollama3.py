@@ -188,6 +188,14 @@ class ModelArguments:
                           "over softmax(diff / tau) (train only) so the segmentation varies per epoch; "
                           "0 = deterministic top-k."},
     )
+    vision_encoder_chunk_frames: int = field(
+        default=0,
+        metadata={"help": "Run the frozen vision encoder in groups of this many frames instead of "
+                          "one shot (design doc §5 item 4). The encoder has no cross-frame attention "
+                          "(per-frame cu_seqlens, 2-D spatial RoPE), so this is mathematically a "
+                          "no-op that bounds peak activation memory -- required at Phase-3 lengths. "
+                          "0 = single-shot (Phase 1/2 behaviour); 8 is the design default."},
+    )
 
 
 @dataclass
@@ -216,6 +224,15 @@ class DataArguments:
     validation_split_rate: float = field(
         default=0,
         metadata={"help": "Percentage of the train set used as validation set."},
+    )
+    pixel_values_dtype: str = field(
+        default="float32",
+        metadata={"help": "dtype the dataset emits pixel_values in: float32 (the image "
+                          "processor's native output) | bfloat16 | float16. The worker -> main "
+                          "process handoff copies this tensor through /dev/shm, and at Phase-3 "
+                          "geometry it is ~588 MiB/video, so bfloat16 halves the shm high-water "
+                          "mark. DeepSpeed casts the encoder's float inputs to bf16 anyway, so "
+                          "bfloat16 is lossless here whenever --bf16 is on."},
     )
 
 
@@ -367,6 +384,8 @@ def train(attn_implementation=None, *,
     config.mm_attn_implementation = attn_implementation
     config.use_token_compression = True
     config.trainable_mm_compressor = True
+    # Chunked frozen-encoder forward (design doc §5 item 4); 0 keeps the single shot.
+    config.vision_encoder_chunk_frames = model_args.vision_encoder_chunk_frames
     if model_args.vision_encoder is not None:
         config.vision_encoder = model_args.vision_encoder
 
@@ -439,19 +458,12 @@ def train(attn_implementation=None, *,
     if model.get_model().token_compressor is None:
         raise RuntimeError("Failed to build token_compressor. Check token_compressor_config.")
     if model_args.pretrained_compressor_path:
-        _p = model_args.pretrained_compressor_path
-        if os.path.isdir(_p):
-            # HF checkpoint dir -> pull token_compressor.* out of the safetensors
-            # shards (same loader TwoStageCompressor.load_stage1_pretrained uses).
-            from videollama3.model.compressor import _load_flat_compressor_state_dict
-            state = _load_flat_compressor_state_dict(_p)
-        else:
-            state = torch.load(_p, map_location="cpu")
-            state = state.get("compressor", state) if isinstance(state, dict) else state
-        missing, unexpected = model.get_model().token_compressor.load_state_dict(state, strict=False)
-        rank0_print(
-            f"[INFO] Loaded pretrained compressor from {model_args.pretrained_compressor_path} "
-            f"(missing={len(missing)}, unexpected={len(unexpected)})"
+        # Handles a bare .pt, a Phase-1 qbase dir and a Phase-2 two-stage run dir,
+        # adapting stage1./stage2. prefixes to whatever compressor was just built
+        # and RAISING if the two share no parameter names.
+        from videollama3.model.compressor import load_pretrained_compressor
+        missing, unexpected = load_pretrained_compressor(
+            model.get_model().token_compressor, model_args.pretrained_compressor_path
         )
         if missing or unexpected:
             rank0_print(f"[WARN] missing keys: {missing}\n[WARN] unexpected keys: {unexpected}")
@@ -541,6 +553,24 @@ def train(attn_implementation=None, *,
             _old_vocab = old_vocabulary_size
 
             def _zero_old_embed_rows(grad, _ov=_old_vocab):
+                # VL3_NAN_PROBE: this hook sees the RAW embedding gradient, before
+                # DeepSpeed flattens it into its ZeRO bucket (after which p.grad is
+                # None and unreadable). It is the only place the incoming gradient of
+                # the trainable rows can be inspected.
+                if os.environ.get("VL3_NAN_PROBE"):
+                    from videollama3.model import compressor as _c
+                    gf = grad.detach().float()
+                    bad_old = int((~torch.isfinite(gf[:_ov])).sum())
+                    bad_new = int((~torch.isfinite(gf[_ov:])).sum())
+                    fin_new = torch.isfinite(gf[_ov:])
+                    amax_new = float(gf[_ov:][fin_new].abs().max()) if bool(fin_new.any()) else float("nan")
+                    fin_old = torch.isfinite(gf[:_ov])
+                    amax_old = float(gf[:_ov][fin_old].abs().max()) if bool(fin_old.any()) else float("nan")
+                    _c._nan_probe_say(
+                        f"[NAN_PROBE step {_c._nan_probe_step[0]:>4}] emb embed_tokens.grad     "
+                        f"rows[:{_ov}] bad={bad_old} max|g|={amax_old:.4g} | "
+                        f"rows[{_ov}:] bad={bad_new} max|g|={amax_new:.4g}"
+                    )
                 g = grad.clone()
                 g[:_ov].zero_()
                 return g
@@ -576,10 +606,19 @@ def train(attn_implementation=None, *,
 
     if model_args.compressor_type == "transformer_decoder_flat":
         if model_args.adaptive_segmentation:
+            # The segment-count rule lives on the built compressor (Phase 3 swaps the
+            # frames rule for the token-denominated target-N one, §5 item 17).
+            _seg1 = getattr(model.get_model().token_compressor, "stage1",
+                            model.get_model().token_compressor)
+            if getattr(_seg1, "segment_count_rule", "frames") == "target_n":
+                _n_rule = (f"N = clip({_seg1.segment_target_n}, N_min(T), T) target-N segments, "
+                           f"min_adapt={_seg1.segment_min_adapt}")
+            else:
+                _n_rule = f"N = T//{model_args.segment_target_frames}+1 adaptive segments"
             _out_tokens = (
                 f"N*{model_args.num_queries} tokens "
-                f"(N = T//{model_args.segment_target_frames}+1 adaptive segments, "
-                f"force_every={model_args.segment_force_every}, tau={model_args.segment_sample_tau})"
+                f"({_n_rule}, force_every={model_args.segment_force_every}, "
+                f"tau={model_args.segment_sample_tau})"
             )
         else:
             _out_tokens = f"{model_args.num_queries} tokens (flat query bank)"
@@ -637,6 +676,23 @@ def train(attn_implementation=None, *,
             self._set(trainer.train_dataset, _progress=float(state.global_step) / total)
 
     trainer.add_callback(_DatasetProgressCallback())
+
+    if os.environ.get("VL3_LOG_MEM") == "1" and torch.cuda.is_available():
+        # Bracket the DeepSpeed engine init: on_train_begin fires AFTER
+        # deepspeed.initialize, so comparing it with the pre-train() reading
+        # separates "the engine allocated it" from "the forward allocated it".
+        _g = 2 ** 30
+        rank0_print(f"[VL3_MEM] before trainer.train(): "
+                    f"live={torch.cuda.memory_allocated() / _g:.2f}G "
+                    f"reserved={torch.cuda.memory_reserved() / _g:.2f}G")
+
+        class _MemAtTrainBegin(transformers.TrainerCallback):
+            def on_train_begin(self, args, state, control, **kw):
+                rank0_print(f"[VL3_MEM] after deepspeed init: "
+                            f"live={torch.cuda.memory_allocated() / _g:.2f}G "
+                            f"reserved={torch.cuda.memory_reserved() / _g:.2f}G")
+
+        trainer.add_callback(_MemAtTrainBegin())
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

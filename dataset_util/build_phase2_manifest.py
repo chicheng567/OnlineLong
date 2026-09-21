@@ -186,23 +186,29 @@ def main() -> None:
     print(f"  total steps / epoch (per-sample) ~= {total:,}")
 
     root = os.path.abspath(a.data_root)
+    # Registry keys track --mid_lo/--mid_hi (they used to be hardcoded to the
+    # 180/420 defaults, so a Phase-3 420-1200 build produced a meta whose key names
+    # contradicted the files they pointed at).
+    k_mid = f"internvid_mid_{int(a.mid_lo)}_{int(a.mid_hi)}"
+    k_replay = f"internvid_replay_lt{int(a.mid_lo)}"
+    k_qbase = f"internvid_qbase_replay_lt{int(a.mid_lo)}"
     meta = {
-        "internvid_mid_180_420": {
+        k_mid: {
             "annotation": str(f_mid.resolve()),
             "data_root": root, "online_mode": False, "prefix_captioning": False,
         },
-        "internvid_replay_lt180": {
+        k_replay: {
             "annotation": str(f_replay.resolve()),
             "data_root": root, "online_mode": False, "prefix_captioning": False,
         },
-        "internvid_qbase_replay": {
+        k_qbase: {
             "annotation": str(f_qbase.resolve()),
             "data_root": root, "online_mode": False, "prefix_captioning": False,
             "qbase_only": True,
         },
     }
     _dump(Path(a.meta_out), meta, a.force)
-    print(f"[phase2-manifest] meta -> {a.meta_out}  (3 datasets; internvid_qbase_replay has qbase_only=true)")
+    print(f"[phase2-manifest] meta -> {a.meta_out}  (3 datasets; {k_qbase} has qbase_only=true)")
     print(f"[phase2-manifest] point training at it:\n"
           f"    ... --multi_dataset True --data_path {a.meta_out} \\\n"
           f"        --durations_json {a.durations} --group_by_compression_depth True")

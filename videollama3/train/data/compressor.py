@@ -20,7 +20,7 @@ import transformers
 
 from videollama3.constants import DEFAULT_IMAGE_TOKEN
 from videollama3.train.data import common
-from videollama3.train.data.common import logger, rank0_print
+from videollama3.train.data.common import cast_pixel_values_, logger, rank0_print
 from videollama3.train.data.supervised import ConcatDatasetWithLengths, LazySupervisedDataset
 
 __all__ = [
@@ -162,6 +162,9 @@ class CompressorLazySupervisedDataset(LazySupervisedDataset):
                 return_labels=self.return_label,
                 return_tensors="pt",
             )
+            # fp32 patches are what crosses worker -> main through /dev/shm; see
+            # cast_pixel_values_.
+            cast_pixel_values_(data_dict, getattr(self.data_args, "pixel_values_dtype", None))
             data_dict["modals"] = [modal] * len(images)
             if modal == "video":
                 image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
@@ -247,7 +250,7 @@ class DataCollatorWithCompressor:
         new_compression_ts_info_full: List[tuple] = []
         # Two-stage fold side inputs (one entry per compression_part == per video;
         # offset-independent, so just concatenate in instance order).
-        new_compression_retained: List[List[int]] = []
+        new_compression_units: List[Optional[int]] = []
         new_compression_seed: List[int] = []
         new_compression_frame_sec: List[List[int]] = []
         new_compression_qbase_only: List[bool] = []
@@ -271,7 +274,7 @@ class DataCollatorWithCompressor:
                 new_compression_ts_info.extend(instances[sample_idx]["compression_ts_info"])
             else:
                 new_compression_ts_info.extend([(0, []) for _ in compression_parts[sample_idx]])
-            new_compression_retained.extend(instances[sample_idx].get("compression_retained", []))
+            new_compression_units.extend(instances[sample_idx].get("compression_units", []))
             new_compression_seed.extend(instances[sample_idx].get("compression_seed", []))
             new_compression_frame_sec.extend(instances[sample_idx].get("compression_frame_sec", []))
             new_compression_qbase_only.extend(
@@ -306,8 +309,8 @@ class DataCollatorWithCompressor:
         batch["compression_ts_info"] = new_compression_ts_info
         batch["compression_parts_full"] = new_compression_parts_full
         batch["compression_ts_info_full"] = new_compression_ts_info_full
-        if new_compression_retained:
-            batch["compression_retained"] = new_compression_retained
+        if new_compression_units:
+            batch["compression_units"] = new_compression_units
         if new_compression_seed:
             batch["compression_seed"] = new_compression_seed
         if new_compression_frame_sec:

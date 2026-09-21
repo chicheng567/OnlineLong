@@ -51,3 +51,33 @@ def _set_module_trainable(module: Optional[torch.nn.Module], trainable: bool):
         return
     for p in module.parameters():
         p.requires_grad = trainable
+
+
+_PIXEL_VALUES_DTYPES = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
+
+
+def cast_pixel_values_(data_dict, spec: Optional[str]) -> None:
+    """Down-cast ``data_dict["pixel_values"]`` in place, in the dataloader worker.
+
+    The image processor always emits fp32 patches (`flatten_patches` in
+    `image_processing_videollama3.py`), and that tensor is what crosses the
+    worker -> main-process boundary through ``/dev/shm``. At Phase-3 geometry
+    (``--vision_max_tokens 65536``) it is ~588 MiB per video, so
+    ``num_workers * prefetch_factor * per_device_batch`` copies per rank blow past
+    a 256 GiB ``/dev/shm``. DeepSpeed casts the encoder's float inputs to bf16 on
+    entry anyway, so emitting bf16 here halves the shm/IPC traffic at no cost.
+    """
+    if not spec or spec == "float32":
+        return
+    dtype = _PIXEL_VALUES_DTYPES.get(spec)
+    if dtype is None:
+        raise ValueError(
+            f"Unknown pixel_values_dtype {spec!r}; expected one of {sorted(_PIXEL_VALUES_DTYPES)}"
+        )
+    pv = data_dict.get("pixel_values", None)
+    if pv is not None and pv.is_floating_point() and pv.dtype != dtype:
+        data_dict["pixel_values"] = pv.to(dtype)

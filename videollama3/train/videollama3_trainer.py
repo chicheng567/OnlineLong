@@ -229,6 +229,104 @@ class VideoLLaMA3Trainer(Trainer):
         self.partial_loss_weight = partial_loss_weight
         self.full_loss_weight = full_loss_weight
 
+    def get_train_dataloader(self):
+        """Keep prefetched batches on the HOST until the micro-step that uses them.
+
+        ``Trainer.get_batch_samples`` pulls ``gradient_accumulation_steps`` batches
+        into a list in one go, and accelerate's ``DataLoaderShard.__iter__`` has
+        already ``send_to_device``'d each one, so the WHOLE accumulation window's
+        inputs sit in VRAM simultaneously. On a video model that is the single
+        largest allocation in the step: one Phase-3 batch carries a
+        ``(~250k, 588)`` ``pixel_values`` (~0.5 GiB at --vision_max_tokens 65536),
+        so ``GLOBAL_BATCH 512`` on 8 GPUs (grad_acc = 64) parks **~32 GiB per rank**
+        before the first forward runs. Measured: `live` = 15.8 GiB right after
+        deepspeed init, 48.6 GiB at the first forward, flat across all 64
+        micro-steps, and the OOM lands in `get_batch_samples` -> `send_to_device`
+        fetching the next window.
+
+        ``DataLoaderShard`` skips the transfer when ``device is None``, and
+        ``Trainer.training_step`` calls ``_prepare_inputs`` anyway, which moves (and,
+        under DeepSpeed, casts) each batch as its micro-step runs. So clearing the
+        attribute makes the window cost ONE batch instead of ``grad_acc`` of them,
+        with no change to what the model sees. Set VL3_KEEP_BATCHES_ON_GPU=1 to
+        restore the stock behaviour.
+        """
+        dataloader = super().get_train_dataloader()
+        if os.environ.get("VL3_KEEP_BATCHES_ON_GPU") == "1":
+            return dataloader
+        if getattr(dataloader, "device", None) is not None:
+            dataloader.device = None
+            if self.args.local_rank in (0, -1):
+                print("[trainer] dataloader device placement OFF -- batches move to GPU "
+                      "per micro-step in _prepare_inputs, not grad_acc at a time")
+        return dataloader
+
+    def training_step(self, *args, **kwargs):
+        """VL3_NAN_PROBE=1: tick the per-step probe counter and, after backward,
+        name the first parameter GROUP whose grad (or value) went non-finite.
+
+        Phase 3 reports grad_norm=nan several steps before the forward loss goes
+        nan, so the parameter scan is what localises the blow-up; the per-stage
+        activation probes in compressor.py say which forward stage fed it."""
+        import os as _os
+        probe = _os.environ.get("VL3_NAN_PROBE", "")
+        if not probe:
+            return super().training_step(*args, **kwargs)
+
+        from videollama3.model import compressor as _comp
+        _comp._nan_probe_new_step()
+        out = super().training_step(*args, **kwargs)
+
+        if self.args.local_rank not in (0, -1):
+            return out
+        try:
+            model = self.accelerator.unwrap_model(self.model)
+        except Exception:
+            model = self.model
+        groups = {}
+        for name, prm in model.named_parameters():
+            if not prm.requires_grad:
+                continue
+            # token_compressor.stage1.* -> "token_compressor.stage1", etc.
+            key = ".".join(name.split(".")[:2])
+            g = groups.setdefault(key, {"n": 0, "bad_grad": 0, "bad_val": 0,
+                                        "gmax": 0.0, "no_grad": 0})
+            g["n"] += 1
+            fin_v = torch.isfinite(prm.detach())
+            if not bool(fin_v.all()):
+                g["bad_val"] += 1
+                if prm.dim() == 2 and g.get("rows") is None:
+                    bad = (~fin_v).any(1).nonzero().flatten()
+                    g["rows"] = (name, int(bad.numel()), int(prm.shape[0]),
+                                 bad[:4].tolist(), bad[-4:].tolist())
+            gr = prm.grad
+            if gr is None:
+                g["no_grad"] += 1
+                continue
+            gd = gr.detach().float()
+            fin = torch.isfinite(gd)
+            if not bool(fin.all()):
+                g["bad_grad"] += 1
+            if bool(fin.any()):
+                g["gmax"] = max(g["gmax"], float(gd[fin].abs().max()))
+        rows = [(k, v) for k, v in groups.items()
+                if v["bad_grad"] or v["bad_val"] or probe == "verbose"]
+        if rows:
+            from tqdm import tqdm as _tqdm
+            for k, v in sorted(rows):
+                _tqdm.write(
+                    f"[NAN_PROBE step {_comp._nan_probe_step[0]:>4}] param {k:<28} "
+                    f"n={v['n']:<4} bad_grad={v['bad_grad']:<4} bad_value={v['bad_val']:<4} "
+                    f"no_grad={v['no_grad']:<4} max|grad|={v['gmax']:.4g}"
+                )
+                if v.get("rows"):
+                    nm, nbad, nrows, first, last = v["rows"]
+                    _tqdm.write(
+                        f"[NAN_PROBE step {_comp._nan_probe_step[0]:>4}]   -> {nm}: "
+                        f"{nbad}/{nrows} rows non-finite, first={first} last={last}"
+                    )
+        return out
+
     def _ce_forward(self, model, base_inputs, compression_parts, compression_ts_info, label="", num_items_in_batch=None):
         """Run one student forward (CE mode) with the given compression_parts.
 
@@ -507,6 +605,10 @@ class VideoLLaMA3Trainer(Trainer):
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
+            # Remember the per-group LR THIS run's CLI args actually asked for, keyed by
+            # group order -- see _load_optimizer_and_scheduler for why.
+            self._configured_group_lrs = [g["lr"] for g in optimizer_grouped_parameters]
+
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
             if optimizer_cls.__name__ == "Adam8bit":
                 import bitsandbytes
@@ -523,6 +625,44 @@ class VideoLLaMA3Trainer(Trainer):
                 logger.info(f"skipped: {skipped/2**20}M params")
 
         return self.optimizer
+
+    def _load_optimizer_and_scheduler(self, checkpoint):
+        """Resuming (DeepSpeed's `deepspeed_load_checkpoint` -> `engine.load_checkpoint(...,
+        load_optimizer_states=True, load_lr_scheduler_states=True)`, and -- on the deepspeed
+        branch -- this base method's own extra `self.lr_scheduler.load_state_dict(...)`) both
+        restore each optimizer param group's `lr`/`initial_lr` (and the scheduler's `base_lrs`)
+        from the CHECKPOINTED values. That silently overrides whatever `create_optimizer()`
+        just built from THIS run's CLI args a few lines earlier in `_inner_training_loop` --
+        e.g. a deliberate `--qbase_lr` change across a cold-start -> resume launch pair (see
+        `shell/pretrain_phase2_internvid.sh`'s documented staggered-start recipe). Confirmed:
+        without this, a `QBASE_LR=1e-12` cold run followed by a same-`OUTPUT_DIR` resume at
+        `QBASE_LR=1e-5` silently keeps training the qbase group at ~1e-12 for the entire
+        resumed run -- no error, no warning, `token_compressor.stage1.*` ends up bit-identical
+        to the warm start.
+
+        Re-apply the CLI-configured per-group LR here, right after both restores have run, so
+        a resume always trains at the LR this run was actually launched with. For a genuine
+        crash-recovery resume (CLI unchanged from the interrupted run) this is a no-op --
+        `_configured_group_lrs` already matches what got checkpointed."""
+        super()._load_optimizer_and_scheduler(checkpoint)
+        if checkpoint is None or self.optimizer is None:
+            return
+        lrs = getattr(self, "_configured_group_lrs", None)
+        if not lrs:
+            return
+        groups = self.optimizer.param_groups
+        if len(groups) != len(lrs):
+            print(f"[post-resume LR reapply] optimizer has {len(groups)} param groups but "
+                  f"{len(lrs)} configured LRs were recorded -- skipping (mismatched group "
+                  f"layout vs the checkpoint?).")
+            return
+        for g, lr in zip(groups, lrs):
+            g["lr"] = lr
+            g["initial_lr"] = lr
+        if hasattr(self.lr_scheduler, "base_lrs"):
+            self.lr_scheduler.base_lrs = list(lrs)
+        print(f"[post-resume LR reapply] reapplied this run's configured per-group LRs {lrs} "
+              f"(overriding whatever the checkpoint's optimizer/scheduler state restored).")
 
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'is_alignment', False):

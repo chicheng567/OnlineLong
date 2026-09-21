@@ -14,6 +14,7 @@
 #    limitations under the License.
 
 
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -199,7 +200,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         modals: Optional[List[str]] = None,
         compression_parts: Optional[List[List[int]]] = None,
         compression_ts_info: Optional[List] = None,
-        compression_retained: Optional[List[List[int]]] = None,
+        compression_units: Optional[List[Optional[int]]] = None,
         compression_seed: Optional[List[int]] = None,
         compression_frame_sec: Optional[List[List[int]]] = None,
         compression_qbase_only: Optional[List[bool]] = None,
@@ -225,7 +226,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 modals=modals,
                 compression_parts=compression_parts,
                 compression_ts_info=compression_ts_info,
-                compression_retained=compression_retained,
+                compression_units=compression_units,
                 compression_seed=compression_seed,
                 compression_frame_sec=compression_frame_sec,
                 compression_qbase_only=compression_qbase_only,
@@ -322,7 +323,42 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                     seq_len = hidden_states.shape[1]
                     llm_loss_value = loss.detach().float().item()
                     label_str = f" [{_debug_label}]" if _debug_label else ""
-                    tqdm.write(f"seq_len={seq_len} llm_loss={llm_loss_value:.6f}{label_str}")
+                    mem_str = ""
+                    # VL3_LOG_MEM=1 -> per-micro-step CUDA memory, to tell a
+                    # sample-driven peak apart from something that grows across a
+                    # gradient-accumulation window (live = still-referenced tensors;
+                    # reserved - live = allocator fragmentation).
+                    if os.environ.get("VL3_LOG_MEM") == "1" and torch.cuda.is_available():
+                        g = 2 ** 30
+                        mem_str = (f" live={torch.cuda.memory_allocated() / g:.2f}G"
+                                   f" peak={torch.cuda.max_memory_allocated() / g:.2f}G"
+                                   f" reserved={torch.cuda.memory_reserved() / g:.2f}G")
+                        if not getattr(self, "_vl3_mem_dumped", False):
+                            self._vl3_mem_dumped = True
+                            by_dt, grad_b, n_big = {}, 0, []
+                            for n_, p_ in self.named_parameters():
+                                if not p_.is_cuda:
+                                    continue
+                                b = p_.numel() * p_.element_size()
+                                by_dt[str(p_.dtype)] = by_dt.get(str(p_.dtype), 0) + b
+                                if p_.grad is not None:
+                                    grad_b += p_.grad.numel() * p_.grad.element_size()
+                                if b > 2 ** 30:
+                                    n_big.append((b / g, n_, str(p_.dtype)))
+                            buf_b = sum(x.numel() * x.element_size()
+                                        for _, x in self.named_buffers() if x.is_cuda)
+                            tot = sum(by_dt.values())
+                            tqdm.write("[VL3_MEM] params by dtype: " + ", ".join(
+                                f"{k}={v / g:.2f}G" for k, v in sorted(by_dt.items())))
+                            tqdm.write(f"[VL3_MEM] params total={tot / g:.2f}G "
+                                       f"buffers={buf_b / g:.2f}G grads={grad_b / g:.2f}G "
+                                       f"live={torch.cuda.memory_allocated() / g:.2f}G "
+                                       f"-> unaccounted="
+                                       f"{(torch.cuda.memory_allocated() - tot - buf_b - grad_b) / g:.2f}G")
+                            for b, n_, d_ in sorted(n_big, reverse=True)[:6]:
+                                tqdm.write(f"[VL3_MEM]   big param {b:.2f}G {d_} {n_}")
+                        torch.cuda.reset_peak_memory_stats()
+                    tqdm.write(f"seq_len={seq_len} llm_loss={llm_loss_value:.6f}{label_str}{mem_str}")
 
         else:
             # skip_ce_loss=True (KL path) or no labels: compute full-sequence logits.
@@ -349,7 +385,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         modals: Optional[List[str]] = None,
         compression_parts: Optional[List[List[int]]] = None,
         compression_ts_info: Optional[List] = None,
-        compression_retained: Optional[List[List[int]]] = None,
+        compression_units: Optional[List[Optional[int]]] = None,
         compression_seed: Optional[List[int]] = None,
         compression_frame_sec: Optional[List[List[int]]] = None,
         compression_qbase_only: Optional[List[bool]] = None,
@@ -392,7 +428,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 modals=modals,
                 compression_parts=compression_parts,
                 compression_ts_info=compression_ts_info,
-                compression_retained=compression_retained,
+                compression_units=compression_units,
                 compression_seed=compression_seed,
                 compression_frame_sec=compression_frame_sec,
                 compression_qbase_only=compression_qbase_only,

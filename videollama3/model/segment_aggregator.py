@@ -541,8 +541,13 @@ class SegmentAggregatorConfig:
     #   "rel_gap_mlp"  -- MLP over per-segment (gap_from_prev_start, duration) seconds
     #                     (design doc §4 Phase 2: content-adaptive segments make the
     #                      gap informative; absolute index is not)
-    #   "none"         -- lean on the SSD's implicit ordering + the retained set
+    #   "none"         -- lean on the SSD's implicit ordering
     time_embed: str = "index_sincos"
+
+    # Activation checkpointing over the Mamba-2 stack (training only). The fold's
+    # sequence is N_u*K + M, so a deep Phase-3 unit is a real allocation; cheap to
+    # recompute next to the qbase it sits behind.
+    gradient_checkpointing: bool = False
 
 
 class SegmentAggregator(nn.Module):
@@ -665,8 +670,14 @@ class SegmentAggregator(nn.Module):
             tok_mask = repeat(segment_valid_mask, "b n -> b (n k)", k=K)
             m_mask = tok_mask.new_ones(B, self.cfg.n_summary_tokens)   # readout is always valid
             valid_mask = torch.cat([tok_mask, m_mask], dim=1)
+        ckpt = (getattr(self.cfg, "gradient_checkpointing", False)
+                and self.training and torch.is_grad_enabled())
         for blk in self.layers:
-            seq = blk(seq, valid_mask=valid_mask)
+            if ckpt:
+                import torch.utils.checkpoint as _cp
+                seq = _cp.checkpoint(blk, seq, valid_mask, use_reentrant=False)
+            else:
+                seq = blk(seq, valid_mask=valid_mask)
             if valid_mask is not None:
                 # Re-zero padded rows after every block. RMSNormGated's silu(z) gate
                 # already drives an all-zero-input block's own output back to zero

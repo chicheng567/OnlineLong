@@ -13,6 +13,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import contextlib
 import copy
 import os
 import math
@@ -28,6 +29,53 @@ from ..constants import IGNORE_INDEX, MODAL_INDEX_MAP, NUM_FRAMES
 from .encoder import build_vision_encoder
 from .projector import build_vision_projector, load_mm_projector
 from .compressor import build_token_compressor
+
+
+def _vl3_memlog(tag, **tensors):
+    """VL3_LOG_MEM=1 -> one CUDA-memory line per instrumented point, rank 0 only.
+    ``live`` is still-referenced tensors, so a jump between two tags is memory that
+    stage RETAINED (for backward), not a transient spike."""
+    import os as _os
+    if _os.environ.get("VL3_LOG_MEM") != "1" or not torch.cuda.is_available():
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+    from tqdm import tqdm as _tqdm
+    g = 2 ** 30
+    extra = " ".join(
+        f"{k}={tuple(v.shape)}/{str(v.dtype).replace('torch.', '')}"
+        f"={v.numel() * v.element_size() / g:.2f}G"
+        for k, v in tensors.items() if torch.is_tensor(v)
+    )
+    _tqdm.write(f"[VL3_MEM] {tag}: live={torch.cuda.memory_allocated() / g:.2f}G "
+                f"peak={torch.cuda.max_memory_allocated() / g:.2f}G {extra}")
+    # VL3_MEM_DUMP=1 -> once, name every live CUDA tensor >0.5G by shape/dtype.
+    # memory_allocated() only gives a total; this says WHAT is holding it.
+    if _os.environ.get("VL3_MEM_DUMP") == "1" and not getattr(_vl3_memlog, "_dumped", False):
+        _vl3_memlog._dumped = True
+        import gc as _gc
+        seen, rows = set(), []
+        for o in _gc.get_objects():
+            try:
+                t = o if torch.is_tensor(o) else getattr(o, "data", None)
+                if not torch.is_tensor(t) or not t.is_cuda:
+                    continue
+                key = (t.data_ptr(), t.numel())
+                if key in seen or t.data_ptr() == 0:
+                    continue
+                seen.add(key)
+                nb = t.numel() * t.element_size()
+                if nb > 0.5 * g:
+                    rows.append((nb / g, tuple(t.shape), str(t.dtype).replace("torch.", ""),
+                                 type(o).__name__, bool(t.requires_grad)))
+            except Exception:
+                continue
+        rows.sort(reverse=True)
+        _tqdm.write(f"[VL3_MEM] --- live CUDA tensors >0.5G (total tracked "
+                    f"{sum(r[0] for r in rows):.2f}G over {len(rows)}) ---")
+        for nb, shp, dt, cls, rg in rows[:25]:
+            _tqdm.write(f"[VL3_MEM]   {nb:6.2f}G {dt:9s} requires_grad={rg!s:5s} {cls:12s} {shp}")
 
 
 def _compressed_len(compressor, n_frames, h, w):
@@ -214,7 +262,7 @@ class Videollama3MetaForCausalLM(ABC):
         vision_tokens: torch.FloatTensor,
         compression_parts: List[List[int]],
         grid_hws: List[Tuple[int, int]],
-        retained_counts: Optional[List[List[int]]] = None,
+        unit_counts: Optional[List[Optional[int]]] = None,
         seed: Optional[int] = None,
         qbase_only: Optional[List[bool]] = None,
     ) -> Tuple[torch.FloatTensor, Optional[List[dict]]]:
@@ -223,9 +271,9 @@ class Videollama3MetaForCausalLM(ABC):
         # compressed block of _compressed_len tokens.  TwoStageCompressor: one part
         # == one WHOLE-VIDEO window that is split model-side into U content-adaptive
         # units (§ docs/two_stage_compression_design.md §4 Phase 2); the compressor
-        # returns unit_meta and this method scatters sum_u (M + r_u*K) rows per part.
-        # retained_counts / seed: forwarded to compress_windows (per-window r_u list;
-        # Gumbel seed).  grid_hws: one (h, w) per part.
+        # returns unit_meta and this method scatters sum_u M rows per part.
+        # unit_counts / seed: forwarded to compress_windows (per-window U; Gumbel
+        # seed).  grid_hws: one (h, w) per part.
         device = vision_tokens.device
         vision_tokens = vision_tokens.squeeze(0)  # [num_tokens, dim]
         compressor = self.get_token_compressor()
@@ -254,7 +302,7 @@ class Videollama3MetaForCausalLM(ABC):
                 original_tokens_to_reconstruct,
                 compression_cu_seqlens,
                 grid_hws,
-                retained_counts=retained_counts,
+                unit_counts=unit_counts,
                 seed=seed,
                 qbase_only=qbase_only,
             )
@@ -263,9 +311,6 @@ class Videollama3MetaForCausalLM(ABC):
             # fold-readout are two distributions -- see get_mm_projector_{qbase,fold}).
             # 0 = raw/uncompressed (never touched below -- the shared mm_projector,
             # same as pre-split), 1 = qbase-only replay, 2 = fold readout.
-            # NOTE: Phase 3's retained-K (r_u > 0) interleaves raw qbase rows into a
-            # "fold" unit's own n_out rows; this per-unit granularity would then need
-            # to become per-row. Inert in Phase 2 (r_u == 0 everywhere).
             n_out_per_part = [0] * len(compression_parts)
             kind = torch.zeros(vision_tokens.shape[0], dtype=torch.uint8, device=device)
             for m in unit_meta:
@@ -275,6 +320,17 @@ class Videollama3MetaForCausalLM(ABC):
                 kind[start: start + n_out] = 2 if m.get("kind") == "fold" else 1
                 n_out_per_part[pi] += n_out
             for pi, ps in enumerate(part_starts):
+                # The rows are reserved INSIDE the part they replace, so a window
+                # that emits more rows than its part holds silently spills into the
+                # next part's region -- the union under-counts and the scatter below
+                # dies on an opaque broadcast error. Name the offending window here.
+                part_len = compression_parts[pi][1] - compression_parts[pi][0]
+                assert n_out_per_part[pi] <= part_len, (
+                    f"compression window {pi} emits {n_out_per_part[pi]} rows but its part holds "
+                    f"only {part_len} vision tokens (grid_hw={grid_hws[pi] if grid_hws else None}). "
+                    f"A window's output must fit in the part it replaces: qbase-only emits N*K, a "
+                    f"fold U*M, so the per-frame grid needs >= K tokens. Raise --vision_min_tokens."
+                )
                 replace_mask[ps: ps + n_out_per_part[pi]] = True
         else:
             compressed = compressor(
@@ -289,6 +345,49 @@ class Videollama3MetaForCausalLM(ABC):
             self._last_compression_kind = kind[keeping_masks]
         return vision_tokens, unit_meta
 
+    def _run_vision_encoder(
+        self,
+        pixel_values: torch.FloatTensor,
+        grid_sizes: torch.LongTensor,
+        merge_sizes: torch.LongTensor,
+    ) -> torch.FloatTensor:
+        """Frozen-encoder forward, optionally in ``vision_encoder_chunk_frames``-frame
+        groups (design doc §5 item 4).
+
+        The encoder has **no cross-frame attention** — its ``cu_seqlens`` is built
+        per frame (``repeat_interleave(h*w, t)``) and the RoPE table is 2-D spatial,
+        repeated identically for every frame of a row — so splitting a ``(t, h, w)``
+        row into ``(t_chunk, h, w)`` rows is mathematically a no-op. It only bounds
+        the peak activation, which at Phase-3 lengths (1200 frames x 1024 patches)
+        is otherwise the single largest allocation in the step. ``0`` (default)
+        keeps the single-shot forward Phase 1/2 ran.
+        """
+        encoder = self.get_model().get_vision_encoder()
+        chunk = int(getattr(self.config, "vision_encoder_chunk_frames", 0) or 0)
+        if chunk <= 0:
+            return encoder(pixel_values=pixel_values, grid_sizes=grid_sizes, merge_sizes=merge_sizes)
+        # Frozen encoder -> no graph to keep. Only skip it if something in there is
+        # actually being trained (an unfrozen vision tower), where the chunked
+        # forward must stay differentiable.
+        trainable = any(p.requires_grad for p in encoder.parameters())
+        ctx = contextlib.nullcontext() if trainable else torch.no_grad()
+        outs = []
+        tok_off = 0
+        with ctx:
+            for row, ms in zip(grid_sizes, merge_sizes):
+                t, h, w = int(row[0]), int(row[1]), int(row[2])
+                per_frame = h * w
+                for s in range(0, t, chunk):
+                    n = min(chunk, t - s)
+                    pv = pixel_values[tok_off + s * per_frame: tok_off + (s + n) * per_frame]
+                    gs = torch.tensor([[n, h, w]], device=row.device, dtype=grid_sizes.dtype)
+                    outs.append(encoder(pixel_values=pv, grid_sizes=gs, merge_sizes=ms.reshape(1)))
+                tok_off += t * per_frame
+        assert tok_off == pixel_values.shape[0], (
+            f"chunked vision forward consumed {tok_off} of {pixel_values.shape[0]} patch rows"
+        )
+        return torch.cat(outs, dim=0)
+
     def encode_images(
         self,
         pixel_values: torch.FloatTensor,
@@ -296,28 +395,27 @@ class Videollama3MetaForCausalLM(ABC):
         merge_sizes: torch.LongTensor,
         compression_parts: Optional[List[List[int]]] = None,
         grid_hws: Optional[List[Tuple[int, int]]] = None,
-        retained_counts: Optional[List[List[int]]] = None,
+        unit_counts: Optional[List[Optional[int]]] = None,
         seed: Optional[int] = None,
         qbase_only: Optional[List[bool]] = None,
     ) -> Tuple[torch.FloatTensor, Optional[List[dict]]]:
         unit_meta = None
-        mm_features = self.get_model().get_vision_encoder()(
-            pixel_values=pixel_values,
-            grid_sizes=grid_sizes,
-            merge_sizes=merge_sizes,
-        )
+        mm_features = self._run_vision_encoder(pixel_values, grid_sizes, merge_sizes)
+        _vl3_memlog("  after vision_encoder", enc_out=mm_features)
         kind = None
         if getattr(self.config, "trainable_mm_compressor", False) and compression_parts is not None and len(compression_parts) > 0:
             mm_features, unit_meta = self.compress_visual_tokens_with_compressor(
                 mm_features,
                 compression_parts,
                 grid_hws,
-                retained_counts=retained_counts,
+                unit_counts=unit_counts,
                 seed=seed,
                 qbase_only=qbase_only,
             )
             kind = self._last_compression_kind
+            _vl3_memlog("  after compressor", comp_out=mm_features)
         mm_features = self._apply_mm_projector(mm_features, kind)
+        _vl3_memlog("  after mm_projector", proj_out=mm_features)
         return mm_features, unit_meta
 
     def _apply_mm_projector(self, mm_features: torch.FloatTensor, kind: Optional[torch.Tensor]):
@@ -387,7 +485,7 @@ class Videollama3MetaForCausalLM(ABC):
         modals: Optional[torch.LongTensor] = None, # This parameter is currently not used in the model, but can be used to indicate the modality of each token for more flexible multimodal modeling.
         compression_parts: Optional[List[List[int]]] = None,
         compression_ts_info: Optional[List[Tuple[int, List[int]]]] = None,
-        compression_retained: Optional[List[List[int]]] = None,
+        compression_units: Optional[List[Optional[int]]] = None,
         compression_seed: Optional[List[int]] = None,
         compression_frame_sec: Optional[List[List[int]]] = None,
         compression_qbase_only: Optional[List[bool]] = None,
@@ -423,10 +521,12 @@ class Videollama3MetaForCausalLM(ABC):
         _qbase_only = None
         if compression_qbase_only is not None and len(compression_qbase_only) > 0:
             _qbase_only = list(compression_qbase_only)
+        _vl3_memlog("before encode_images", pixel_values=pixel_values)
         mm_features, unit_meta = self.encode_images(
             pixel_values, grid_sizes, merge_sizes, compression_parts, grid_hws,
-            retained_counts=compression_retained, seed=_seed, qbase_only=_qbase_only,
+            unit_counts=compression_units, seed=_seed, qbase_only=_qbase_only,
         )
+        _vl3_memlog("after encode_images (encoder+compressor+projector)", mm_features=mm_features)
 
         if compression_parts is not None and len(compression_parts) > 0:
             compressor = self.get_token_compressor()
@@ -441,7 +541,7 @@ class Videollama3MetaForCausalLM(ABC):
             # Single-stage: replace the per-frame "Time X.0s:" text with one range
             # "Time:{a}s-{b}s:" before the compressed block. Two-stage: the model
             # split each whole-video part into U units, so emit U {range-ts, <cs>,
-            # M+r_u*K placeholders, <ce>} blocks; placeholder blocks carry a
+            # M placeholders, <ce>} blocks; placeholder blocks carry a
             # `pos_block` = (slot offsets, unit_span) for the strided position_ids.
             ids_segs, lbl_segs, attn_segs, is_start_segs, pos_plan = [], [], [], [], []
 
