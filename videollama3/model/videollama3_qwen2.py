@@ -204,6 +204,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         compression_seed: Optional[List[int]] = None,
         compression_frame_sec: Optional[List[List[int]]] = None,
         compression_qbase_only: Optional[List[bool]] = None,
+        compression_is_image: Optional[List[bool]] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if inputs_embeds is None:
@@ -230,6 +231,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 compression_seed=compression_seed,
                 compression_frame_sec=compression_frame_sec,
                 compression_qbase_only=compression_qbase_only,
+                compression_is_image=compression_is_image,
             )
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -265,11 +267,21 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
             self._last_compressed_labels = labels
 
         loss, logits = None, None
+        # Per-stream CE split, for logging only -- reset here so a forward without
+        # `compression_is_image` (or without labels) cannot re-log a stale value.
+        self._last_stream_ce = None
         # Loss computation
         if labels is not None and not skip_ce_loss:
             shift_hidden_states = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             mask = shift_labels != IGNORE_INDEX
+            # Which supervised token came from a still-image sample vs a video one.
+            # Taken BEFORE `mask` is applied so it can be masked the same way; None
+            # unless the batch carries `compression_is_image` (see
+            # Videollama3MetaForCausalLM.image_stream_token_mask).
+            _img_tok = self.image_stream_token_mask(position_ids, compression_is_image)
+            shift_is_image = None if _img_tok is None else _img_tok[..., 1:].contiguous()[mask]
+            per_token = None
             shift_hidden_states = shift_hidden_states[mask]
             shift_labels = shift_labels[mask]
 
@@ -301,7 +313,8 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 numerator = torch.einsum("nd,nd->n", shift_hidden_states, weight[shift_labels])
 
                 acc_op = torch.sum if reduction == "sum" else torch.mean
-                loss = acc_op(-numerator + lse)
+                per_token = -numerator + lse
+                loss = acc_op(per_token)
 
             else:
                 shift_logits = self.lm_head(shift_hidden_states)
@@ -310,9 +323,29 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                     shift_labels,
                     reduction=reduction,
                 )
+                if shift_is_image is not None:
+                    # Second pass over the SAME (already masked, so answer-tokens-only)
+                    # logits -- no extra lm_head matmul, no graph. The reduced `loss`
+                    # above is left byte-identical rather than rebuilt from this.
+                    with torch.no_grad():
+                        per_token = torch.nn.functional.cross_entropy(
+                            shift_logits.detach(), shift_labels, reduction="none",
+                        )
 
             if num_items_in_batch is not None:
                 loss = loss / num_items_in_batch
+
+            if shift_is_image is not None and per_token is not None:
+                with torch.no_grad():
+                    pt = per_token.detach().float()
+                    n_img = int(shift_is_image.sum())
+                    self._last_stream_ce = {
+                        # (sum CE, n supervised tokens) per stream -- the trainer turns
+                        # each into a per-token mean, which is comparable across steps
+                        # regardless of how the micro-batch happened to be composed.
+                        "image": (float(pt[shift_is_image].sum()), n_img),
+                        "video": (float(pt[~shift_is_image].sum()), int(pt.numel()) - n_img),
+                    }
 
             # Lightweight debugging log: print loss components on rank 0 only.
             if self.training:
@@ -389,6 +422,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         compression_seed: Optional[List[int]] = None,
         compression_frame_sec: Optional[List[List[int]]] = None,
         compression_qbase_only: Optional[List[bool]] = None,
+        compression_is_image: Optional[List[bool]] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         input_ids = kwargs.pop("input_ids", None)
@@ -432,6 +466,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 compression_seed=compression_seed,
                 compression_frame_sec=compression_frame_sec,
                 compression_qbase_only=compression_qbase_only,
+                compression_is_image=compression_is_image,
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(input_ids)

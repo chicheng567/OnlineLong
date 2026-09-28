@@ -26,7 +26,7 @@ list of ``{"video_id", "duration_sec", "est_frames_1fps", "ok"}`` records).
 Example
 -------
     python dataset_util/build_phase2_manifest.py \
-        --anno       anno_online/internvid_qwen3vl.json \
+        --anno       anno_online/internvid/pool_all_qwen3vl.json \
         --durations  anno_data/internVid_durations.json \
         --data_root  /share/dataset/internVid \
         --meta_out   anno_data/phase2_internvid.json
@@ -78,17 +78,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--anno", default="anno_online/internvid_qwen3vl.json",
+    p.add_argument("--anno", default="anno_online/internvid/pool_all_qwen3vl.json",
                    help="Full re-caption annotation (LLaVA list) to slice from.")
     p.add_argument("--durations", default="anno_data/internVid_durations.json",
                    help="ffprobe duration scan (list of records OR {clip: sec} map).")
-    p.add_argument("--out_dir", default="anno_online",
+    p.add_argument("--out_dir", default="anno_online/internvid",
                    help="Directory for the three sliced annotation JSONs.")
     p.add_argument("--meta_out", default="anno_data/phase2_internvid.json",
                    help="Meta registry written for --multi_dataset True.")
     p.add_argument("--data_root", default="/share/dataset/internVid",
                    help="Directory the `video` paths are relative to (into --meta_out).")
-    p.add_argument("--prefix", default="internvid_qwen3vl",
+    p.add_argument("--prefix", default="phase2",
                    help="Basename prefix for the sliced annotation files.")
     p.add_argument("--mid_lo", type=float, default=180.0)
     p.add_argument("--mid_hi", type=float, default=420.0)
@@ -172,17 +172,24 @@ def main() -> None:
     f_mid = out_dir / f"{a.prefix}_mid_{int(a.mid_lo)}_{int(a.mid_hi)}.json"
     f_replay = out_dir / f"{a.prefix}_lt{int(a.mid_lo)}_replay.json"
     f_qbase = out_dir / f"{a.prefix}_qbase_replay.json"
+    # An EMPTY stream is written nowhere and registered nowhere: `--replay_frac 0`
+    # / `--qbase_frac 0` mean "this Phase-2 run has no replay", and a 0-row
+    # annotation would still become a LazySupervisedDataset in the concat.
     _dump(f_mid, mid, a.force)
-    _dump(f_replay, replay, a.force)
-    _dump(f_qbase, qbase, a.force)
+    if replay:
+        _dump(f_replay, replay, a.force)
+    if qbase:
+        _dump(f_qbase, qbase, a.force)
 
     total = len(mid) + len(replay) + len(qbase)
     def pct(n):
         return f"{100.0 * n / total:.1f}%" if total else "-"
     print(f"[phase2-manifest] wrote:")
     print(f"  {f_mid}            {len(mid):>8,}  ({pct(len(mid))})")
-    print(f"  {f_replay}    {len(replay):>8,}  ({pct(len(replay))})")
-    print(f"  {f_qbase}       {len(qbase):>8,}  ({pct(len(qbase))})  [qbase_only]")
+    print(f"  {f_replay}    {len(replay):>8,}  ({pct(len(replay))})"
+          f"{'  [SKIPPED -- not written, not registered]' if not replay else ''}")
+    print(f"  {f_qbase}       {len(qbase):>8,}  ({pct(len(qbase))})  [qbase_only]"
+          f"{'  [SKIPPED -- not written, not registered]' if not qbase else ''}")
     print(f"  total steps / epoch (per-sample) ~= {total:,}")
 
     root = os.path.abspath(a.data_root)
@@ -197,18 +204,22 @@ def main() -> None:
             "annotation": str(f_mid.resolve()),
             "data_root": root, "online_mode": False, "prefix_captioning": False,
         },
-        k_replay: {
+    }
+    if replay:
+        meta[k_replay] = {
             "annotation": str(f_replay.resolve()),
             "data_root": root, "online_mode": False, "prefix_captioning": False,
-        },
-        k_qbase: {
+        }
+    if qbase:
+        meta[k_qbase] = {
             "annotation": str(f_qbase.resolve()),
             "data_root": root, "online_mode": False, "prefix_captioning": False,
             "qbase_only": True,
-        },
-    }
+        }
     _dump(Path(a.meta_out), meta, a.force)
-    print(f"[phase2-manifest] meta -> {a.meta_out}  (3 datasets; {k_qbase} has qbase_only=true)")
+    print(f"[phase2-manifest] meta -> {a.meta_out}  ({len(meta)} dataset"
+          f"{'s' if len(meta)!=1 else ''}"
+          f"{f'; {k_qbase} has qbase_only=true' if qbase else ''})")
     print(f"[phase2-manifest] point training at it:\n"
           f"    ... --multi_dataset True --data_path {a.meta_out} \\\n"
           f"        --durations_json {a.durations} --group_by_compression_depth True")

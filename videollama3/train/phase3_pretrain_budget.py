@@ -150,7 +150,16 @@ class Phase3BudgetDataset(Phase2FoldDataset):
 class Phase3ModelArguments(Phase2ModelArguments):
     # Phase-3 clips are 420-1200 frames; the single-shot encoder forward is the
     # largest allocation in the step at that length (§5 item 4, §8 step 7).
-    vision_encoder_chunk_frames: int = field(default=8)
+    # 32, not 8 (measured on one H100 over the blend's real frame geometries): what
+    # sets the GEMM size is `chunk * h * w` patch rows, and a 420-frame clip at the
+    # 65536-token budget is only 576 patches/frame, so 8 frames is 4,608 rows -- far
+    # too small (195 TFLOP/s, vs 237 at chunk=32). Over the blend (~90% InternVid)
+    # 8 -> 32 takes the encoder from 9.02 s to 7.76 s per 8-video micro-batch,
+    # i.e. 95.4 -> 85.3 s/it. 64 buys only another 1.8 s/it: the remaining gain is
+    # all on the long low-resolution clips, while the high-resolution short ones
+    # (10k+ patches/frame, already a big GEMM at chunk=8) gain nothing and pay up to
+    # +6 GiB of peak activation -- and the step already peaks at 78 of 81.5 GiB.
+    vision_encoder_chunk_frames: int = field(default=32)
     compressor_gradient_checkpointing: bool = field(
         default=True,
         metadata={"help": "Recompute the qbase / fold layer activations in backward. The qbase "

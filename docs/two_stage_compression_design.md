@@ -213,9 +213,38 @@ example, T = 240: N = 61; draw `N̄_u = 13` ⇒ U = 5; partition e.g.
 
 ### Phase 1 — qbase only, content-adaptive segments, **NO fold**
 
+**Still images are the degenerate case of this same path** and are the densest
+supervision it can get. `T = 1` ⇒ `adaptive_segment_count(1) = 1` segment ⇒ `K = 64`
+tokens, with the whole per-sample vision budget spent on that one frame (bunny's
+native grids are p50 216–999 tokens ⇒ a 3.4–15.6× squeeze). InternVid captions are
+generated from a FIXED 64-frame sample regardless of duration
+(`shell/recaption_vllm.sh`), so nothing in the video stream rewards detail finer
+than that sampling density — which is exactly §2.2's "the qbase was pretrained on
+very sparse input". Images supply the missing pressure: OCR strings, attributes,
+counts, spatial relations, all in one frame. Three constraints, all measured:
+
+- **No `Time` marker.** An image has no timeline.
+  `_rewrite_image_block_as_single_frame_video` drops its timestamp so the chat
+  template renders a bare `<image>` (no `Time X.0s:` prefix), `build_range_ts_info`
+  returns `(0, [])` so nothing is cut back, and the datasets set
+  `compression_is_image=[True]` so the two-stage path does not emit a degenerate
+  `Time:0s-0s:` range either (§5 item 18).
+- **An image must hold ≥ K vision tokens.** It is ONE segment, so the compressor
+  emits `K` rows into a part that holds only that image's own tokens; anything
+  smaller overflows the part (the assert in
+  `compress_visual_tokens_with_compressor`). Enforced twice: the builder drops
+  sub-K images *at native resolution* (upscaling a thumbnail invents no detail
+  while still costing a full segment), and `--vision_min_tokens 64` is the
+  processor-level guard.
+- **Mix ratio is the row count.** The meta format has no per-entry weight, so
+  `--image_share` subsamples the image tasks. Too high and the qbase becomes a
+  single-frame expert and loses the 1–8 frame segment behaviour it is actually
+  deployed with; the default is 0.40.
+
 - **Data:** every clip **< 180 s** (~264k) — **including the very short ones**.
   Short clips are useless for the fold but perfectly good qbase signal; do not drop
-  them.
+  them. **Plus a still-image stream (added 2026-09-26, §6 "Phase-1 image
+  stream")**: 176k samples at a 40 % row share, `anno_data/phase1_blend.json`.
 - **Segmenter** (new, `compressor.py` or a small module): causal, non-learned,
   model-side on the frozen-encoder **per-frame mean feature**. **Fixed segment
   count, adaptive placement** — a deliberate trade (this *is* a fixed compression
@@ -266,6 +295,13 @@ example, T = 240: N = 61; draw `N̄_u = 13` ⇒ U = 5; partition e.g.
   LLM**) not worse than the whole-video qbase baseline.
 
 ### Phase 2 — add the fold; qbase + fold streams; **+ 180–420 s**
+
+> **Superseded in part (2026-09-27).** Both replay streams are **gone** and the
+> qbase is **frozen for the whole phase** (`QBASE_LR=0`). The data is a single
+> stream: `internvid_mid_180_420`, 273,356 rows, 180–420 s. Rationale and measured
+> composition in §6 *"Phase 2/3 data — replay removed, qbase frozen (2026-09-27)"*.
+> The two bullets immediately below are kept because they record **why** the replay
+> streams existed — they no longer describe the run.
 
 - **Data:** 180–420 s (~273k, Qwen3-VL re-captions complete) **+ 30 % replay** of
   the Phase-1 `< 180 s` pool. The replay is not only short-video retention — it is
@@ -437,7 +473,10 @@ pinning + no variance; each half covers what the other cannot.
 
 ### Phase 3 — deep folds; **420–1200 s + budget-driven length-adaptive fold (draft, 2026-09-18)**
 
-**Status: built + data ready 2026-09-20, run not started.** Items 4, 13, 14, 16,
+**Status: built + data ready 2026-09-20, run not started. Data REBUILT 2026-09-27
+— InternVid removed entirely, no replay, qbase frozen; the 420 → 720 → 1200 length
+curriculum is retired because the blend no longer holds long clips. See §6
+*"Phase 2/3 data — replay removed, qbase frozen (2026-09-27)"*.** Items 4, 13, 14, 16,
 17 are implemented and self-checked (see each row in §5); the entrypoint is
 `videollama3/train/phase3_pretrain_budget.py` (launcher `shell/pretrain_phase3_budget.sh`),
 a thin wrapper over `phase2_pretrain_fold.py` via the same injection hooks.
@@ -864,8 +903,8 @@ even though a real arc is lost, because the cost never looks past one hop
 (problem #2 above). Checked on
 `eval_ablation/manifest_internvid_true_heldout_420_550.json` (8 InternVid
 clips; verified by basename cross-reference to have **zero** overlap with the
-actual short/mid-bucket training files `anno_online/internvid_qwen3vl_lt180.json`
-/ `_mid_180_420.json` — the previously-used `manifest_internvid_heldout.json`
+actual short/mid-bucket training files `anno_online/internvid/phase1_lt180.json`
+/ `phase2_mid_180_420.json` — the previously-used `manifest_internvid_heldout.json`
 turned out to be fully in-pool with the short-bucket training set and was
 retired), sliding fixed-length windows (`L=5,10,20`, matching the `N_u` range
 already observed in production, up to 34) over both the frozen-encoder and
@@ -1194,6 +1233,8 @@ on short clips, identical on long ones.
 | 16 | **Phase-3 unit placement: exact DP on `WCSS + λ·depth_cost`** (§4 Phase 3) — new method alongside `_place_unit_boundaries` (which stays for Phase 2). `O(N²U)` numpy/torch pass; `min_gap` floor drops to 1 so raw-bypass units can exist. `λ ≥ 0.01` (insensitive above that); **`N_u_soft ≈ 1.5–2 × N/U`, NOT a fixed 16** — below `N/U` the quadratic swamps `WCSS` and the DP degenerates to a uniform split. Reference implementation + probe: `eval_ablation/phase3_dp_depth_probe.py`. **Done** — `TwoStageCompressor._place_unit_boundaries_dp` (float64 prefix-sum `WCSS`, `N_u_soft = stage2_dp_soft_ratio · N/U` as a **float**, no `min_gap`), selected by `--stage2_unit_placement dp`; verified to reproduce the probe's partition exactly on 6 `(N, U, λ, ratio)` points. The knee being a float and not the probe's rounded int is load-bearing at small `N` (it moved the partition at `N=121`). **Deterministic — no Gumbel**: Phase-3 per-epoch partition variance comes from the segment-level jitter (`--segment_sample_tau`) moving the DP's input; the WCSS-space jitter analogue stays an open item. | `compressor.py`, `train/phase3_pretrain_budget.py` | no |
 | 17 | **Target-`N` qbase segmentation + clamp** (§4 Phase 3) — replace the fixed `segment_target_frames` with `N = clip(c·⌊B/M⌋, N_min(T), T)`, `N_min` from the `force_every` hard floor and the `min_adapt` adaptivity floor; decision `c = 4, min_adapt = 0.5` (identical to `tf=4` on long clips, 69.0 % → 20.4 % zero-fold-gradient on short ones). Separately **add an assert in `adaptive_segment_count`**: a requested `N < ⌊(T−1)/force_every⌋ + 1` silently disagrees with what `adaptive_segment_lengths` actually cuts (`T=1200, tf=12` ⇒ 101 vs 150), corrupting the arch's placeholder count. Sweep: `eval_ablation/phase3_segment_budget_sweep.py`. **Done** — `target_segment_count` / `min_segment_count` / `n_forced_cuts` + `_assert_segment_count_contract` (raises on the `tf=12` case, inert at `tf=4 < force_every=8`), `adaptive_segment_lengths(n_segments=…)`, `TransformerDecoderFlatCompressor.segment_count_for` behind `--segment_count_rule` (`frames` default keeps Phase 1/2 byte-identical; Phase 3 sets `target_n`). Verified equal to the sweep's `plan()` for every `T ∈ [1, 1400)`, and the realised cut matches the promised count with all lengths ≤ `force_every`. | `compressor.py::adaptive_segment_count` / `adaptive_segment_lengths` / `output_len_for`, `train/phase3_pretrain_budget.py` | no |
 
+| 18 | **Still-image stream for Phase 1 + no `Time` marker on images** (§4 Phase 1, §6 "Phase-1 image stream") — **Done 2026-09-26.** Data: `dataset_util/build_phase1_image_blend.py` (media-verified, native-resolution `< K` filter, turn merging, per-task held-out by image realpath) → `anno_data/phase1_blend.json`. Code: `compression_is_image` threaded `dataset → DataCollatorWithCompressor → videollama3_qwen2.forward/generate → prepare_inputs_labels_for_multimodal`, mirroring `compression_qbase_only` (§5 item 12); the arch's two-stage branch emits `<cs> … <ce>` with **no** `Time:{a}s-{b}s:` for an image part, and `Phase2FoldDataset` no longer claims an `old_ts_len` for one (it would have cut that many tokens of real prompt text, since an image renders as a bare `<image>`). The single-stage Phase-1 path already emitted nothing (`build_range_ts_info` → `(0, [])`). `--vision_min_tokens` / `--vision_max_tokens` moved onto `base.DataArguments` so Phase 1 gets them too, with a launch-time warning when `min_tokens < K`. **Runtime fallback:** `GlobalCompressorLazySupervisedDataset._reject_if_too_small` warns and skips any sample whose compressed output would not fit in the vision tokens it replaces — `N·K` on the Phase-1 path, `M` (the `U=1` floor) on the two-stage one — because the arch writes the compressed rows back INTO the part (`replace_mask[ps : ps+n_out]`) and an overflow spills into the next part. Full remedy logged on the first occurrence per dataset, one line each after, every 100th beyond 20. The skip draws a replacement index through `_backup_sample`, now bounded by `MAX_SAMPLE_RETRIES = 50` and raising `TooManySampleRejections` (its own class, re-raised past the per-sample `except Exception`) so an all-thumbnail registry fails with one clear error instead of recursing until the stack dies. Verified: a 4-row all-sub-K registry at `min_tokens=16` warns then raises cleanly, the same registry at `--vision_min_tokens 64` upscales and passes (`compression_parts=[[0, 64]]`), and the real blend triggers **zero** rejections across all 7 tasks. Verified on GPU: an image is `962 → 64` tokens with zero `Time` tokens through both the Phase-1 single-stage and the Phase-3 two-stage path (the latter 320 → 312, the 8 removed being `Time:0s-0s:`), a video is unchanged (`14,994 → 1,600`, `Time:0.0s-97.0s:` intact), and a 4-step mixed image+video Phase-1 run is green. | `dataset_util/build_phase1_image_blend.py`, `train/data/{global_compressor,compressor}.py`, `train/phase2_pretrain_fold.py`, `train/compressor_pretrain_with_videollama3.py`, `model/videollama3_{arch,qwen2}.py` | no |
+
 **Keep, do not touch:** no feature cache; CE only; **no reconstruction / MSE /
 masked-feature** (collapses to order-invariant — Option A/B are distribution
 moments, not per-token targets, and are allowed);
@@ -1205,10 +1246,51 @@ moments, not per-token targets, and are allowed);
 
 | bucket | duration | ~count | phase |
 |---|---|---:|---|
+| **images** | T = 1 | **176k** | **1** |
 | short | < 180 s | 264k | 1 (qbase), replay 2/3 |
 | mid | 180–420 s | 262k | 2, replay 3 |
 | long | 420–1200 s | 451k | 3 |
 | — | > 1200 s | 98 | dropped |
+
+### Phase-1 image stream (2026-09-26)
+
+`dataset_util/build_phase1_image_blend.py` → `anno_data/phase1_image_blend.json`
+(train) / `phase1_image_heldout.json` / `eval_ablation/manifest_phase1_image_heldout.json`,
+and with `--merge anno_data/internvid_qwen3vl_lt180.json` the blended Phase-1
+registry `anno_data/phase1_blend.json` the launcher now defaults to.
+
+Rationale in §4 Phase 1. Sources, all verified on disk 2026-09-26 (these three
+files are the ones `build_phase3_blend.py` skips as "image-only"):
+
+| source | raw rows | unresolvable | < K tokens native | → samples |
+|---|---:|---:|---:|---:|
+| `bunny_union` visual_genome | 316,040 | 10,691 | 58 | 96,031 |
+| `bunny_union` coco_2017 | 206,244 | 20,064 | 54 | 68,343 |
+| `bunny_union` ocrvqa | 79,949 | 27,049 | 801 | 52,099 |
+| `bunny_union` open_images | 21,941 | 8,131 | 0 | 13,810 |
+| `ocrvqa_19k` | 19,258 | 68 | 252 | 18,938 |
+| videoxl `pretrain.json` (capped 60k of 2M) | 60,000 | 0 | 16,277 | 43,723 |
+
+- **`bunny_union` is four corpora**, registered as four tasks so each gets its own
+  held-out slice and its own share. Per-root resolution differs a lot
+  (visual_genome 93.6 %, coco 89.0 %, ocrvqa 66.3 %, open_images 57.9 %), so every
+  row is existence-checked rather than trusted. Mean answer 339 chars, p90 1,513 —
+  a real dense-caption tail, 5.32 turns per sample.
+- **`pretrain.json` is alt-text** (mean ~90 chars, "Piece of dark jeans fabric
+  Royalty Free Stock Photography") and 27 % of it is thumbnails below `K` tokens:
+  volume, not detail. Capped at `--vxl_pretrain_max 60000`.
+- **Turn merging.** bunny ships ~2.1 rows per image; rows sharing an image merge
+  into one multi-turn sample (`--max_turns 6`) so the frozen encoder runs once per
+  image per epoch. The **longest** answer leads, so the dense-caption turn is the
+  one that survives the cut.
+- **Held-out**: same per-task policy as Phase 3 — split by **image**, union across
+  tasks, disjointness asserted. Identity is the media **realpath**: image stems here
+  are generic (`0010278167`) and the same physical file is reachable through two
+  symlinks (bunny's `ocrvqa/x.jpg` and `ocrvqa_19k`'s `ocrvqa/x.jpg`), so the
+  stem-vs-realpath rule of the video builder does not apply. Measured: 1,775 images
+  held out over 6 tasks, train × held-out overlap **0**.
+- **Measured blend**: 176,123 image samples (173,435 images) + 264,186 InternVid
+  rows ⇒ image share **0.400**.
 
 - `anno_data/internVid.json` — 977,423 entries `{"video": "<id>.mp4", ...}`, 1 file
   missing on disk. Videos in `/share/dataset/internVid/`, stored at native 2 fps
@@ -1250,45 +1332,204 @@ one before anything is trained on:
   `eval_ablation/manifest_phase3_heldout.json`, the per-task video manifest the
   `eval_ablation/` probes take. The builder asserts the two sides are disjoint by
   stem and refuses to finish if they are not.
-- **Measured (2026-09-20 build):** 523 videos held out across 12 tasks; train ×
-  held-out overlap **0**.
+- **Measured (2026-09-21 rebuild):** 3,642 videos held out across 29 tasks;
+  train x held-out overlap **0**. Two rules the split now encodes:
+  - **Identity** is the file *stem* when the stem is distinctive (>= 8 chars and
+    not `video_<digits>`), the *realpath* otherwise. Stem alone merges
+    `ShareGPT-4o/pvideo/video_10001.mp4` with
+    `perception_test/videos/video_10001.mp4` (different videos, 1,511 such
+    collisions); realpath alone splits NextQA's `1202/3264772244.mp4`, which the
+    release ships as two separate physical copies under `0_30_s_nextqa/` and
+    `0_30_s_academic_v0_1/` (identical bytes, different inodes).
+  - **`--protect_from`** bars a clip that Phase 1/2 already trained on from being
+    *chosen* as held-out. The 2026-09-20 build did not, and put 192/300 and
+    209/300 of the InternVid replay held-out clips inside the Phase-2 training
+    pool. With it, the InternVid `< 420 s` replay streams get **no** held-out
+    slice at all -- the whole pool was trained on -- and only the 420-1200 s
+    bucket has one.
 
 This is what makes **VDC usable as training data**: it goes into the blend like
 any other task, and it is evaluated on its own held-out slice rather than on the
-benchmark in bulk. The same applies to any InternVid registry passed through
-`--merge` (split unless `--no_split_merged`) — note the Phase-1/2 runs trained on
-the whole `< 420 s` pool, so only a **long-bucket** InternVid held-out slice is
-genuinely clean for a Phase-3 checkpoint.
+benchmark in bulk.
 
-- **Phase 3 also blends `../datasets/unified` + `../datasets/vcd`** (~278k
-  clips) directly into the length-bucketed curriculum — see §4 Phase 3 for why
-  (the InternVid re-caption pipeline's fixed frame-sample budget caps how much
-  temporal detail CE can ever reward, independent of duration). Per-dataset
-  signal:
-  - **activitynet** (19,994 clips, 648 h, `unified/annotations/activitynet/`):
-    real human multi-event annotation, `timestamps: [[s,e], ...]` +
-    `sentences` — trains `Time:{a}s-{b}s:` against genuine localization, not a
-    frame-capped VLM guess.
-  - **llava-video `nextqa` / `perceptiontest` / `activitynetqa`**
-    (`unified/annotations/llava-video/`): precise-event VQA (e.g. "what did the
-    man in blue do at the end of the video?") — penalizes averaging away
-    order/recency in a way a generic caption never does.
-  - **vcd `VDC_1k`** (**1,027 clips, all resolved 2026-09-20**): multi-turn,
-    multi-granularity detailed captioning (camera work / background /
-    main-object / short summary / full detailed caption — five human/gpt turns
-    per clip) — far denser supervision than a single InternVid sentence. **It is
-    training data**, evaluated on its own held-out slice (policy above). Build it
-    from the **original `../datasets/vcd/VDC_1k.jsonl`**, not
+### Phase 3 blend -- `/root/datasets` PRIMARY, InternVid SECONDARY (2026-09-21)
+
+The 2026-09-20 build had InternVid at 90.1 % of rows and **98.7 % of the CE
+token mass**, and its captions are the *least* dense annotation on the machine:
+`shell/recaption_vllm.sh` pins every clip to `NUM_FRAMES=64` regardless of
+duration, so the 678 s median of the long bucket is captioned at ~0.05 fps. At
+the same time `/root/datasets` held 278k clips that were 8.6 % used --
+llava-video at 4.2 % (and the 4 % kept was the letter-only MCQ, mean answer
+10-18 chars, while the GPT-4o dense captions and open-ended QA were excluded by
+the `LLAVA_FAMILIES` filter), videoxl + videoxl_pro at **0 %**.
+
+`dataset_util/build_phase3_blend.py` now registers everything resolvable under
+`--datasets_root` and demotes InternVid to `--merge_share` (default 0.35 of the
+final rows, each stream keeping its relative proportion). Per-source signal:
+
+  - **activitynet** (14,926 clips resolved of 19,994): human multi-event
+    `timestamps` + `sentences` -> one event-list answer with real `{a}s-{b}s:`
+    ranges. The only source that trains the `Time:{a}s-{b}s:` string the
+    compressor emits per unit against genuine localization.
+  - **llava-video, ALL subsets** (186,854 clips, 100 % on disk): the
+    `*_cap_processed.json` files are GPT-4o recursive dense captions --
+    147,460 rows at mean 3,010 chars (`youtube`) + 29,494 at 2,019
+    (`academic`), i.e. 2.3x the density of an InternVid caption -- plus 952,396
+    open-ended QA rows (mean ~410 chars) and 191,362 MCQ rows. The
+    `nextqa`/`perceptiontest`/`activitynetqa` subsets stay for precise-event VQA.
+  - **videoxl / videoxl_pro** (70,176 clips, media 100 % resolvable through
+    `source/videoxl_pro/media/`): `sharegpt4v_38k` (37,769 ShareGPT4Video dense
+    captions, mean 1,826 chars), `time_sft_opens`' ActivityNet slice (29,896
+    rows of "the given query happens in a - b seconds" -- direct supervision for
+    the per-unit time range), `baaicaption_10k`, `cinepine_union` + `VICO`
+    (CinePile MCQ + event-ordering on 8,051 movie clips, p50 161 s),
+    `vcg_union` (VideoChatGPT full-video descriptions on ActivityNet),
+    `gpt4o_video_2k`, `ego_4d_0.7k`, `anomaly_det`. Skipped: `bunny_union` /
+    `ocrvqa_19k` / `Pretraining/pretrain.json` (images), `finevideo_43k` (0 % of
+    its media on disk), `_excluded/` and `_superseded_by_dedup/`.
+  - **vcd `VDC_1k`** (1,027 clips, all resolved): multi-turn multi-granularity
+    captioning (camera work / short / background / main-object / detailed).
+    Build it from the **original `/root/datasets/vcd/VDC_1k.jsonl`**, not
     `unified/annotations/vcd/VDC_1k.json`: the unified copy re-ids every clip to
     a UUID whose `vcd/videos/<uuid>.mp4` path does not exist, while the jsonl's
-    `video_id` is the on-disk file stem. The ego4d ids live in
-    `vcd/videos/videos_3.tar.gz` — extracted 2026-09-20 (35 GB, 200 clips), which
-    took resolution from 827/1027 to 1027/1027.
-  - Duration profile (`unified/VIDEO_DURATION_REPORT.md`): 277,024 clips total,
-    mean 57.8 s, p90 149.6 s — overwhelmingly short/mid, only activitynet's
-    tail and a sliver of videoxl reach into the 5–60 min range. Mix these into
-    the existing short/mid buckets above; they do not supply new long-bucket
-    coverage.
+    `video_id` is the on-disk file stem.
+
+**Turn merging.** llava-video ships ~7 rows per clip across separate files, so a
+row-per-QA registry would decode and vision-encode the same clip 7x per epoch.
+Rows sharing a video are merged into ONE multi-turn sample (`--max_turns 6`,
+dense caption first, `<video>` on the first human turn only): 1,320,712
+llava-video rows become 177,834 samples with the same supervision.
+
+**Measured composition (2026-09-21, `--merge_share 0.35`, `--max_turns 6`):**
+31 train tasks / **419,652 samples** / 853M answer chars. *(Superseded 2026-09-27:
+the InternVid secondary stream was removed outright — 28 tasks / 271,080 samples.
+The table below is the last build that had it.)*
+
+| | rows | CE token mass | vs. 2026-09-20 build |
+|---|---:|---:|---|
+| `/root/datasets` primary | 271,080 (64.6 %) | **78.3 %** | 70,692 rows / 1.3 % |
+| InternVid secondary | 148,572 (35.4 %) | 21.7 % | 642,218 rows / 98.7 % |
+
+Duration buckets over the train rows: `<60 s` 45.1 %, `60-180 s` 22.8 %,
+`180-420 s` 7.9 %, `420-720 s` 13.7 %, `>720 s` 10.6 % -- so **24.3 % of steps
+still land on a 420-1200 s clip** (was 61.6 %), all of it InternVid. Every
+registered clip has a duration (`anno_data/phase3_durations.json`, 1,212,449 /
+1,212,450 probed ok), so `--group_by_compression_depth` has a real depth class
+for every sample. Biggest single CE contributors are now
+`llava_2_3_m_youtube_v0_1` (19.4 %), `llava_0_30_s_youtube_v0_1` (16.9 %) and
+`internvid_mid_420_1200` (15.7 %).
+
+**Length is the one thing this cannot fix.** Sampled ffprobe over every pool:
+cinepile / ShareGPT4Video / baaicaption / gpt4o_video / ego4d / time_sft 0 %
+>= 420 s, llava-video 0 % (max 3-5 min, 309 clips), activitynet 0.1 %,
+vcg_union 0.4 %, anomaly_det 4.8 % (~63 clips). `VIDEO_DURATION_REPORT.md`:
+163 clips >= 5 min in the whole of `unified`. **Outside InternVid the machine
+holds ~170 clips >= 420 s**, so InternVid stays as the sole long-bucket
+supplier; `--merge_share` is the knob that trades fold depth against annotation
+density.
+
+### Phase 2/3 data — replay removed, qbase frozen (2026-09-27)
+
+**User decision, three parts:** delete every replay stream from Phase 2 and Phase 3;
+keep the qbase **frozen for the whole of Phase 2** (extended to Phase 3 for
+consistency — freezing in 2 and training in 3 gives back exactly what freezing
+protects); and drop InternVid's `> 420 s` bucket because its annotation quality
+cannot support it. The reasoning, and what it cost:
+
+**Why freezing replaces replay.** The replay streams existed to keep a *trainable*
+qbase (and the `mm_projector`) anchored to the raw-qbase manifold. A frozen qbase
+cannot drift, so they defend nothing while costing 104k samples/epoch in Phase 2.
+Freezing is also what protects the one measured win of the Phase-1 image stream:
+**−0.561 nats/token vs the warm-start on 2,866 never-seen images, 95 % CI
+[−0.668, −0.456]**, with `train − heldout = +0.009` (CI covers 0, so it is
+generalisation, not in-sample fit — see the Phase-1 image stream section). Phase 2's
+data is 100 % long-caption CE, the signal least likely to preserve that. And
+unfreezing was already tried and bought nothing: the frame-order probes stayed flat
+with the qbase unfrozen.
+
+**Why InternVid `> 420 s` had to go.** `shell/recaption_vllm.sh` pins every clip to
+`NUM_FRAMES=64` regardless of duration, so a 1200 s clip is captioned at **0.053 fps**
+— one frame every 18.75 s. Training a compressor to predict that target is not merely
+noisy: the target itself contains no detail, so it actively imposes a detail-discarding
+ceiling. This is the same sparse-input family as the §2.2 collapse root cause.
+
+**Measured after the rebuild.**
+
+| | Phase 2 | Phase 3 |
+|---|---:|---:|
+| tasks | 3 → **1** | 31 → **28** |
+| rows | 377,295 → **273,356** | 419,652 → **271,080** |
+| `< 180 s` | 0 | 261,890 (96.6 %) |
+| `180–420 s` | **273,356 (100 %)** | 9,015 (3.3 %) |
+| `420–1200 s` | 0 | **150** |
+| `> 1200 s` | 0 | 24 |
+
+Signal composition per **turn** (not per task — a merged llava-video sample holds
+1 caption + ~5.5 open-ended + ~1 MCQ turn, so a task-level classifier charges all of
+them to caption):
+
+| | CAPTION | SHORT-QA | MCQ |
+|---|---:|---:|---:|
+| Phase 2 turns / answer-chars | 100 % / 100 % | 0 | 0 |
+| Phase 3 turns / answer-chars | 56.8 % / **96.57 %** | 32.4 % / 2.92 % | 10.7 % / **0.51 %** |
+
+QA turns are **43.1 %** of Phase 3's turns but **3.4 %** of its answer characters —
+a caption turn runs 272–1,849 chars against an MCQ turn's 12–27, and CE sums per
+token. Removing InternVid raised the QA *turn* share (38.5 % → 43.1 %) and left the
+*gradient* share essentially unchanged. The MCQ data is not scarce: 209,811 MCQ rows
+exist on disk in llava-video alone (1,377,780 duration-bucketed rows total, ~7.53 per
+clip before turn merging), and 129,920 MCQ turns are already in the blend. What is
+scarce is their weight in a per-token loss.
+
+**`--protect_from` must stay, even though Phase 3 no longer trains on InternVid.**
+Phase 1 still trains 264k clips `< 180 s` and Phase 2 273k clips at 180–420 s, so any
+Phase-3 clip sharing an identity with those pools must not become held-out. Dropping
+the flag silently re-drew **166/170** of `vxlp_cinepile`'s and **262/320** of
+`vxlp_sharegpt4video`'s held-out videos (they share YouTube stems with the InternVid
+pool) — caught by diffing against the pre-rebuild split, 2026-09-27. The canonical
+rebuild is:
+
+    python dataset_util/build_phase3_blend.py --datasets_root /root/datasets --force \
+      --durations_seed anno_data/internVid_durations.json anno_data/phase3_durations.json \
+      --protect_from anno_data/phase2_internvid.json anno_data/internvid_qwen3vl_lt180.json
+
+**Held-out is unchanged by policy decision.** It is 1.34 % of the pool (5,696 of
+425,348 rows), so deleting it would buy +1.34 % training data while destroying the
+only guaranteed-uncontaminated caption-side measurement — the one that produced
+Phase 4's single positive result (B=256 rougeL gap −0.0314 → **+0.0197**). External
+MCQ benchmarks cannot replace it: they score no caption metric, and Video-MME /
+LongVideoBench share YouTube sources with the training pool (hence
+`check_benchmark_contamination.py`). After the rebuild the 28 shared tasks'
+held-out video sets are **byte-identical** to the pre-rebuild split; only InternVid's
+300-clip slice is gone (5,696 → 5,396 videos). The real deficiency is the opposite of
+too much held-out: only ~94 clips are actually read by any eval manifest, which is
+why Phase 4's caption result reached p<0.05 on just one metric.
+
+**Length curriculum retired.** With 420–1200 s down to 150 rows, `MAX_FRAMES=420`
+covers 99.9 % of the blend in one run and the 720 / 1200 runs have nothing to train
+on. Deep-fold coverage comes from Phase 2's 180–420 s instead: Phase 4 measured
+inference `N_u` at 2.1–6.4, inside the trained 3.8–6.6. Restore the curriculum if a
+long-video stream with trustworthy captions appears.
+
+**Launcher state after this change** (`shell/`, gitignored):
+
+| | Phase 2 | Phase 3 |
+|---|---|---|
+| output | `work_dirs/phase2_fold_frozen_qbase` | `work_dirs/phase3_budget_frozen_qbase` |
+| warm-start | `work_dirs/phase1_qbase_internvid` | Phase 2's output dir |
+| `QBASE_LR` | **0** | **0** |
+| `VISION_MAX_TOKENS` | checkpoint (16384) | 65536 |
+| `EPOCHS` | 3 (~1,601 steps; was ~2,212) | 2 |
+
+`VISION_MAX_TOKENS=65536` was **kept** after a false alarm: per-frame tokens rise to
+~364 on a short clip, but the qbase operates per *segment*, and Phase 1 already
+trained it on segments of 88–1,369 kv tokens (24.7 % of Phase-1 images exceed 364
+tokens alone; `img_bunny_open_images` has a median of 999). A Phase-3 segment at
+65536 is ~1,456 kv tokens — inside that range, not out of distribution. Note that
+Phase 1's **images were never budget-limited at all** (every native grid is < 1,369,
+far below 16384); only its video stream was (16384/T → 91–299 tok/frame), so raising
+Phase 1's own `VISION_MAX_TOKENS` is the way to give the qbase higher-resolution
+*video* input if that is ever wanted.
 
 ---
 

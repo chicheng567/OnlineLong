@@ -194,7 +194,8 @@ class ModelArguments:
                           "one shot (design doc §5 item 4). The encoder has no cross-frame attention "
                           "(per-frame cu_seqlens, 2-D spatial RoPE), so this is mathematically a "
                           "no-op that bounds peak activation memory -- required at Phase-3 lengths. "
-                          "0 = single-shot (Phase 1/2 behaviour); 8 is the design default."},
+                          "0 = single-shot (Phase 1/2 behaviour); Phase 3 defaults it to 32 -- see "
+                          "Phase3ModelArguments for the measurement behind that number."},
     )
 
 
@@ -224,6 +225,26 @@ class DataArguments:
     validation_split_rate: float = field(
         default=0,
         metadata={"help": "Percentage of the train set used as validation set."},
+    )
+    # Dynamic-HW knobs. Leave --force_image_size UNSET so the image processor keeps
+    # each sample's native aspect ratio / resolution (smart_resize), scaled to a
+    # per-SAMPLE token budget shared across its frames. The compressor emits a fixed
+    # N*K (Phase 1) / U*M (Phase 2-3) to the LLM either way, so a large budget only
+    # costs the frozen encoder forward + the qbase cross-attention KV.
+    vision_max_tokens: Optional[int] = field(
+        default=None,
+        metadata={"help": "Override image_processor.max_tokens: total vision-token budget PER "
+                          "SAMPLE (shared across a video's frames; a still image is one frame and "
+                          "gets all of it). None keeps the checkpoint value (16384). Ignored when "
+                          "--force_image_size is set."},
+    )
+    vision_min_tokens: Optional[int] = field(
+        default=None,
+        metadata={"help": "Override image_processor.min_tokens (PER-FRAME floor; simple_batched_resize "
+                          "upscales to meet it). Must be >= num_queries (K) when the blend holds "
+                          "still images: an image is ONE segment, so the compressor emits K rows into "
+                          "a part that holds only that image's own vision tokens. None keeps the "
+                          "checkpoint value (16 -> a 4x4 grid, far below K=64)."},
     )
     pixel_values_dtype: str = field(
         default="float32",
@@ -304,6 +325,28 @@ def _build_token_compressor_config(
         "segment_force_every": model_args.segment_force_every,
         "segment_sample_tau": model_args.segment_sample_tau,
     }
+
+
+def _configure_image_processor(image_processor, model_args, data_args) -> None:
+    """Apply --vision_{min,max}_tokens before the processor is wrapped. Shared by
+    Phase 1; Phase 2/3 pass their own wrapper around the same two fields."""
+    if data_args.vision_max_tokens:
+        image_processor.max_tokens = int(data_args.vision_max_tokens)
+    if data_args.vision_min_tokens:
+        image_processor.min_tokens = int(data_args.vision_min_tokens)
+    k = int(getattr(model_args, "num_queries", 0) or 0)
+    if k and image_processor.min_tokens < k:
+        rank0_print(
+            f"[phase1] WARNING image_processor.min_tokens={image_processor.min_tokens} < K={k}. "
+            f"A still image is ONE segment, so the compressor emits K rows into a part holding "
+            f"only that image's vision tokens -- any image below K tokens overflows the part "
+            f"(see compress_visual_tokens_with_compressor's assert). Pass --vision_min_tokens {k} "
+            f"if the blend contains images."
+        )
+    rank0_print(
+        f"[phase1] image processor: force_size={image_processor.force_size}, "
+        f"min_tokens={image_processor.min_tokens}, max_tokens={image_processor.max_tokens}"
+    )
 
 
 def train(attn_implementation=None, *,
@@ -716,4 +759,5 @@ def train(attn_implementation=None, *,
 
 
 if __name__ == "__main__":
-    train(attn_implementation="flash_attention_2")
+    train(attn_implementation="flash_attention_2",
+          configure_image_processor=_configure_image_processor)

@@ -53,6 +53,7 @@ import os
 import random
 import sys
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Dict, Optional, Tuple
 
 sys.path.append("./")
@@ -68,6 +69,7 @@ from videollama3.train.compressor_pretrain_with_videollama3 import (
 from videollama3.train.data.common import cast_pixel_values_, rank0_print
 from videollama3.train.data.global_compressor import (
     GlobalCompressorLazySupervisedDataset,
+    TooManySampleRejections,
     _rewrite_image_block_as_single_frame_video,
     get_video_content,
     resample_video_frames,
@@ -80,6 +82,42 @@ logger = logging.getLogger(__name__)
 # Dataset — same as GlobalCompressorLazySupervisedDataset, but the tail emits
 # U contiguous units instead of one whole-video part.
 # ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=4)
+def _load_durations_map(path: str, _mtime: float) -> Dict[str, int]:
+    """``{stem: est_frames_1fps}`` from a durations scan, parsed ONCE per path.
+
+    ``--multi_dataset`` builds one dataset object per registered sub-dataset (31
+    of them for the Phase-3 blend), and each one used to re-parse this file: at
+    the blend's 1.2M-clip / 94 MB scale that is ~31 redundant parses and ~7 GiB
+    of duplicate dicts per rank, all forked into every dataloader worker.
+    ``_mtime`` is part of the key so a regenerated file is not served stale.
+
+    Accepts two shapes: a ``{clip: est_frames_1fps | {est_frames_1fps: ...}}``
+    map, OR the list-of-records the ffprobe scan emits
+    (``anno_data/internVid_durations.json``:
+     ``[{"video"/"video_id", "est_frames_1fps"|"duration_sec", "ok"}, ...]``).
+    """
+    raw = json.load(open(path))
+    items = raw.items() if isinstance(raw, dict) else (
+        (r.get("video_id") or r.get("video"), r) for r in raw
+    )
+    d: Dict[str, int] = {}
+    for k, v in items:
+        if k is None:
+            continue
+        if isinstance(v, dict):
+            if v.get("ok") is False:
+                continue
+            ef = v.get("est_frames_1fps") or v.get("duration_sec")
+        else:
+            ef = v
+        if ef:
+            d[os.path.splitext(os.path.basename(str(k)))[0]] = int(round(float(ef)))
+    rank0_print(f"[phase2] durations_json: {len(d)} clips for depth-class grouping "
+                f"({os.path.basename(path)}, parsed once)")
+    return d
+
 
 class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
     """Plan-X Phase 2 dataset. Emits ONE whole-video ``compression_part`` per video
@@ -113,29 +151,7 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
         dj = getattr(self.data_args, "durations_json", None)
         if dj and os.path.exists(dj):
             try:
-                raw = json.load(open(dj))
-                # Accepts two shapes: a ``{clip: est_frames_1fps | {est_frames_1fps: ...}}``
-                # map, OR the list-of-records the ffprobe scan emits
-                # (``anno_data/internVid_durations.json``:
-                #  ``[{"video"/"video_id", "est_frames_1fps"|"duration_sec", "ok"}, ...]``).
-                items = raw.items() if isinstance(raw, dict) else (
-                    (r.get("video_id") or r.get("video"), r) for r in raw
-                )
-                d = {}
-                for k, v in items:
-                    if k is None:
-                        continue
-                    if isinstance(v, dict):
-                        if v.get("ok") is False:
-                            continue
-                        ef = v.get("est_frames_1fps") or v.get("duration_sec")
-                    else:
-                        ef = v
-                    if ef:
-                        stem = os.path.splitext(os.path.basename(str(k)))[0]
-                        d[stem] = int(round(float(ef)))
-                self._durations = d
-                rank0_print(f"[phase2] durations_json: {len(d)} clips for depth-class grouping")
+                self._durations = _load_durations_map(dj, os.path.getmtime(dj))
             except Exception as e:  # pragma: no cover
                 rank0_print(f"[phase2] failed to load durations_json {dj}: {e}")
 
@@ -254,7 +270,7 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
                 ]
         return super()._convert_normal(data_dict)
 
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, i, _retries: int = 0) -> Dict[str, torch.Tensor]:
         try:
             sample = self.list_data_dict[i]
             if self.online_mode:
@@ -288,13 +304,12 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
             max_len = self.vlprocessor.tokenizer.model_max_length
             seq_len = int(data_dict["input_ids"].shape[-1])
             if seq_len > max_len:
-                backup_idx = random.randint(0, len(self.list_data_dict) - 1)
                 logger.warning(
                     "Sample %s: pre-compression length %d exceeds model_max_length %d (%d frames). "
-                    "Lower --max_frames or --fixed_frames. Retrying with sample %s.",
-                    i, seq_len, max_len, total_frames, backup_idx,
+                    "Lower --max_frames or --fixed_frames. Skipping.",
+                    i, seq_len, max_len, total_frames,
                 )
-                return self.__getitem__(backup_idx)
+                return self._backup_sample(i, _retries)
 
             image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
             total_vision_tokens = int((data_dict["input_ids"] == image_token_id).sum().item())
@@ -303,10 +318,14 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
             )
 
             _target_f, _max_units, m_tok, _k = self._fold_knobs()
-            if total_vision_tokens < m_tok:
-                raise ValueError(
-                    f"sample {i}: {total_vision_tokens} image tokens (< M={m_tok}); too small to fold"
-                )
+            # Even the smallest possible output -- U=1, one fold unit -- is M rows, and
+            # the arch writes them back INTO the part they replace. Below that the
+            # sample cannot be compressed at all, so warn and draw another rather than
+            # raising into the generic `except` (which logs a full traceback per
+            # sample). Same guard as Phase 1's, at the two-stage floor.
+            if self._reject_if_too_small(i, m_tok, total_vision_tokens, total_frames,
+                                         f"M={m_tok}, the U=1 floor"):
+                return self._backup_sample(i, _retries)
             tpf = total_vision_tokens // total_frames
             N = self._segment_count(total_frames)
             seed = (int(self._epoch) * 1_000_003 + int(i)) & 0x7FFFFFFF
@@ -361,13 +380,21 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
             data_dict["compression_frame_sec"] = [frame_sec]
             tok = self.vlprocessor.tokenizer
             first_ts = float(ts[0]) if len(ts) else 0.0
-            old_ts_len = len(tok.encode(f"Time {round(first_ts, 1)}s:", add_special_tokens=False))
+            # A still image renders as a bare `<image>` -- there is no "Time X.0s:"
+            # prefix in front of it, so claiming one here would make
+            # `prepare_inputs_labels_for_multimodal` cut that many tokens of REAL
+            # prompt text before the image. `compression_is_image` also stops the
+            # per-unit `Time:{a}s-{b}s:` range being emitted for the part.
+            old_ts_len = 0 if is_still_image else len(
+                tok.encode(f"Time {round(first_ts, 1)}s:", add_special_tokens=False))
             data_dict["compression_ts_info"] = [(old_ts_len, [])]
+            data_dict["compression_is_image"] = [is_still_image]
 
+        except TooManySampleRejections:
+            raise
         except Exception:
-            backup_idx = random.randint(0, len(self.list_data_dict) - 1)
-            logger.exception("Failed to process sample %s. Fallback index: %s.", i, backup_idx)
-            return self.__getitem__(backup_idx)
+            logger.exception("Failed to process sample %s. Drawing a replacement.", i)
+            return self._backup_sample(i, _retries)
         return data_dict
 
 
@@ -391,6 +418,11 @@ class Phase2ModelArguments(base.ModelArguments):
         metadata={"help": "Warm-start for the qbase (token_compressor.stage1.*): a bare .pt/.bin OR an "
                           "HF checkpoint dir. Leave empty when the whole compressor is warm-started via "
                           "--pretrained_compressor_path."},
+    )
+    compressor_gradient_checkpointing: bool = field(
+        default=False,
+        metadata={"help": "Recompute the qbase / fold layer activations in backward. "
+                          "--gradient_checkpointing only covers the LLM, never the compressor."},
     )
     stage2_n_summary_tokens: int = field(default=64, metadata={"help": "M readout tokens per unit."})
     stage2_d_model: int = field(
@@ -428,22 +460,8 @@ class Phase2DataArguments(base.DataArguments):
     variance_cold_frac: float = field(
         default=0.15, metadata={"help": "Cold-fold window: fraction of training with U narrowed to min(3, N//4)."},
     )
-    # Dynamic-HW knobs. Leave --force_image_size UNSET so the image processor keeps
-    # each video's native aspect ratio / resolution (smart_resize), scaled to a
-    # per-VIDEO token budget shared across its frames. The two-stage compressor
-    # still emits a fixed U*M <= 320 tokens to the LLM, so a large budget only
-    # costs the frozen encoder forward + the qbase cross-attention KV.
-    vision_max_tokens: Optional[int] = field(
-        default=None,
-        metadata={"help": "Override image_processor.max_tokens: total vision-token budget PER VIDEO "
-                          "(shared across its frames). ~= tokens/frame * n_frames. None keeps the "
-                          "checkpoint value (16384). Ignored when --force_image_size is set."},
-    )
-    vision_min_tokens: Optional[int] = field(
-        default=None,
-        metadata={"help": "Override image_processor.min_tokens (per-frame floor). None keeps the "
-                          "checkpoint value (16 -> 4x4 grid)."},
-    )
+    # --vision_max_tokens / --vision_min_tokens now live on base.DataArguments
+    # (Phase 1 needs them too, for the still-image stream) and are inherited.
 
 
 # ---------------------------------------------------------------------------

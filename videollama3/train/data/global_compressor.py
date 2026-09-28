@@ -19,6 +19,7 @@ import torch
 import transformers
 
 from videollama3.constants import DEFAULT_IMAGE_TOKEN
+from videollama3.model.compressor import adaptive_segment_count
 from videollama3.train.data import common
 from videollama3.train.data.common import cast_pixel_values_, logger, rank0_print
 from videollama3.train.data.compressor import (
@@ -28,7 +29,15 @@ from videollama3.train.data.compressor import (
 )
 from videollama3.train.data.supervised import ConcatDatasetWithLengths, LazySupervisedDataset
 
+
+class TooManySampleRejections(RuntimeError):
+    """Raised when a dataset rejects `MAX_SAMPLE_RETRIES` samples in a row. Its own
+    class so the per-sample `except Exception` handlers re-raise it instead of
+    catching it and starting yet another retry chain around it."""
+
+
 __all__ = [
+    "TooManySampleRejections",
     "get_video_content",
     "resample_indices",
     "resample_video_frames",
@@ -150,7 +159,83 @@ class GlobalCompressorLazySupervisedDataset(LazySupervisedDataset):
         # on it. docs/two_stage_compression_design.md §4 Phase 2.
         self.qbase_only = bool(qbase_only)
 
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+    # Bound on the retry chain a rejected sample starts. Each rejection recurses into
+    # another random index, so a registry where EVERY sample is rejected (all-thumbnail,
+    # or model_max_length set far too low) would otherwise recurse until the stack dies
+    # -- a confusing hang instead of a clear error.
+    MAX_SAMPLE_RETRIES = 50
+
+    def _backup_sample(self, i: int, retries: int) -> Dict[str, torch.Tensor]:
+        """Draw a different sample in place of a rejected one."""
+        if retries >= self.MAX_SAMPLE_RETRIES:
+            raise TooManySampleRejections(
+                f"{type(self).__name__}[{self.dataset_name}]: {retries} consecutive samples "
+                f"rejected starting at index {i}. This is a dataset problem, not a flaky "
+                f"sample -- check the warnings above (compressed output larger than the "
+                f"sample's vision tokens, or pre-compression length over --model_max_length)."
+            )
+        backup_idx = random.randint(0, len(self.list_data_dict) - 1)
+        return self.__getitem__(backup_idx, _retries=retries + 1)
+
+    def _segment_count(self, n_frames: int) -> int:
+        """``N`` for this sample -- Phase 1's fixed-frames rule, a pure function of
+        the frame count and identical to the model's ``segment_count_for``, so no
+        decode is needed here. Phase 2/3 override it."""
+        ma = self.model_args
+        tf = int(getattr(ma, "segment_target_frames", 4)) if ma is not None else 4
+        fe = int(getattr(ma, "segment_force_every", 8)) if ma is not None else 8
+        return adaptive_segment_count(int(n_frames), tf, fe)
+
+    def _compressed_len(self, n_frames: int) -> int:
+        """Rows the compressor will emit -- mirrors
+        ``TransformerDecoderFlatCompressor.output_len_for``."""
+        ma = self.model_args
+        k = int(getattr(ma, "num_queries", 64)) if ma is not None else 64
+        if ma is not None and not getattr(ma, "adaptive_segmentation", False):
+            return k
+        return self._segment_count(n_frames) * k
+
+    def _reject_if_too_small(self, i: int, n_out: int, total_vision_tokens: int,
+                             total_frames: int, what: str = "") -> bool:
+        """True when this sample's compressed output cannot fit in the vision tokens
+        it replaces, so the caller must skip it.
+
+        ``compress_visual_tokens_with_compressor`` writes the compressed rows back
+        INTO the part they replace (``replace_mask[ps : ps + n_out]``), so a sample
+        whose grid holds fewer tokens than the compressor emits silently spills into
+        the next part and dies on a shape mismatch. For a still image that is exactly
+        ``num_queries``: one frame is ONE segment, so it emits ``K`` rows into a part
+        holding only that image's own tokens, and anything under ~224x224 px is below
+        it (measured: 27.6 % of videoxl ``pretrain.json`` are 100x100-240x160
+        thumbnails). ``dataset_util/build_phase1_image_blend.py`` already drops those
+        at build time and ``--vision_min_tokens K`` upscales the rest; this is the
+        last-resort guard for a registry built without either."""
+        if n_out <= total_vision_tokens:
+            return False
+        cls = type(self)
+        n_seen = getattr(cls, "_too_small_count", 0) + 1
+        cls._too_small_count = n_seen
+        k = int(getattr(self.model_args, "num_queries", 64)) if self.model_args is not None else 64
+        if n_seen == 1:
+            # Spell out the remedy once; the rest are one-liners so a systematically
+            # bad registry does not bury the rest of the log.
+            logger.warning(
+                "Sample %s of %s: the compressor emits %d rows%s but the sample holds only %d "
+                "vision tokens (%d frame(s)), so its output would overflow the part it replaces. "
+                "SKIPPING. A still image is ONE segment and therefore needs >= num_queries (%d) "
+                "tokens, i.e. roughly 224x224 px. Rebuild the registry with "
+                "dataset_util/build_phase1_image_blend.py (it drops sub-K images at native "
+                "resolution) or pass --vision_min_tokens %d to upscale them instead. Further "
+                "occurrences in this dataset are logged one line each, then every 100th.",
+                i, self.dataset_name, n_out, f" ({what})" if what else "",
+                total_vision_tokens, total_frames, k, k,
+            )
+        elif n_seen <= 20 or n_seen % 100 == 0:
+            logger.warning("Sample %s of %s: only %d vision tokens < %d emitted -- skipped (#%d).",
+                           i, self.dataset_name, total_vision_tokens, n_out, n_seen)
+        return True
+
+    def __getitem__(self, i, _retries: int = 0) -> Dict[str, torch.Tensor]:
         try:
             sample = self.list_data_dict[i]
             if self.online_mode:
@@ -190,13 +275,12 @@ class GlobalCompressorLazySupervisedDataset(LazySupervisedDataset):
             max_len = self.vlprocessor.tokenizer.model_max_length
             seq_len = int(data_dict["input_ids"].shape[-1])
             if seq_len > max_len:
-                backup_idx = random.randint(0, len(self.list_data_dict) - 1)
                 logger.warning(
                     "Sample %s: pre-compression length %d exceeds model_max_length %d (%d frames). "
-                    "Lower --max_frames or --fixed_frames. Retrying with sample %s.",
-                    i, seq_len, max_len, total_frames, backup_idx,
+                    "Lower --max_frames or --fixed_frames. Skipping.",
+                    i, seq_len, max_len, total_frames,
                 )
-                return self.__getitem__(backup_idx)
+                return self._backup_sample(i, _retries)
 
             image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
             total_vision_tokens = int((data_dict["input_ids"] == image_token_id).sum().item())
@@ -205,13 +289,27 @@ class GlobalCompressorLazySupervisedDataset(LazySupervisedDataset):
             )
             # One part covering every vision token of the sample. Indices count image
             # tokens only, not sequence positions.
+            n_out = self._compressed_len(total_frames)
+            if self._reject_if_too_small(i, n_out, total_vision_tokens, total_frames,
+                                         f"N={self._segment_count(total_frames)} x "
+                                         f"K={self._compressed_len(1)}"):
+                return self._backup_sample(i, _retries)
+
             data_dict["compression_parts"] = [[0, total_vision_tokens]]
             data_dict["compression_ts_info"] = build_range_ts_info(content, self.vlprocessor.tokenizer)
+            # A still image has no timeline. The rewrite above dropped its timestamp,
+            # so the chat template renders a bare `<image>` with no "Time X.0s:"
+            # prefix and `build_range_ts_info` returns `(0, [])` -- nothing to cut
+            # back and no range string to emit on this (single-stage) path. The flag
+            # carries that to the model so the two-stage path does not emit a
+            # degenerate `Time:0s-0s:` either (videollama3_arch.py).
+            data_dict["compression_is_image"] = [is_still_image]
 
+        except TooManySampleRejections:
+            raise
         except Exception:
-            backup_idx = random.randint(0, len(self.list_data_dict) - 1)
-            logger.exception("Failed to process sample %s. Fallback index: %s.", i, backup_idx)
-            return self.__getitem__(backup_idx)
+            logger.exception("Failed to process sample %s. Drawing a replacement.", i)
+            return self._backup_sample(i, _retries)
         return data_dict
 
 

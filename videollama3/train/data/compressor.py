@@ -254,6 +254,7 @@ class DataCollatorWithCompressor:
         new_compression_seed: List[int] = []
         new_compression_frame_sec: List[List[int]] = []
         new_compression_qbase_only: List[bool] = []
+        new_compression_is_image: List[bool] = []
         accumulated_length = 0
         image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
         for sample_idx in range(0, len(input_ids)):
@@ -280,6 +281,11 @@ class DataCollatorWithCompressor:
             new_compression_qbase_only.extend(
                 instances[sample_idx].get(
                     "compression_qbase_only", [False] * len(compression_parts[sample_idx])
+                )
+            )
+            new_compression_is_image.extend(
+                instances[sample_idx].get(
+                    "compression_is_image", [False] * len(compression_parts[sample_idx])
                 )
             )
             # Full compression parts (same offset logic).
@@ -317,6 +323,10 @@ class DataCollatorWithCompressor:
             batch["compression_frame_sec"] = new_compression_frame_sec
         if any(new_compression_qbase_only):
             batch["compression_qbase_only"] = new_compression_qbase_only
+        # Only sent when the batch actually holds a still image, so a video-only
+        # step's kwargs are byte-identical to before this flag existed.
+        if any(new_compression_is_image):
+            batch["compression_is_image"] = new_compression_is_image
 
         return batch
 

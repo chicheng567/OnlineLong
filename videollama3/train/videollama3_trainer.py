@@ -261,6 +261,49 @@ class VideoLLaMA3Trainer(Trainer):
                       "per micro-step in _prepare_inputs, not grad_acc at a time")
         return dataloader
 
+    def get_batch_samples(self, epoch_iterator, num_batches, device):
+        """With ``--dataloader_pin_memory False``, copy each batch out of /dev/shm the
+        moment it arrives.
+
+        Worker batches reach the main process as /dev/shm-backed tensors. The pin
+        thread normally copies them out (into pinned memory) straight away; without
+        it they stay in /dev/shm for as long as they are held, and this method holds
+        the WHOLE accumulation window. At --vision_max_tokens 65536 a batch is ~1.1 GiB,
+        so window (16) + prefetch (16) x 8 ranks ~ 280 GiB > the 256 GiB /dev/shm ->
+        worker Bus error (measured). Pinning instead is not an option either: the
+        CUDA host caching allocator never returns blocks, and the variable-size
+        batches grew it to ~170 GiB per rank (1.38 TiB total), pinning the container
+        at its cgroup limit and stalling the data workers in reclaim (measured).
+        A plain copy is freed normally once the micro-step drops it.
+        """
+        if self.args.dataloader_pin_memory or not self.args.dataloader_num_workers:
+            return super().get_batch_samples(epoch_iterator, num_batches, device)
+
+        def _unshare(x):
+            if torch.is_tensor(x):
+                return x.clone() if x.is_shared() else x
+            if isinstance(x, dict):
+                return type(x)((k, _unshare(v)) for k, v in x.items())
+            if isinstance(x, (list, tuple)):
+                return type(x)(_unshare(v) for v in x)
+            return x
+
+        batch_samples = []
+        for _ in range(num_batches):
+            try:
+                batch_samples.append(_unshare(next(epoch_iterator)))
+            except StopIteration:
+                break
+        if not getattr(self, "_unshare_logged", False) and self.args.local_rank in (0, -1):
+            self._unshare_logged = True
+            n_shared = sum(
+                1 for b in batch_samples for v in b.values() if torch.is_tensor(v) and v.is_shared()
+            )
+            print(f"[trainer] get_batch_samples: {len(batch_samples)} batches copied out of "
+                  f"/dev/shm ({n_shared} tensors still shared)", flush=True)
+        num_items_in_batch = self._get_num_items_in_batch(batch_samples, device)
+        return batch_samples, num_items_in_batch
+
     def training_step(self, *args, **kwargs):
         """VL3_NAN_PROBE=1: tick the per-step probe counter and, after backward,
         name the first parameter GROUP whose grad (or value) went non-finite.
@@ -368,8 +411,12 @@ class VideoLLaMA3Trainer(Trainer):
         l_partial = None
         l_full = None
 
+        stream_ce = None
         if parts:
             l_partial, outs_partial = self._ce_forward(model, inputs, parts, ts, label="partial", num_items_in_batch=num_items_in_batch)
+            # Read the per-stream split off the model NOW: with use_dual_forward the
+            # second (full) forward overwrites the stash.
+            stream_ce = self._pop_stream_ce(model)
             loss = self.partial_loss_weight * l_partial
             outputs = outs_partial
 
@@ -385,6 +432,20 @@ class VideoLLaMA3Trainer(Trainer):
             log_dict["loss_partial"] = (self.partial_loss_weight * l_partial).detach().item()
         if l_full is not None:
             log_dict["loss_full"] = (self.full_loss_weight * l_full).detach().item()
+
+        # Per-stream CE, when the batch carried `compression_is_image` (a Phase-1
+        # blend with the still-image stream in it). These are per-token means over
+        # THIS micro-batch, so loss_img and loss_vid are comparable to each other and
+        # across steps -- but NOT to loss_partial above, which is sum/num_items_in_batch
+        # over the whole accumulated batch and is therefore ~1/GAS of a token mean.
+        if stream_ce:
+            n_tot = sum(n for _, n in stream_ce.values())
+            for key, short in (("image", "img"), ("video", "vid")):
+                tot, n = stream_ce.get(key, (0.0, 0))
+                if n:
+                    log_dict[f"loss_{short}"] = tot / n
+            if n_tot:
+                log_dict["frac_tok_img"] = stream_ce.get("image", (0.0, 0))[1] / n_tot
 
         # Option B: distribution-match aux loss stashed on the token compressor
         # during the CE forward (compressor._distribution_match_loss). Added here so
@@ -410,6 +471,25 @@ class VideoLLaMA3Trainer(Trainer):
             self.log(log_dict)
 
         return (loss, outputs) if return_outputs else loss
+
+    def _pop_stream_ce(self, model):
+        """Pop the per-stream CE split (`{"image": (sum, n), "video": (sum, n)}`) the
+        last CE forward stashed on the model, or None when the batch carried no
+        `compression_is_image` (video-only step, or a script that never sets it)."""
+        inner = None
+        try:
+            inner = self.accelerator.unwrap_model(model)
+        except Exception:
+            for attr in ("module", "base_model"):
+                cand = getattr(model, attr, None)
+                if cand is not None and hasattr(cand, "_last_stream_ce"):
+                    inner = cand
+                    break
+        if inner is None:
+            return None
+        out = getattr(inner, "_last_stream_ce", None)
+        inner._last_stream_ce = None
+        return out
 
     def _compressor_distr_loss(self, model):
         """Return the already-weighted Option-B distribution-match loss stashed on

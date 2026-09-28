@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Phase-1 (qbase, <180 s) InternVid annotation + meta.
 
-Filters ``anno_online/internvid_qwen3vl.json`` to clips whose ffprobed duration is
+Filters ``anno_online/internvid/pool_all_qwen3vl.json`` to clips whose ffprobed duration is
 < --max_seconds (default 180) and whose .mp4 is on disk, then writes:
   * <anno_out>       LLaVA-shape annotation (subset, same schema as the input)
   * <meta_out>       anno_data-style meta: { name: {annotation, data_root, ...} }
 
 Usage:
   python dataset_util/build_internvid_phase1_anno.py \
-    --anno anno_online/internvid_qwen3vl.json \
+    --anno anno_online/internvid/pool_all_qwen3vl.json \
     --durations anno_data/internVid_durations.json \
     --data_root /share/dataset/internVid \
     --max_seconds 180 \
-    --anno_out anno_online/internvid_qwen3vl_lt180.json \
+    --anno_out anno_online/internvid/phase1_lt180.json \
     --meta_out anno_data/internvid_qwen3vl_lt180.json
 """
 import argparse
@@ -22,12 +22,12 @@ import os
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--anno", default="anno_online/internvid_qwen3vl.json")
+    p.add_argument("--anno", default="anno_online/internvid/pool_all_qwen3vl.json")
     p.add_argument("--durations", default="anno_data/internVid_durations.json")
     p.add_argument("--data_root", default="/share/dataset/internVid")
     p.add_argument("--max_seconds", type=float, default=180.0)
     p.add_argument("--min_seconds", type=float, default=0.0)
-    p.add_argument("--anno_out", default="anno_online/internvid_qwen3vl_lt180.json")
+    p.add_argument("--anno_out", default="anno_online/internvid/phase1_lt180.json")
     p.add_argument("--meta_out", default="anno_data/internvid_qwen3vl_lt180.json")
     p.add_argument("--name", default=None, help="meta dataset name (default: anno_out stem)")
     p.add_argument("--limit", type=int, default=0, help="cap kept entries (debug)")

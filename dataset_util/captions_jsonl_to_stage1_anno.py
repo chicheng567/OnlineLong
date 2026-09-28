@@ -30,7 +30,7 @@ Example
 -------
     python dataset_util/captions_jsonl_to_stage1_anno.py \
         --captions recaption/qwen3vl/captions.jsonl \
-        --anno_out anno_online/internvid_qwen3vl.json \
+        --anno_out anno_online/internvid/pool_all_qwen3vl.json \
         --meta_out anno_data/internvid_qwen3vl.json \
         --data_root /share/dataset/internVid
 

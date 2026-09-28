@@ -291,6 +291,21 @@ class Videollama3MetaForCausalLM(ABC):
             if not two_stage:
                 n_frames = part_len // (h * w)
                 n_out = _compressed_len(compressor, n_frames, h, w)
+                # Same contract the two-stage branch asserts below: the compressed
+                # rows are written back INSIDE the part they replace, so a part that
+                # holds fewer tokens than the compressor emits silently spills into
+                # the next part's region (or is clamped at the tensor end), the
+                # keeping/replace masks under-count, and `vision_tokens[replace_mask]
+                # = compressed` dies on an opaque broadcast error. The Phase-1
+                # dataset rejects such samples up front, but eval / inference paths
+                # build compression_parts themselves and do not.
+                assert n_out <= part_len, (
+                    f"compression part {len(part_starts) - 1} emits {n_out} rows but holds only "
+                    f"{part_len} vision tokens (grid_hw=({h}, {w}), n_frames={n_frames}). A part's "
+                    f"output must fit in the part it replaces: an adaptive-segment qbase emits "
+                    f"N*K, so the per-frame grid needs >= K tokens (a still image is ONE segment "
+                    f"and needs >= K on its own). Raise --vision_min_tokens."
+                )
                 replace_mask[part[0]: part[0] + n_out] = True
         compression_cu_seqlens = torch.tensor(compression_cu_seqlens, device=device, dtype=torch.long)
 
@@ -456,6 +471,36 @@ class Videollama3MetaForCausalLM(ABC):
         out = torch.where(kind == 1, qbase_out, raw_out)
         out = torch.where(kind == 2, fold_out, out)
         return out
+
+    @staticmethod
+    def image_stream_token_mask(position_ids, compression_is_image):
+        """Per-token bool over the (rewritten) sequence: does this position belong to
+        a still-image sample? ``None`` when the mapping cannot be trusted.
+
+        Used only for logging (the trainer's per-stream CE split): a Phase-1 blend
+        holds two very different streams -- ~40 % still images, ~60 % video clips --
+        flattened into one batch-size-1 sequence, and a single `loss_partial` cannot
+        say which of them is moving.
+
+        The collator restarts ``position_ids`` at 0 for every sample it flattens in,
+        and ``prepare_inputs_labels_for_multimodal`` preserves those resets (text runs
+        re-anchor at each sample start, placeholder blocks always sit at ``cur > 0``),
+        so ``cumsum(position_ids == 0) - 1`` is the sample index of every token. The
+        Phase-1/2/3 datasets emit exactly ONE compression part per sample, so
+        ``compression_is_image`` is indexed by that same counter -- which is why this
+        bails out unless the two counts agree (the windowed compressor SFT path emits
+        several parts per sample and never sets the flag).
+        """
+        if position_ids is None or not compression_is_image:
+            return None
+        starts = position_ids == 0
+        if int(starts.sum()) != len(compression_is_image):
+            return None
+        flags = torch.as_tensor([bool(x) for x in compression_is_image],
+                                device=position_ids.device, dtype=torch.bool)
+        sample_idx = starts.long().cumsum(-1).sub_(1).clamp_(0, flags.numel() - 1)
+        return flags[sample_idx]
+
     
     def _time_range_token_ids(self, a_sec: int, b_sec: int) -> List[int]:
         """`Time:{a}s-{b}s:` as token ids, assembled from the digit / fragment
@@ -489,6 +534,7 @@ class Videollama3MetaForCausalLM(ABC):
         compression_seed: Optional[List[int]] = None,
         compression_frame_sec: Optional[List[List[int]]] = None,
         compression_qbase_only: Optional[List[bool]] = None,
+        compression_is_image: Optional[List[bool]] = None,
     ):
         B, N = input_ids.shape
         device = input_ids.device
@@ -580,6 +626,13 @@ class Videollama3MetaForCausalLM(ABC):
                 )
 
             cs_id, ce_id = self.config.compression_start_token_id, self.config.compression_end_token_id
+            # A still image is compressed through the same whole-video path (T = 1,
+            # one segment) but has no timeline, so it gets no "Time:{a}s-{b}s:"
+            # range -- the frozen LLM never saw a timestamp in front of an image and
+            # `Time:0s-0s:` is noise. The dataset sets this per part; absent (every
+            # eval script, every video-only batch) means "all video", the behaviour
+            # before the flag existed.
+            is_image_part = list(compression_is_image or [])
             prev = 0
             parts_with_hw = sorted(zip(compression_parts, grid_hws), key=lambda pair: pair[0][0])
             for part_idx, (part, (part_h, part_w)) in enumerate(parts_with_hw):
@@ -605,7 +658,13 @@ class Videollama3MetaForCausalLM(ABC):
                     frame_sec = None
                     if compression_frame_sec is not None and part_idx < len(compression_frame_sec):
                         frame_sec = compression_frame_sec[part_idx]
+                    part_is_image = part_idx < len(is_image_part) and bool(is_image_part[part_idx])
                     for m in units_by_win.get(part_idx, []):
+                        if part_is_image:
+                            _append_ids([cs_id])
+                            _append_placeholders(int(m["n_out"]), (m["pos_offsets"], int(m["unit_span"])))
+                            _append_ids([ce_id])
+                            continue
                         if frame_sec:
                             nfs = len(frame_sec)
                             a_sec = frame_sec[min(m["a_frame"], nfs - 1)]
