@@ -149,10 +149,15 @@ class GlobalCompressorLazySupervisedDataset(LazySupervisedDataset):
     shared with the still-image path.
     """
 
-    def __init__(self, *args, fixed_frames: int = 0, model_args=None, qbase_only: bool = False, **kwargs):
+    def __init__(self, *args, fixed_frames: int = 0, model_args=None, qbase_only: bool = False,
+                 raw_frames: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_args = model_args
         self.fixed_frames = fixed_frames
+        # LLM-SFT raw-frame stream: when True, this dataset's samples are fed to the LLM
+        # UNCOMPRESSED (no compression part). Set per meta-JSON entry ("raw_frames":
+        # true); only QbaseLLMSFTDataset (videollama3/train/qbase_llm_sft.py) acts on it.
+        self.raw_frames = bool(raw_frames)
         # Phase-2 pure-qbase replay: when True, this dataset's samples bypass the
         # unit split + fold and route straight through stage-1 (N*K qbase tokens).
         # Set per meta-JSON entry ("qbase_only": true); only Phase2FoldDataset acts
@@ -337,6 +342,7 @@ def make_global_compressor_data_module(
                 fixed_frames=data_args.fixed_frames,
                 model_args=model_args,
                 qbase_only=dataset_cfg.get("qbase_only", False),
+                raw_frames=dataset_cfg.get("raw_frames", False),
             )
             for dataset_name, dataset_cfg in ds_collection.items()
         ]

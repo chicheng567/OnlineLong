@@ -78,6 +78,21 @@ class ConcatDatasetWithLengths(ConcatDataset):
     def compression_depths(self):
         return self._compression_depths
 
+    @property
+    def encode_costs(self):
+        """Concatenated per-sample ``encode_costs`` (``--group_by_encode_cost``), or
+        None unless every sub-dataset has them. Lazy: only a run that asks pays for it."""
+        if not hasattr(self, "_encode_costs"):
+            costs = []
+            for dataset in self.datasets:
+                c = getattr(dataset, "encode_costs", None)
+                if c is None:
+                    costs = None
+                    break
+                costs.extend(c)
+            self._encode_costs = costs
+        return self._encode_costs
+
 
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""

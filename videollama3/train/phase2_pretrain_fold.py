@@ -235,6 +235,12 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
         cap = int(getattr(self.data_args, "max_frames", 0) or 0)
         out = []
         for s in self.list_data_dict:
+            if s.get("image") and not s.get("video"):
+                # A still image is one frame -> one segment (T=1). Without this it
+                # fell to the missing-duration default (32) and was grouped with
+                # mid-depth videos.
+                out.append(self._segment_count(1))
+                continue
             vid = s.get("video")
             vid = vid[0] if isinstance(vid, list) and vid else vid
             stem = os.path.splitext(os.path.basename(str(vid)))[0] if vid else None
@@ -504,9 +510,12 @@ def _configure_phase2_image_processor(image_processor, model_args, data_args) ->
         image_processor.max_tokens = int(mt)
     if mn:
         image_processor.min_tokens = int(mn)
+    if data_args.vision_max_tokens_per_frame:
+        image_processor.max_tokens_per_frame = int(data_args.vision_max_tokens_per_frame)
     rank0_print(
         f"[phase2] image processor: force_size={image_processor.force_size}, "
-        f"min_tokens={image_processor.min_tokens}, max_tokens={image_processor.max_tokens} "
+        f"min_tokens={image_processor.min_tokens}, max_tokens={image_processor.max_tokens}, "
+        f"max_tokens_per_frame={image_processor.max_tokens_per_frame} "
         f"(dynamic HW unless force_size is set; max_tokens is a per-video budget)"
     )
 

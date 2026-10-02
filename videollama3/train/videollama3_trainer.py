@@ -200,6 +200,7 @@ class LengthGroupedSampler(Sampler):
         lengths: Optional[List[int]] = None,
         generator=None,
         group_by_modality: bool = False,
+        seed_fn=None,
     ):
         if lengths is None:
             raise ValueError("Lengths must be provided.")
@@ -209,15 +210,24 @@ class LengthGroupedSampler(Sampler):
         self.lengths = lengths
         self.generator = generator
         self.group_by_modality = group_by_modality
+        # seed_fn() -> int, called once per __iter__ (i.e. per epoch): every rank
+        # iterates its OWN copy of this sampler and keeps only its share of the
+        # batches, so the permutation must be identical across ranks. generator=None
+        # falls back to the global torch RNG, which is rank-consistent only as long
+        # as nothing rank-dependent has consumed it.
+        self.seed_fn = seed_fn
 
     def __len__(self):
         return len(self.lengths)
 
     def __iter__(self):
+        generator = self.generator
+        if self.seed_fn is not None:
+            generator = torch.Generator().manual_seed(int(self.seed_fn()))
         if self.group_by_modality:
-            indices = get_modality_length_grouped_indices(self.lengths, self.batch_size, self.world_size, generator=self.generator)
+            indices = get_modality_length_grouped_indices(self.lengths, self.batch_size, self.world_size, generator=generator)
         else:
-            indices = get_length_grouped_indices(self.lengths, self.batch_size, self.world_size, generator=self.generator)
+            indices = get_length_grouped_indices(self.lengths, self.batch_size, self.world_size, generator=generator)
         return iter(indices)
 
 
@@ -310,7 +320,17 @@ class VideoLLaMA3Trainer(Trainer):
 
         Phase 3 reports grad_norm=nan several steps before the forward loss goes
         nan, so the parameter scan is what localises the blow-up; the per-stage
-        activation probes in compressor.py say which forward stage fed it."""
+        activation probes in compressor.py say which forward stage fed it.
+
+        Also pins DeepSpeed's grad-accumulation boundary to the Trainer's. accelerate
+        1.3.0 never forwards it, so DeepSpeed steps on its own ``micro_steps % GA``
+        counter; an epoch whose micro-batch count is not a multiple of GA (e.g.
+        8543 = 533*16 + 15) knocks it out of phase, and the Trainer's per-step
+        ``model.zero_grad()`` then wipes 15/16 of every later window's bf16 ZeRO-1
+        grads (measured: grad_norm 0.117 -> 0.022 at the epoch-2 boundary)."""
+        if self.is_deepspeed_enabled:
+            self.model_wrapped.set_gradient_accumulation_boundary(
+                bool(self.accelerator.sync_gradients))
         import os as _os
         probe = _os.environ.get("VL3_NAN_PROBE", "")
         if not probe:
@@ -517,6 +537,26 @@ class VideoLLaMA3Trainer(Trainer):
         dataset = dataset if dataset is not None else self.train_dataset
         if dataset is None or not has_length(dataset):
             return None
+
+        if getattr(self.args, "group_by_encode_cost", False):
+            # One megabatch == one optimizer step (world x grad_acc x per-device
+            # samples, a uniform random draw as before); inside it the samples are
+            # dealt into world x grad_acc micro-batches of equal estimated cost, so no
+            # rank idles at the step-boundary allreduce waiting for the one that drew
+            # the heaviest window. The step's sample SET is unchanged in distribution.
+            costs = getattr(dataset, "encode_costs", None)
+            if costs is not None and len(costs) == len(dataset):
+                # Seeded by epoch from the trainer state: identical on every rank, and
+                # a resume re-draws the resumed epoch's permutation before skipping.
+                return LengthGroupedSampler(
+                    self.args.train_batch_size,
+                    world_size=self.args.world_size * self.args.gradient_accumulation_steps,
+                    lengths=list(costs),
+                    seed_fn=lambda: self.args.seed + int(self.state.epoch + 1e-6),
+                )
+            if self.args.local_rank in (-1, 0):
+                print("[trainer] group_by_encode_cost set but dataset has no usable "
+                      "`encode_costs` (media_geometry_json?); falling back to default sampler.")
 
         if getattr(self.args, "group_by_compression_depth", False):
             depths = getattr(dataset, "compression_depths", None)
@@ -736,13 +776,20 @@ class VideoLLaMA3Trainer(Trainer):
                   f"{len(lrs)} configured LRs were recorded -- skipping (mismatched group "
                   f"layout vs the checkpoint?).")
             return
-        for g, lr in zip(groups, lrs):
-            g["lr"] = lr
+        # The scheduler only rewrites g["lr"] AFTER the next optimizer step, so the
+        # live lr must already be the scheduled value at the restored step --
+        # base_lr * lambda(last_epoch) -- not the bare base LR (which made the first
+        # resumed step run at the peak LR, e.g. 3e-5 instead of ~1.6e-5 at step 500).
+        lambdas = getattr(self.lr_scheduler, "lr_lambdas", None)
+        last = getattr(self.lr_scheduler, "last_epoch", None)
+        for i, (g, lr) in enumerate(zip(groups, lrs)):
             g["initial_lr"] = lr
+            g["lr"] = lr * lambdas[i](last) if lambdas and last is not None else lr
         if hasattr(self.lr_scheduler, "base_lrs"):
             self.lr_scheduler.base_lrs = list(lrs)
         print(f"[post-resume LR reapply] reapplied this run's configured per-group LRs {lrs} "
-              f"(overriding whatever the checkpoint's optimizer/scheduler state restored).")
+              f"(overriding whatever the checkpoint's optimizer/scheduler state restored); "
+              f"live lr at step {last}: {[g['lr'] for g in groups]}")
 
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'is_alignment', False):

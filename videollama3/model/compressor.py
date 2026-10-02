@@ -342,6 +342,17 @@ def adaptive_segment_count(n_frames: int, target_frames: int = 4, force_every: i
     return N
 
 
+def pick_target_frames(choices, seed, default: int) -> int:
+    """Per-sample frames/segment for the mixed-granularity qbase stream
+    (``--segment_target_frames_choices``): ``choices[seed % len(choices)]`` when both
+    are given, else ``default``. The dataset and the model call this with the same
+    per-sample ``compression_seed``, so the placeholder count and the cut agree; with
+    no seed (eval / inference) it is the fixed ``segment_target_frames``."""
+    if not choices or seed is None:
+        return int(default)
+    return int(choices[int(seed) % len(choices)])
+
+
 def target_segment_count(n_frames: int, target_n: int, force_every: int = 8,
                          min_adapt: float = 0.5) -> int:
     """``N = clip(target_n, N_min(T), T)`` — the Phase-3 segment count (design doc
@@ -804,6 +815,8 @@ class TransformerDecoderFlatCompressor(nn.Module):
         # N * num_queries tokens; output_len_for tells the arch the count.
         self.adaptive_segmentation = bool(getattr(config, "adaptive_segmentation", False))
         self.segment_target_frames = int(getattr(config, "segment_target_frames", 4) or 4)
+        self.segment_target_frames_choices = [
+            int(x) for x in (getattr(config, "segment_target_frames_choices", None) or [])]
         self.segment_force_every = int(getattr(config, "segment_force_every", 8) or 8)
         self.segment_sample_tau = float(getattr(config, "segment_sample_tau", 0.0) or 0.0)
         # Phase-3 segment-count rule (design doc §4 Phase 3 / §5 item 17):
@@ -815,29 +828,31 @@ class TransformerDecoderFlatCompressor(nn.Module):
         self.segment_target_n = int(getattr(config, "segment_target_n", 64) or 64)
         self.segment_min_adapt = float(getattr(config, "segment_min_adapt", 0.5) or 0.0)
 
-    def segment_count_for(self, n_frames: int) -> int:
+    def segment_count_for(self, n_frames: int, seed=None) -> int:
         """``N`` for a window of ``n_frames`` frames, under the configured rule.
-        Pure function of the frame count either way — the dataset/collator and the
-        model must agree on it without decoding features."""
+        Pure function of the frame count (and, with ``segment_target_frames_choices``,
+        the per-sample seed) — the dataset/collator and the model must agree on it
+        without decoding features."""
         if self.segment_count_rule == "target_n":
             return target_segment_count(n_frames, self.segment_target_n,
                                         self.segment_force_every, self.segment_min_adapt)
-        return adaptive_segment_count(n_frames, self.segment_target_frames,
-                                      self.segment_force_every)
+        tf = pick_target_frames(self.segment_target_frames_choices, seed,
+                                self.segment_target_frames)
+        return adaptive_segment_count(n_frames, tf, self.segment_force_every)
 
     def output_hw_for(self, h: int, w: int):
         # Flat output, no 2-D grid — (1, num_queries) so callers' oh*ow arithmetic
         # (arch.py) still yields the right total token count.
         return 1, self.num_queries
 
-    def output_len_for(self, n_frames: int, h: int, w: int) -> int:
+    def output_len_for(self, n_frames: int, h: int, w: int, seed=None) -> int:
         """Compressed token count for a window of ``n_frames`` frames — what the arch
         reserves as placeholder slots. Fixed ``num_queries`` unless the adaptive
         segmenter is on, then ``N * num_queries`` with ``N`` from
         ``segment_count_for`` (a pure function of the frame count)."""
         if not self.adaptive_segmentation:
             return int(self.num_queries)
-        return self.segment_count_for(n_frames) * int(self.num_queries)
+        return self.segment_count_for(n_frames, seed=seed) * int(self.num_queries)
 
     def _build_cross_rotary_kv(self, compression_cu_seqlens, device, grid_hws, kept_idx=None):
         """KV-side-only counterpart of TransformerDecoderCompressor._build_cross_rotary_3d
@@ -942,19 +957,19 @@ class TransformerDecoderFlatCompressor(nn.Module):
                 assert span % hw == 0, (
                     f"adaptive_segmentation: window {wi} has {span} tokens, not a multiple of h*w={hw}"
                 )
+                sv = None if seed is None else (seed[wi] if isinstance(seed, (list, tuple)) else seed)
                 gen = None
                 if tau > 0.0:
                     gen = torch.Generator(device=kv.device)
-                    if seed is None:
+                    if sv is None:
                         gen.manual_seed(int(torch.randint(0, 2 ** 31 - 1, (1,)).item()))
                     else:
-                        sv = seed[wi] if isinstance(seed, (list, tuple)) else seed
                         gen.manual_seed((int(sv) * 1_000_003 + wi) % (2 ** 63 - 1))
                 with torch.no_grad():
                     per_frame = kv[a:b].view(span // hw, hw, C).float().mean(1)
                     seg_lens = adaptive_segment_lengths(
                         per_frame, self.segment_target_frames, self.segment_force_every, tau, gen,
-                        n_segments=self.segment_count_for(span // hw),
+                        n_segments=self.segment_count_for(span // hw, seed=sv),
                     )
                 seg_lens_per_window.append([int(x) for x in seg_lens])
                 for L in seg_lens:
@@ -1921,6 +1936,9 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         # See docs/two_stage_compression_design.md §4 Phase 1.
         adaptive_segmentation=False,
         segment_target_frames=4,
+        # Mixed-granularity qbase stream: per-sample frames/segment drawn from this
+        # list by compression_seed (pick_target_frames). None/[] = fixed target_frames.
+        segment_target_frames_choices=None,
         segment_force_every=8,
         segment_sample_tau=0.0,          # >0: Gumbel-top-k boundary draw (train only)
         # Phase-3 segment-count rule (§4 Phase 3 "qbase segmentation: target N +
@@ -1993,6 +2011,7 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         self.compressor_gradient_checkpointing = compressor_gradient_checkpointing
         self.adaptive_segmentation = adaptive_segmentation
         self.segment_target_frames = segment_target_frames
+        self.segment_target_frames_choices = segment_target_frames_choices
         self.segment_force_every = segment_force_every
         self.segment_sample_tau = segment_sample_tau
         self.segment_count_rule = segment_count_rule

@@ -78,12 +78,22 @@ def _vl3_memlog(tag, **tensors):
             _tqdm.write(f"[VL3_MEM]   {nb:6.2f}G {dt:9s} requires_grad={rg!s:5s} {cls:12s} {shp}")
 
 
-def _compressed_len(compressor, n_frames, h, w):
+def _seed_for(seed, i):
+    """Per-part entry of a ``compression_seed`` list (or the scalar itself)."""
+    if seed is None:
+        return None
+    return seed[i] if isinstance(seed, (list, tuple)) else seed
+
+
+def _compressed_len(compressor, n_frames, h, w, seed=None):
     """Number of compressed tokens a window of ``n_frames`` frames (post-merge grid
     ``h x w``) produces. Prefers the compressor's ``output_len_for`` (frame-count
     aware — the fixed-count adaptive segmenter's ``N * num_queries``); falls back to
-    ``prod(output_hw_for(h, w))`` for the fixed-length compressors."""
+    ``prod(output_hw_for(h, w))`` for the fixed-length compressors. ``seed`` is the
+    part's ``compression_seed`` (mixed-granularity qbase stream only)."""
     if hasattr(compressor, "output_len_for"):
+        if seed is not None:
+            return int(compressor.output_len_for(int(n_frames), int(h), int(w), seed=seed))
         return int(compressor.output_len_for(int(n_frames), int(h), int(w)))
     oh, ow = compressor.output_hw_for(int(h), int(w))
     return int(oh) * int(ow)
@@ -283,14 +293,14 @@ class Videollama3MetaForCausalLM(ABC):
         need_compress_parts = torch.zeros(vision_tokens.shape[0], device=device, dtype=torch.bool)
         replace_mask = torch.zeros(vision_tokens.shape[0], device=device, dtype=torch.bool)
         part_starts: List[int] = []
-        for part, (h, w) in zip(compression_parts, grid_hws):
+        for pi, (part, (h, w)) in enumerate(zip(compression_parts, grid_hws)):
             part_len = part[1] - part[0]
             need_compress_parts[part[0]: part[1]] = True
             part_starts.append(part[0])
             compression_cu_seqlens.append(compression_cu_seqlens[-1] + part_len)
             if not two_stage:
                 n_frames = part_len // (h * w)
-                n_out = _compressed_len(compressor, n_frames, h, w)
+                n_out = _compressed_len(compressor, n_frames, h, w, seed=_seed_for(seed, pi))
                 # Same contract the two-stage branch asserts below: the compressed
                 # rows are written back INSIDE the part they replace, so a part that
                 # holds fewer tokens than the compressor emits silently spills into
@@ -352,6 +362,7 @@ class Videollama3MetaForCausalLM(ABC):
                 original_tokens_to_reconstruct,
                 compression_cu_seqlens,
                 grid_hws,
+                seed=seed,
             )
         keeping_masks = ~need_compress_parts | replace_mask
         vision_tokens[replace_mask] = compressed
@@ -677,7 +688,8 @@ class Videollama3MetaForCausalLM(ABC):
                         _append_ids([ce_id])
                 else:
                     n_frames = (part[1] - part[0]) // (part_h * part_w)
-                    compact = _compressed_len(compressor, n_frames, part_h, part_w)
+                    compact = _compressed_len(compressor, n_frames, part_h, part_w,
+                                              seed=_seed_for(_seed, part_idx))
                     _append_ids(list(ts_extra) if ts_extra else [])
                     _append_ids([cs_id])
                     _append_placeholders(compact, None)

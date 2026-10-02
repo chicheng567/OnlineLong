@@ -90,8 +90,13 @@ def make_batched_images(images) -> List[List[ImageInput]]:
 
 
 def simple_batched_resize(
-    images, factor: int = 28, min_tokens: int = 4 * 4, max_tokens: int = 16384, input_data_format: str = None
+    images, factor: int = 28, min_tokens: int = 4 * 4, max_tokens: int = 16384, input_data_format: str = None,
+    max_tokens_per_frame: Optional[int] = None,
 ):
+    """``max_tokens`` is shared by every frame of the call; ``max_tokens_per_frame``
+    (None = off) additionally caps each frame, so a short or still input cannot pour
+    the whole budget into a few huge frames (the encoder's per-frame attention is
+    quadratic in that frame's patch count)."""
     min_pixels = min_tokens * factor * factor
     max_pixels = max_tokens * factor * factor
 
@@ -112,12 +117,15 @@ def simple_batched_resize(
             height, width = get_image_size(image, channel_dim=input_data_format)
         image_sizes.append([height, width])
 
+    frame_pixels = max_pixels // num_images
+    if max_tokens_per_frame:
+        frame_pixels = min(frame_pixels, max_tokens_per_frame * factor * factor)
     tmp_image_sizes = []
     for height, width in image_sizes:
         h_bar = round(height / factor) * factor
         w_bar = round(width / factor) * factor
-        if h_bar * w_bar > (max_pixels // num_images):
-            beta = math.sqrt((height * width) / (max_pixels // num_images))
+        if h_bar * w_bar > frame_pixels:
+            beta = math.sqrt((height * width) / frame_pixels)
             h_bar = math.floor(height / beta / factor) * factor
             w_bar = math.floor(width / beta / factor) * factor
         # per image min_pixels
@@ -131,7 +139,8 @@ def simple_batched_resize(
 
 
 def batched_resize(
-    images, factors: List[int], min_tokens: int = 4 * 4, max_tokens: int = 16384, input_data_format: str = None
+    images, factors: List[int], min_tokens: int = 4 * 4, max_tokens: int = 16384, input_data_format: str = None,
+    max_tokens_per_frame: Optional[int] = None,
 ):
     image_sizes = []
     for image in images:
@@ -165,6 +174,17 @@ def batched_resize(
         for (_, height, width), factor in zip(image_sizes, factors):
             height = round(height / factor) * factor
             width = round(width / factor) * factor
+            tmp_image_sizes.append((height, width))
+        image_sizes = tmp_image_sizes
+
+    if max_tokens_per_frame:
+        tmp_image_sizes = []
+        for (height, width), factor in zip(image_sizes, factors):
+            cap = max_tokens_per_frame * factor * factor
+            if height * width > cap:
+                beta = math.sqrt((height * width) / cap)
+                height = max(factor, math.floor(height / beta / factor) * factor)
+                width = max(factor, math.floor(width / beta / factor) * factor)
             tmp_image_sizes.append((height, width))
         image_sizes = tmp_image_sizes
 
@@ -216,6 +236,7 @@ class Videollama3ImageProcessor(BaseImageProcessor):
         max_tokens: int = 16384,
         patch_size: int = 14,
         force_size: Optional[List[int]] = None,
+        max_tokens_per_frame: Optional[int] = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -231,6 +252,8 @@ class Videollama3ImageProcessor(BaseImageProcessor):
         self.patch_size = patch_size
         self.do_convert_rgb = do_convert_rgb
         self.force_size = force_size
+        # Per-frame cap on top of the per-input ``max_tokens`` budget (None = off).
+        self.max_tokens_per_frame = max_tokens_per_frame
 
     def _preprocess(
         self,
@@ -428,6 +451,7 @@ class Videollama3ImageProcessor(BaseImageProcessor):
                 min_tokens=self.min_tokens,
                 max_tokens=self.max_tokens,
                 input_data_format=input_data_format,
+                max_tokens_per_frame=getattr(self, "max_tokens_per_frame", None),
             )
         else:
             target_sizes = batched_resize(
@@ -436,6 +460,7 @@ class Videollama3ImageProcessor(BaseImageProcessor):
                 min_tokens=self.min_tokens,
                 max_tokens=self.max_tokens,
                 input_data_format=input_data_format,
+                max_tokens_per_frame=getattr(self, "max_tokens_per_frame", None),
             )
         # Override the target sizes if force_size is set.
         if self.force_size is not None:

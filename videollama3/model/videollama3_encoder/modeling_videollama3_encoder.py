@@ -37,8 +37,10 @@ from transformers.utils import is_flash_attn_2_available
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
+    from flash_attn.layers.rotary import apply_rotary_emb
 else:
     flash_attn_varlen_func = None
+    apply_rotary_emb = None
 
 try:
     from .configuration_videollama3_encoder import Videollama3VisionEncoderConfig
@@ -168,6 +170,17 @@ def apply_rotary_pos_emb_vision(tensor: torch.Tensor, freqs: torch.Tensor) -> to
     output = (tensor * cos) + (rotate_half(tensor) * sin)
     output = output.to(orig_dtype)
     return output
+
+
+def apply_rotary_pos_emb_vision_fused(tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """``apply_rotary_pos_emb_vision`` for a ``(L, H, D)`` tensor as ONE Triton kernel
+    (flash-attn's, the one HF Qwen2-VL uses for its vision tower): same cos/sin values
+    (taken in ``freqs``' dtype, then fp32), same non-interleaved rotation in fp32, cast
+    back. The unfused version is ~8 elementwise passes over fp32 copies of q and k per
+    layer -- ~20 % of the frozen encoder forward at 65536 tokens/video (measured)."""
+    cos = freqs.cos().float()
+    sin = freqs.sin().float()
+    return apply_rotary_emb(tensor.float().unsqueeze(0), cos, sin).squeeze(0).to(tensor.dtype)
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -301,9 +314,9 @@ class VisionFlashAttention2(VisionAttention):
         query_states = query_states.view(q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(q_len, self.num_heads, self.head_dim)
         value_states = value_states.view(q_len, self.num_heads, self.head_dim)
-        query_states = apply_rotary_pos_emb_vision(query_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
-        key_states = apply_rotary_pos_emb_vision(key_states.unsqueeze(0), rotary_pos_emb).squeeze(0)
-        
+        query_states = apply_rotary_pos_emb_vision_fused(query_states, rotary_pos_emb)
+        key_states = apply_rotary_pos_emb_vision_fused(key_states, rotary_pos_emb)
+
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         attn_output = flash_attn_varlen_func(query_states, key_states, value_states, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
             q_len, -1

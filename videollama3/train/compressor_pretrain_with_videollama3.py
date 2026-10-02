@@ -147,6 +147,13 @@ class ModelArguments:
         default=None,
         metadata={"help": "Optional saved compressor weights (.pt/.bin) to warm-start token_compressor."},
     )
+    qbase_projector_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "HF run/checkpoint dir whose projector seeds mm_projector_qbase (its "
+                          "mm_projector_qbase.* if present, else mm_projector.*). Point it at the run "
+                          "that TRAINED the qbase; overrides the one carried by "
+                          "--pretrained_compressor_path."},
+    )
     # Keep the compressed tokens on the frozen encoder / mm_projector's feature
     # scale. Both ride into the compressor via token_compressor_config;
     # transformer_decoder / transformer_decoder_flat only.
@@ -246,6 +253,14 @@ class DataArguments:
                           "a part that holds only that image's own vision tokens. None keeps the "
                           "checkpoint value (16 -> a 4x4 grid, far below K=64)."},
     )
+    vision_max_tokens_per_frame: Optional[int] = field(
+        default=None,
+        metadata={"help": "Per-FRAME cap on top of --vision_max_tokens (merged tokens; None = off). "
+                          "The per-sample budget is shared by the frames, so a short or still input "
+                          "otherwise gets a few huge frames, and the encoder's per-frame attention is "
+                          "quadratic in their patch count (a 4K 8-frame clip: ~8k tokens/frame, ~4 s "
+                          "of encoder). Inputs with >= max_tokens / cap frames are unaffected."},
+    )
     pixel_values_dtype: str = field(
         default="float32",
         metadata={"help": "dtype the dataset emits pixel_values in: float32 (the image "
@@ -283,6 +298,10 @@ class TrainingArguments(transformers.TrainingArguments):
     # so max_u N_u — the SSD recurrence depth / backward-graph depth — stays
     # homogeneous. Needs the dataset to expose `compression_depths`.
     group_by_compression_depth: bool = field(default=False)
+    # Deal each optimizer step's samples into micro-batches of equal estimated
+    # encoder + LLM cost (the per-rank step-boundary wait otherwise gates the step).
+    # Needs the dataset to expose `encode_costs` (qbase_enhance: --media_geometry_json).
+    group_by_encode_cost: bool = field(default=False)
     model_max_length: int = field(default=32768)
     double_quant: bool = field(default=True)
     quant_type: str = field(default="nf4")
@@ -334,6 +353,8 @@ def _configure_image_processor(image_processor, model_args, data_args) -> None:
         image_processor.max_tokens = int(data_args.vision_max_tokens)
     if data_args.vision_min_tokens:
         image_processor.min_tokens = int(data_args.vision_min_tokens)
+    if data_args.vision_max_tokens_per_frame:
+        image_processor.max_tokens_per_frame = int(data_args.vision_max_tokens_per_frame)
     k = int(getattr(model_args, "num_queries", 0) or 0)
     if k and image_processor.min_tokens < k:
         rank0_print(
@@ -345,8 +366,102 @@ def _configure_image_processor(image_processor, model_args, data_args) -> None:
         )
     rank0_print(
         f"[phase1] image processor: force_size={image_processor.force_size}, "
-        f"min_tokens={image_processor.min_tokens}, max_tokens={image_processor.max_tokens}"
+        f"min_tokens={image_processor.min_tokens}, max_tokens={image_processor.max_tokens}, "
+        f"max_tokens_per_frame={image_processor.max_tokens_per_frame}"
     )
+
+
+def _warmstart_projectors_and_compression_embeds(model, model_args, tokenizer) -> None:
+    """Carry a warm start's trained projectors and compression-token embedding rows
+    over, not just ``token_compressor.*``. Without this every phase re-copied both
+    ``mm_projector_{qbase,fold}`` from the BASE model's projector and let
+    ``resize_token_embeddings`` re-initialise ``<|compression_start|>`` /
+    ``<|compression_end|>``. Rule: ``mm_projector_qbase`` comes from the run that
+    trained the qbase. Applied in order, later steps overriding earlier ones:
+
+    1. ``--stage1_pretrained`` HF dir (the Phase-1 qbase run): its trained
+       ``mm_projector`` seeds BOTH split projectors, plus its embedding rows.
+    2. ``--pretrained_compressor_path`` HF dir (a Phase-2 run/checkpoint): its
+       ``mm_projector_{qbase,fold}`` and embedding rows.
+    3. ``--qbase_projector_path`` HF dir: ``mm_projector_qbase`` only (its
+       ``mm_projector_qbase.*`` if present, else ``mm_projector.*``).
+
+    A bare ``.pt`` source carries no projector and is skipped, as before."""
+    from safetensors import safe_open
+    mm = model.get_model()
+
+    def weight_map(path):
+        index = os.path.join(path or "", "model.safetensors.index.json")
+        return json.load(open(index))["weight_map"] if path and os.path.isfile(index) else None
+
+    def read_prefix(path, wmap, prefix):
+        keys = [k for k in wmap if k.startswith(prefix)]
+        out, by_file = {}, {}
+        for k in keys:
+            by_file.setdefault(wmap[k], []).append(k)
+        for f, ks in by_file.items():
+            with safe_open(os.path.join(path, f), "pt") as h:
+                for k in ks:
+                    out[k[len(prefix):]] = h.get_tensor(k)
+        return out
+
+    def load_projector(dst, path, wmap, src_prefix):
+        sub = getattr(mm, dst, None)
+        sd = read_prefix(path, wmap, src_prefix) if sub is not None else {}
+        if not sd:
+            return
+        sub.load_state_dict(sd, strict=True)
+        rank0_print(f"[warm-start] {dst} <- {path} ({src_prefix}*, {len(sd)} tensors)")
+
+    def load_embeds(path, wmap):
+        added = os.path.join(path, "added_tokens.json")
+        emb_key = "model.embed_tokens.weight"
+        if not os.path.isfile(added) or emb_key not in wmap:
+            return
+        src_ids = json.load(open(added))
+        with safe_open(os.path.join(path, wmap[emb_key]), "pt") as h:
+            src = h.get_tensor(emb_key)
+        emb = model.get_input_embeddings().weight
+        for tok in (COMPRESSION_START_TOKEN, COMPRESSION_END_TOKEN):
+            dst_id, src_id = tokenizer.convert_tokens_to_ids(tok), src_ids.get(tok)
+            if src_id is None:
+                continue
+            with torch.no_grad():
+                emb[dst_id].copy_(src[src_id].to(dtype=emb.dtype, device=emb.device))
+            rank0_print(f"[warm-start] embed row {tok} (id {dst_id}) <- {path} row {src_id}")
+
+    stage1_src = getattr(model_args, "stage1_pretrained", "") or ""
+    wm = weight_map(stage1_src)
+    if wm is not None:
+        for dst in ("mm_projector_qbase", "mm_projector_fold"):
+            load_projector(dst, stage1_src, wm, "model.mm_projector.")
+        load_embeds(stage1_src, wm)
+
+    comp_src = model_args.pretrained_compressor_path or ""
+    wm = weight_map(comp_src)
+    if wm is not None:
+        if getattr(mm, "mm_projector_qbase", None) is None:
+            # Single-stage (qbase-only) target: its plain mm_projector IS the qbase
+            # projector, so it comes from the source's qbase projector -- the split
+            # copy of a two-stage run, else a single-stage run's own mm_projector.
+            has_split = any(k.startswith("model.mm_projector_qbase.") for k in wm)
+            load_projector("mm_projector", comp_src, wm,
+                           "model.mm_projector_qbase." if has_split else "model.mm_projector.")
+        for dst in ("mm_projector_qbase", "mm_projector_fold"):
+            load_projector(dst, comp_src, wm, f"model.{dst}.")
+        load_embeds(comp_src, wm)
+    elif comp_src:
+        rank0_print(f"[warm-start] {comp_src}: no safetensors index -- projectors / compression "
+                    f"embeddings NOT carried over (token_compressor only)")
+
+    qproj_src = getattr(model_args, "qbase_projector_path", "") or ""
+    if qproj_src:
+        wm = weight_map(qproj_src)
+        if wm is None:
+            raise FileNotFoundError(f"--qbase_projector_path {qproj_src}: no model.safetensors.index.json")
+        has_split = any(k.startswith("model.mm_projector_qbase.") for k in wm)
+        load_projector("mm_projector_qbase", qproj_src, wm,
+                       "model.mm_projector_qbase." if has_split else "model.mm_projector.")
 
 
 def train(attn_implementation=None, *,
@@ -630,6 +745,7 @@ def train(attn_implementation=None, *,
     model.config.image_token_index = tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
     model.config.compression_start_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_START_TOKEN)
     model.config.compression_end_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_END_TOKEN)
+    _warmstart_projectors_and_compression_embeds(model, model_args, tokenizer)
     # Pre-tokenise the "Time:{a}s-{b}s:" pieces onto the config so the arch can build
     # the per-unit range string with no tokenizer at forward time (two-stage fold).
     from videollama3.model.compressor import bake_time_tokens

@@ -360,6 +360,11 @@ class SubsetWithLengths(torch.utils.data.Subset):
     def compression_depths(self):
         return self._compression_depths
 
+    @property
+    def encode_costs(self):
+        parent = getattr(self.dataset, "encode_costs", None)
+        return [parent[i] for i in self.indices] if parent is not None else None
+
 
 def _collect_val_video_paths(dataset, val_indices: List[int]) -> List[str]:
     """Return the full video paths for the given global indices in dataset.
