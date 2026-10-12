@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan X Phase 3 — budget-driven length-adaptive fold on long video (420–1200 s).
+"""Plan X Phase 3 — budget-driven length-adaptive fold (designed for 420–1200 s video).
 
 Thin wrapper over ``phase2_pretrain_fold.py`` (itself a wrapper over
 ``compressor_pretrain_with_videollama3.py``): same frozen-LLM CE recipe, same
@@ -20,10 +20,10 @@ checkpoint. Three mechanisms change, all of them documented in
   ``U ≤ 16``) replaces Phase 2's depth-class ``N̄_u`` draw. A unit costs ``M``
   tokens whether it folds or passes through raw, so the mechanism reduces to
   choosing how many final units there are; a unit left holding one segment emits
-  that segment's ``K`` qbase tokens verbatim (``--stage2_bypass_singletons``).
+  that segment's ``K`` qbase tokens verbatim (``--fold_bypass_singletons``).
   That is **not** the banned retained-K: a segment is either raw or absorbed into
   some other unit's fold, never both.
-* **§5 item 16 — DP unit placement.** ``--stage2_unit_placement dp``: exact
+* **§5 item 16 — DP unit placement.** ``--fold_unit_placement dp``: exact
   ``O(N²U)`` DP over ``WCSS + λ·depth_cost``, ``N_u_soft = ratio·N/U``. Phase 2's
   greedy ``_place_unit_boundaries`` is left untouched (its ``min_gap`` is a floor on
   every unit's size, so it can never emit a bypass unit, and it is worse than the DP
@@ -47,8 +47,8 @@ invocation)::
         --compressor_num_layers 8 --compressor_num_attention_heads 8 \\
         --match_encoder_scale True --compressor_distr_loss_weight 0.05 \\
         --pretrained_compressor_path work_dirs/phase2_fold_internvid \\
-        --token_budget 1024 --stage2_n_summary_tokens 64 \\
-        --stage2_unit_placement dp --stage2_bypass_singletons True \\
+        --token_budget 1024 --fold_n_summary_tokens 64 \\
+        --fold_unit_placement dp --fold_bypass_singletons True \\
         --mm_projector_lr 2e-5 --qbase_lr 5e-6 --mamba_lr 5e-5 \\
         --group_by_compression_depth True --durations_json anno_data/internVid_durations.json \\
         --multi_dataset True --data_path anno_data/phase3_training.json ...
@@ -74,7 +74,7 @@ from videollama3.train.phase2_pretrain_fold import (
     Phase2ModelArguments,
     _build_phase2_token_compressor_config,
     _configure_phase2_image_processor,
-    _warmstart_and_freeze_stage1,
+    _warmstart_and_freeze_qbase,
 )
 
 
@@ -113,7 +113,7 @@ class Phase3BudgetDataset(Phase2FoldDataset):
         tf, _max_units, m, k = super()._fold_knobs()
         ma = self.model_args
         budget = int(getattr(ma, "token_budget", 1024)) if ma is not None else 1024
-        # U cap is the budget itself, not Phase 2's stage2_max_units = 5.
+        # U cap is the budget itself, not Phase 2's fold_max_units = 5.
         return tf, max(1, budget // max(1, m)), m, k
 
     def _segment_count(self, n_frames: int) -> int:
@@ -186,23 +186,23 @@ class Phase3ModelArguments(Phase2ModelArguments):
                           "(target_frames = force_every*(1-min_adapt)); 0 halves the N*K RoPE "
                           "footprint but mostly disables the adaptive segmenter."},
     )
-    stage2_unit_placement: str = field(
+    fold_unit_placement: str = field(
         default="dp",
         metadata={"help": "'dp' = exact DP on WCSS + lambda*depth_cost (Phase 3); 'greedy' = "
                           "Phase 2's top-diff + min_gap ranking (cannot emit a bypass unit)."},
     )
-    stage2_dp_lambda: float = field(
+    fold_dp_lambda: float = field(
         default=0.05,
         metadata={"help": "depth_cost weight. Insensitive above ~0.01 (lambda=0.01 vs 0.1 differ "
                           "by 1-2 segments); lambda=0 lets real video reach N_u=196."},
     )
-    stage2_dp_soft_ratio: float = field(
+    fold_dp_soft_ratio: float = field(
         default=1.75,
         metadata={"help": "N_u_soft = ratio * N/U. MUST scale with N/U (1.5-2), never a fixed 16: "
                           "below N/U every unit pays the quadratic and the DP degenerates to a "
                           "uniform split."},
     )
-    stage2_bypass_singletons: bool = field(
+    fold_bypass_singletons: bool = field(
         default=True,
         metadata={"help": "A unit holding one segment emits that segment's K qbase tokens raw "
                           "(kind 'qbase') instead of folding a singleton."},
@@ -226,7 +226,7 @@ class Phase3DataArguments(Phase2DataArguments):
 
 def _build_phase3_token_compressor_config(model_config, model_args, data_args) -> Dict:
     d = _build_phase2_token_compressor_config(model_config, model_args, data_args)
-    u_cap = max(1, int(model_args.token_budget) // max(1, int(model_args.stage2_n_summary_tokens)))
+    u_cap = max(1, int(model_args.token_budget) // max(1, int(model_args.fold_n_summary_tokens)))
     d.update(
         # §5 item 17 -- the model derives N from the frame count with these, exactly
         # as Phase3BudgetDataset._segment_count does.
@@ -234,26 +234,26 @@ def _build_phase3_token_compressor_config(model_config, model_args, data_args) -
         segment_target_n=int(model_args.segment_target_c) * u_cap,
         segment_min_adapt=float(model_args.segment_min_adapt),
         # §5 items 13 / 16.
-        stage2_unit_placement=model_args.stage2_unit_placement,
-        stage2_dp_lambda=model_args.stage2_dp_lambda,
-        stage2_dp_soft_ratio=model_args.stage2_dp_soft_ratio,
-        stage2_bypass_singletons=model_args.stage2_bypass_singletons,
+        fold_unit_placement=model_args.fold_unit_placement,
+        fold_dp_lambda=model_args.fold_dp_lambda,
+        fold_dp_soft_ratio=model_args.fold_dp_soft_ratio,
+        fold_bypass_singletons=model_args.fold_bypass_singletons,
     )
     return d
 
 
 def _phase3_on_compressor_built(compressor, model_args, data_args, training_args) -> None:
-    _warmstart_and_freeze_stage1(compressor, model_args, data_args, training_args)
+    _warmstart_and_freeze_qbase(compressor, model_args, data_args, training_args)
     if not isinstance(compressor, TwoStageCompressor):
         return
     M = compressor.n_summary_tokens
     u_cap = max(1, int(model_args.token_budget) // max(1, M))
     rank0_print(
         f"[phase3] budget B={model_args.token_budget} -> U <= {u_cap} units x M={M} tokens; "
-        f"segmentation rule={compressor.stage1.segment_count_rule} "
-        f"(target_n={compressor.stage1.segment_target_n} = c{model_args.segment_target_c}*{u_cap}, "
-        f"min_adapt={compressor.stage1.segment_min_adapt}, "
-        f"force_every={compressor.stage1.segment_force_every}); "
+        f"segmentation rule={compressor.qbase.segment_count_rule} "
+        f"(target_n={compressor.qbase.segment_target_n} = c{model_args.segment_target_c}*{u_cap}, "
+        f"min_adapt={compressor.qbase.segment_min_adapt}, "
+        f"force_every={compressor.qbase.segment_force_every}); "
         f"unit placement={compressor.unit_placement} "
         f"(lambda={compressor.dp_lambda}, N_u_soft={compressor.dp_soft_ratio}*N/U), "
         f"bypass_singletons={compressor.bypass_singletons}"

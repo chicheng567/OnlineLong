@@ -138,7 +138,6 @@ def captioning() -> None:
     processor = Videollama3Processor.from_pretrained(
         model_args.model_name_or_path,
         trust_remote_code=False,
-        fix_mistral_regex=True,
     )
     
     generation_kwargs = {

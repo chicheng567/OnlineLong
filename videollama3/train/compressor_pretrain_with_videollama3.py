@@ -16,11 +16,14 @@ its frame count.
 * Every video yields exactly one part, so all ranks always take the compression path
   -- the NCCL desync the windowed script guards against (some ranks compressing, some
   not) cannot happen here.
-* Timestamps still mark the *whole* span: the chat template's per-frame
-  ``"Time X.0s:"`` text before the first frame is replaced by
-  ``"Time:{first}s-{last}s:"``, and the per-frame timestamps inside the span are
-  dropped along with the frame tokens they annotate (they sit between the first and
-  last image token, which ``prepare_inputs_labels_for_multimodal`` cuts out).
+* Timestamps: the chat template's per-frame ``"Time X.0s:"`` text is dropped along
+  with the frame tokens (it sits between the first and last image token, which
+  ``prepare_inputs_labels_for_multimodal`` cuts out). With ``--segment_time_marks``
+  (default on since 2026-10-12) every qbase segment then gets its own
+  ``"Time:{a}s-{b}s:"`` (first / last frame second of that segment) in front of its
+  own ``<|compression_start|>`` K rows ``<|compression_end|>`` block. Off = the old
+  layout: one whole-span ``"Time:{first}s-{last}s:"`` before all N*K rows -- every
+  checkpoint trained before 2026-10-12 used it.
 * One video block per sample is assumed. Multi-turn online data (which
   ``preprocess_videollama3`` splits into one block per user turn) is out of scope and
   is skipped.
@@ -189,6 +192,13 @@ class ModelArguments:
         default=8,
         metadata={"help": "Adaptive segmenter: forced boundary every this many frames (the [1,N] clamp max)."},
     )
+    segment_time_marks: bool = field(
+        default=True,
+        metadata={"help": "Give EVERY qbase segment its own `Time:{a}s-{b}s:` (its first / last "
+                          "frame second), one `<cs> K rows <ce>` block per segment, instead of one "
+                          "whole-video range before all N*K rows. Saved into the compressor config, "
+                          "so eval / inference rebuild the same layout. Still images get none."},
+    )
     segment_sample_tau: float = field(
         default=0.0,
         metadata={"help": "Adaptive segmenter: >0 draws the non-forced boundaries with Gumbel-top-k "
@@ -283,16 +293,24 @@ class TrainingArguments(transformers.TrainingArguments):
     # Two-stage compressor (qbase + Mamba-2/SSD fold) LR split -- both no-ops for a
     # single-stage compressor (Phase 1: just leave them at 0, compressor_lr is the
     # qbase's only rate):
-    #   qbase_lr  > 0 -> token_compressor.stage1.* (the qbase) gets its OWN
+    #   qbase_lr  > 0 -> token_compressor.qbase.* (the qbase) gets its OWN
     #     optimizer group at this LR instead of sharing the fold's rate -- used by
     #     the joint-polish window that unfreezes the qbase and moves it ~10x
     #     slower than the fold.
     #   mamba_lr  > 0 -> the rate for everything else in the compressor
-    #     (token_compressor.stage2.* / embed_tokens), overriding compressor_lr.
+    #     (token_compressor.fold.* / embed_tokens), overriding compressor_lr.
     #     0 -> falls back to compressor_lr.
     qbase_lr: Optional[float] = field(default=0.0)
     mamba_lr: Optional[float] = field(default=0.0)
     llm_lr: Optional[float] = field(default=0.0)
+    # Projectors kept frozen even when --mm_projector_lr > 0: comma list of
+    # mm_projector / mm_projector_qbase / mm_projector_fold (Phase 3 trains only
+    # mm_projector_fold). Empty -> --mm_projector_lr governs all of them.
+    frozen_projectors: str = field(default="")
+    # With the LLM frozen, the two compression-token embedding rows train in the
+    # compressor group (fold LR on a two-stage model). False keeps them at their
+    # warm-start values.
+    train_compression_embeds: bool = field(default=True)
     group_by_modality_length: bool = field(default=False)
     # Two-stage fold: fill each grad-accum window from one depth class (N = ⌊T/4⌋+1)
     # so max_u N_u — the SSD recurrence depth / backward-graph depth — stays
@@ -343,6 +361,7 @@ def _build_token_compressor_config(
         "segment_target_frames": model_args.segment_target_frames,
         "segment_force_every": model_args.segment_force_every,
         "segment_sample_tau": model_args.segment_sample_tau,
+        "segment_time_marks": bool(model_args.segment_time_marks),
     }
 
 
@@ -379,7 +398,7 @@ def _warmstart_projectors_and_compression_embeds(model, model_args, tokenizer) -
     ``<|compression_end|>``. Rule: ``mm_projector_qbase`` comes from the run that
     trained the qbase. Applied in order, later steps overriding earlier ones:
 
-    1. ``--stage1_pretrained`` HF dir (the Phase-1 qbase run): its trained
+    1. ``--qbase_pretrained`` HF dir (the Phase-1 qbase run): its trained
        ``mm_projector`` seeds BOTH split projectors, plus its embedding rows.
     2. ``--pretrained_compressor_path`` HF dir (a Phase-2 run/checkpoint): its
        ``mm_projector_{qbase,fold}`` and embedding rows.
@@ -430,12 +449,12 @@ def _warmstart_projectors_and_compression_embeds(model, model_args, tokenizer) -
                 emb[dst_id].copy_(src[src_id].to(dtype=emb.dtype, device=emb.device))
             rank0_print(f"[warm-start] embed row {tok} (id {dst_id}) <- {path} row {src_id}")
 
-    stage1_src = getattr(model_args, "stage1_pretrained", "") or ""
-    wm = weight_map(stage1_src)
+    qbase_src = getattr(model_args, "qbase_pretrained", "") or ""
+    wm = weight_map(qbase_src)
     if wm is not None:
         for dst in ("mm_projector_qbase", "mm_projector_fold"):
-            load_projector(dst, stage1_src, wm, "model.mm_projector.")
-        load_embeds(stage1_src, wm)
+            load_projector(dst, qbase_src, wm, "model.mm_projector.")
+        load_embeds(qbase_src, wm)
 
     comp_src = model_args.pretrained_compressor_path or ""
     wm = weight_map(comp_src)
@@ -617,7 +636,7 @@ def train(attn_implementation=None, *,
         raise RuntimeError("Failed to build token_compressor. Check token_compressor_config.")
     if model_args.pretrained_compressor_path:
         # Handles a bare .pt, a Phase-1 qbase dir and a Phase-2 two-stage run dir,
-        # adapting stage1./stage2. prefixes to whatever compressor was just built
+        # adapting qbase./fold. prefixes to whatever compressor was just built
         # and RAISING if the two share no parameter names.
         from videollama3.model.compressor import load_pretrained_compressor
         missing, unexpected = load_pretrained_compressor(
@@ -672,6 +691,13 @@ def train(attn_implementation=None, *,
         _set_module_trainable(getattr(model.get_model(), "mm_projector_qbase", None), projector_trainable)
         _set_module_trainable(getattr(model.get_model(), "mm_projector_fold", None), projector_trainable)
         _set_module_trainable(getattr(model.get_model(), "token_compressor", None), compressor_trainable)
+
+    for name in filter(None, (s.strip() for s in training_args.frozen_projectors.split(","))):
+        projector = getattr(model.get_model(), name, None)
+        if name not in ("mm_projector", "mm_projector_qbase", "mm_projector_fold") or projector is None:
+            raise ValueError(f"--frozen_projectors: no projector {name!r} on this model")
+        _set_module_trainable(projector, False)
+        rank0_print(f"[INFO] {name} frozen (--frozen_projectors)")
 
     token_compressor = getattr(model.get_model(), "token_compressor", None)
     if on_compressor_built is not None and token_compressor is not None:
@@ -734,8 +760,13 @@ def train(attn_implementation=None, *,
                 return g
 
             embed = model.get_input_embeddings()
-            embed.weight.requires_grad_(True)
-            embed.weight.register_hook(_zero_old_embed_rows)
+            if training_args.train_compression_embeds:
+                embed.weight.requires_grad_(True)
+                embed.weight.register_hook(_zero_old_embed_rows)
+            else:
+                # resize_token_embeddings hands back a fresh, trainable Parameter.
+                embed.weight.requires_grad_(False)
+                rank0_print("[INFO] compression-token embedding rows frozen (--train_compression_embeds False)")
 
             # lm_head: compression tokens are always masked with IGNORE_INDEX in labels
             # so their rows never receive gradients; freeze it entirely.
@@ -746,11 +777,21 @@ def train(attn_implementation=None, *,
     model.config.compression_start_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_START_TOKEN)
     model.config.compression_end_token_id = tokenizer.convert_tokens_to_ids(COMPRESSION_END_TOKEN)
     _warmstart_projectors_and_compression_embeds(model, model_args, tokenizer)
+    # The count printed above predates the embedding resize; this is the final set.
+    trainable_by_prefix = {}
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            prefix = ".".join(n.split(".")[:3])
+            trainable_by_prefix[prefix] = trainable_by_prefix.get(prefix, 0) + p.numel()
+    rank0_print("[INFO] trainable after setup: " + ", ".join(
+        f"{k} {v / 1e6:.3f}M" for k, v in sorted(trainable_by_prefix.items())))
     # Pre-tokenise the "Time:{a}s-{b}s:" pieces onto the config so the arch can build
     # the per-unit range string with no tokenizer at forward time (two-stage fold).
     from videollama3.model.compressor import bake_time_tokens
+    # 14400 s (4 h) so a long-video eval of this checkpoint (per-segment marks read the
+    # same tables) never runs past them.
     bake_time_tokens(model.config, tokenizer,
-                     max_seconds=max(2048, int(getattr(data_args, "max_frames", 0) or 0) + 64))
+                     max_seconds=max(14400, int(getattr(data_args, "max_frames", 0) or 0) + 64))
 
     if data_args.force_image_size is not None:
         vision_encoder.image_processor.force_size = [data_args.force_image_size] * 2
@@ -767,7 +808,7 @@ def train(attn_implementation=None, *,
         if model_args.adaptive_segmentation:
             # The segment-count rule lives on the built compressor (Phase 3 swaps the
             # frames rule for the token-denominated target-N one, §5 item 17).
-            _seg1 = getattr(model.get_model().token_compressor, "stage1",
+            _seg1 = getattr(model.get_model().token_compressor, "qbase",
                             model.get_model().token_compressor)
             if getattr(_seg1, "segment_count_rule", "frames") == "target_n":
                 _n_rule = (f"N = clip({_seg1.segment_target_n}, N_min(T), T) target-N segments, "

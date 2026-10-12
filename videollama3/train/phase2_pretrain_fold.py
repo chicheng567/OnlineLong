@@ -10,13 +10,13 @@ collator/trainer — with these changes:
 * each video is **one whole-video ``compression_part``**; the compressor does the
   content-adaptive segment cut *and* the ``U``-unit split model-side (seeded
   per-``(epoch, index)`` Gumbel). The dataset only draws ``U`` and the seed;
-* the qbase is warm-started from ``--stage1_pretrained`` (a bare ``.pt`` **or** an
+* the qbase is warm-started from ``--qbase_pretrained`` (a bare ``.pt`` **or** an
   HF checkpoint dir). A single knob controls whether it trains: ``--qbase_lr > 0``
   trains it, in its own optimizer group at that LR, alongside the fold;
-  ``--qbase_lr 0`` (the dataclass default -- the shell wrapper defaults it to
-  ``$MAMBA_LR`` for joint training instead) freezes it (``requires_grad=False``)
+  ``--qbase_lr 0`` (the dataclass default, and the launcher's since 2026-09-27)
+  freezes it (``requires_grad=False``)
   for a staggered cold-fold start, later resumed with ``--qbase_lr <small>``
-  (~10x below ``--mamba_lr``) so it moves slower than the fold. ``stage1`` is
+  (~10x below ``--mamba_lr``) so it moves slower than the fold. ``qbase`` is
   the load-bearing name of the qbase module;
 * a meta-JSON entry with ``"qbase_only": true`` becomes the **pure-qbase replay**
   stream (no unit split, no fold — ``N*K`` qbase tokens straight to the projector),
@@ -39,8 +39,8 @@ Run from repo root with ``PYTHONPATH=.`` (the shell wrapper exports it)::
     PYTHONPATH=. torchrun ... videollama3/train/phase2_pretrain_fold.py \
         --compressor_type transformer_decoder_flat --num_queries 64 \
         --compressor_num_layers 8 --compressor_num_attention_heads 8 --match_encoder_scale True \
-        --stage1_pretrained work_dirs/phase1_qbase_internvid \
-        --stage2_n_summary_tokens 64 --stage2_max_units 5 --mm_projector_lr 2e-5 \
+        --qbase_pretrained work_dirs/phase1_qbase_internvid \
+        --fold_n_summary_tokens 64 --fold_max_units 5 --mm_projector_lr 2e-5 \
         --group_by_compression_depth True --durations_json anno_data/internVid_durations.json \
         --multi_dataset True --data_path anno_data/phase2_training.json ...
 """
@@ -174,12 +174,12 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
 
     def _fold_knobs(self):
         ma, da = self.model_args, self.data_args
-        m = int(getattr(ma, "stage2_n_summary_tokens", 64)) if ma is not None else 64
+        m = int(getattr(ma, "fold_n_summary_tokens", 64)) if ma is not None else 64
         k = int(getattr(ma, "num_queries", 64)) if ma is not None else 64
         tf = int(getattr(ma, "segment_target_frames", 4)) if ma is not None else 4
         return (
             tf,                                              # segment_target_frames
-            int(getattr(da, "stage2_max_units", 5)),         # U cap
+            int(getattr(da, "fold_max_units", 5)),         # U cap
             m,                                               # M readout tokens / unit
             k,                                               # K qbase tokens / segment
         )
@@ -364,7 +364,7 @@ class Phase2FoldDataset(GlobalCompressorLazySupervisedDataset):
                 qbase_only_sample = False
             if qbase_only_sample:
                 # Pure-qbase replay: no unit split, no fold -- the model routes this
-                # window straight through stage-1 (N*K qbase tokens, Phase-1 layout).
+                # window straight through qbase (N*K qbase tokens, Phase-1 layout).
                 # unit_counts[wi] is never read on this path (compress_windows
                 # returns early for qbase_only windows) -- None is a placeholder.
                 data_dict["compression_units"] = [None]
@@ -419,9 +419,9 @@ class Phase2ModelArguments(base.ModelArguments):
         metadata={"help": "Gumbel-top-k temperature for the per-epoch segment-boundary jitter "
                           "(seeded by compression_seed). 0 = deterministic top-diff (ablation only)."},
     )
-    stage1_pretrained: str = field(
+    qbase_pretrained: str = field(
         default="",
-        metadata={"help": "Warm-start for the qbase (token_compressor.stage1.*): a bare .pt/.bin OR an "
+        metadata={"help": "Warm-start for the qbase (token_compressor.qbase.*): a bare .pt/.bin OR an "
                           "HF checkpoint dir. Leave empty when the whole compressor is warm-started via "
                           "--pretrained_compressor_path."},
     )
@@ -430,34 +430,34 @@ class Phase2ModelArguments(base.ModelArguments):
         metadata={"help": "Recompute the qbase / fold layer activations in backward. "
                           "--gradient_checkpointing only covers the LLM, never the compressor."},
     )
-    stage2_n_summary_tokens: int = field(default=64, metadata={"help": "M readout tokens per unit."})
-    stage2_d_model: int = field(
+    fold_n_summary_tokens: int = field(default=64, metadata={"help": "M readout tokens per unit."})
+    fold_d_model: int = field(
         default=1024,
         metadata={"help": "Fold working width (bottleneck below the compressor hidden 1152). "
                           "SegmentAggregator.output_proj decodes the M readout tokens from this width "
                           "back to 1152 -> the SHARED frozen mm_projector (Option A/B align them). "
                           "The SSM state stays its own (nheads, headdim, d_state) object."},
     )
-    stage2_n_layers: int = field(default=4)
-    stage2_d_state: int = field(default=128)
-    stage2_headdim: int = field(default=64)
-    stage2_dropout: float = field(
+    fold_n_layers: int = field(default=4)
+    fold_d_state: int = field(default=128)
+    fold_headdim: int = field(default=64)
+    fold_dropout: float = field(
         default=0.1,
         metadata={"help": "Fold dropout (Mamba2Block residual branches + MLP). docs §4 Phase 2 "
                           "readout-regularization recommends 0.1; set 0.0 to disable."},
     )
-    stage2_time_embed: str = field(default="rel_gap_mlp", metadata={"help": "rel_gap_mlp (per-segment (gap,duration) seconds, "
+    fold_time_embed: str = field(default="rel_gap_mlp", metadata={"help": "rel_gap_mlp (per-segment (gap,duration) seconds, "
                                                                      "built model-side from the adaptive cut) | seconds_mlp | "
                                                                      "index_sincos | none. First runs used none; temporal_blindness "
                                                                      "0.955->0.998 (qbase->fold) on eval_ablation/grounding_probe.py "
                                                                      "motivated switching the default to rel_gap_mlp."})
-    stage2_final_norm: str = field(default="rmsnorm", metadata={"help": "readout norm: rmsnorm|layernorm|scale|none (ablatable)."})
-    stage2_rope_slot_scale: str = field(default="ratio", metadata={"help": "'ratio' (readout stride N_u*K/M) or float S slots/sec."})
+    fold_final_norm: str = field(default="rmsnorm", metadata={"help": "readout norm: rmsnorm|layernorm|scale|none (ablatable)."})
+    fold_rope_slot_scale: str = field(default="ratio", metadata={"help": "'ratio' (readout stride N_u*K/M) or float S slots/sec."})
 
 
 @dataclass
 class Phase2DataArguments(base.DataArguments):
-    stage2_max_units: int = field(default=5, metadata={"help": "Hard cap on U (so U*M <= budget)."})
+    fold_max_units: int = field(default=5, metadata={"help": "Hard cap on U (so U*M <= budget)."})
     durations_json: Optional[str] = field(
         default=None,
         metadata={"help": "Optional {clip: {est_frames_1fps}} map; enables the depth-class grouped "
@@ -481,15 +481,15 @@ def _build_phase2_token_compressor_config(model_config, model_args, data_args) -
     d.update(
         # The fold consumes per-segment qbase tokens -> the qbase must self-segment.
         adaptive_segmentation=True,
-        stage2_n_summary_tokens=model_args.stage2_n_summary_tokens,
-        stage2_d_model=model_args.stage2_d_model,
-        stage2_n_layers=model_args.stage2_n_layers,
-        stage2_d_state=model_args.stage2_d_state,
-        stage2_headdim=model_args.stage2_headdim,
-        stage2_dropout=model_args.stage2_dropout,
-        stage2_time_embed=model_args.stage2_time_embed,
-        stage2_final_norm=model_args.stage2_final_norm,
-        stage2_rope_slot_scale=model_args.stage2_rope_slot_scale,
+        fold_n_summary_tokens=model_args.fold_n_summary_tokens,
+        fold_d_model=model_args.fold_d_model,
+        fold_n_layers=model_args.fold_n_layers,
+        fold_d_state=model_args.fold_d_state,
+        fold_headdim=model_args.fold_headdim,
+        fold_dropout=model_args.fold_dropout,
+        fold_time_embed=model_args.fold_time_embed,
+        fold_final_norm=model_args.fold_final_norm,
+        fold_rope_slot_scale=model_args.fold_rope_slot_scale,
         compressor_gradient_checkpointing=bool(
             getattr(model_args, "compressor_gradient_checkpointing", False)
         ),
@@ -520,32 +520,32 @@ def _configure_phase2_image_processor(image_processor, model_args, data_args) ->
     )
 
 
-def _warmstart_and_freeze_stage1(compressor, model_args, data_args, training_args) -> None:
+def _warmstart_and_freeze_qbase(compressor, model_args, data_args, training_args) -> None:
     if not isinstance(compressor, TwoStageCompressor):
         return
-    if model_args.stage1_pretrained:
-        compressor.load_stage1_pretrained(model_args.stage1_pretrained)
+    if model_args.qbase_pretrained:
+        compressor.load_qbase_pretrained(model_args.qbase_pretrained)
     # Single knob: qbase_lr > 0 trains the qbase (its own optimizer group at that
     # LR, set up in create_optimizer); qbase_lr <= 0 freezes it. No separate
     # freeze/unfreeze flag -- see docs/two_stage_compression_design.md §4 Phase 2.
     qbase_lr = getattr(training_args, "qbase_lr", 0.0) or 0.0
     if qbase_lr > 0:
-        compressor.stage1_frozen = False
-        for p in compressor.stage1.parameters():
+        compressor.qbase_frozen = False
+        for p in compressor.qbase.parameters():
             p.requires_grad_(True)
-        compressor.stage1.train()
+        compressor.qbase.train()
         s1_state = f"TRAINABLE @ qbase_lr={qbase_lr}"
     else:
-        compressor.freeze_stage1()
+        compressor.freeze_qbase()
         s1_state = "frozen (qbase_lr<=0)"
-    n1 = sum(p.numel() for p in compressor.stage1.parameters() if p.requires_grad)
-    n2 = sum(p.numel() for p in compressor.stage2.parameters() if p.requires_grad)
+    n1 = sum(p.numel() for p in compressor.qbase.parameters() if p.requires_grad)
+    n2 = sum(p.numel() for p in compressor.fold.parameters() if p.requires_grad)
     rank0_print(
         f"[phase2] TwoStageCompressor: qbase {s1_state} ({n1 / 1e6:.2f}M trainable), "
         f"fold trainable ({n2 / 1e6:.2f}M params); "
         f"segment_target_frames={compressor.segment_target_frames}, "
         f"K={compressor.tokens_per_segment}, M={compressor.n_summary_tokens}, "
-        f"final_norm={compressor.stage2.cfg.final_norm}, dropout={compressor.stage2.cfg.dropout}, "
+        f"final_norm={compressor.fold.cfg.final_norm}, dropout={compressor.fold.cfg.dropout}, "
         f"rope_slot_scale={compressor.rope_slot_scale}"
     )
 
@@ -560,5 +560,5 @@ if __name__ == "__main__":
         dataset_cls=Phase2FoldDataset,
         build_token_compressor_config=_build_phase2_token_compressor_config,
         configure_image_processor=_configure_phase2_image_processor,
-        on_compressor_built=_warmstart_and_freeze_stage1,
+        on_compressor_built=_warmstart_and_freeze_qbase,
     )

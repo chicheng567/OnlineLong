@@ -350,7 +350,7 @@ class VideoLLaMA3Trainer(Trainer):
         for name, prm in model.named_parameters():
             if not prm.requires_grad:
                 continue
-            # token_compressor.stage1.* -> "token_compressor.stage1", etc.
+            # token_compressor.qbase.* -> "token_compressor.qbase", etc.
             key = ".".join(name.split(".")[:2])
             g = groups.setdefault(key, {"n": 0, "bad_grad": 0, "bad_val": 0,
                                         "gmax": 0.0, "no_grad": 0})
@@ -647,14 +647,14 @@ class VideoLLaMA3Trainer(Trainer):
                         name for name, _ in optimized_parameters
                         if "embed_tokens" in name and name not in compressor_parameters
                     ]
-                # Optional qbase/mamba LR split: the qbase (token_compressor.stage1.*)
+                # Optional qbase/mamba LR split: the qbase (token_compressor.qbase.*)
                 # gets its own group at qbase_lr; everything else (the Mamba-2/SSD
                 # fold + embed_tokens) stays at fold_lr. qbase_lr <= 0 -> single group.
                 use_qbase_group = qbase_lr is not None and qbase_lr > 0 and any(
-                    "token_compressor.stage1" in n for n in compressor_parameters
+                    "token_compressor.qbase" in n for n in compressor_parameters
                 )
                 if use_qbase_group:
-                    qbase_parameters = [n for n in compressor_parameters if "token_compressor.stage1" in n]
+                    qbase_parameters = [n for n in compressor_parameters if "token_compressor.qbase" in n]
                     rest_parameters = [n for n in compressor_parameters if n not in qbase_parameters]
                     for grp_names, grp_lr in ((rest_parameters, fold_lr), (qbase_parameters, qbase_lr)):
                         decay_grp = [n for n in grp_names if n in decay_parameters]
@@ -757,7 +757,7 @@ class VideoLLaMA3Trainer(Trainer):
         `shell/pretrain_phase2_internvid.sh`'s documented staggered-start recipe). Confirmed:
         without this, a `QBASE_LR=1e-12` cold run followed by a same-`OUTPUT_DIR` resume at
         `QBASE_LR=1e-5` silently keeps training the qbase group at ~1e-12 for the entire
-        resumed run -- no error, no warning, `token_compressor.stage1.*` ends up bit-identical
+        resumed run -- no error, no warning, `token_compressor.qbase.*` ends up bit-identical
         to the warm start.
 
         Re-apply the CLI-configured per-group LR here, right after both restores have run, so

@@ -1,10 +1,10 @@
 """
-Stage-2 segment aggregator — a Mamba-2 accumulator with bounded state.
+The fold — a Mamba-2 segment aggregator with bounded state.
 
 Context
 -------
-Stage 1 (the pretrained token compressor) turns each scene segment of a long video
-into a *fixed* number of tokens ``K`` (e.g. 64). This module is stage 2: it folds the
+The qbase (the pretrained token compressor) turns each scene segment of a long video
+into a *fixed* number of tokens ``K`` (e.g. 64). This module is the fold: it folds the
 temporally-ordered stream of per-segment summaries
 
     seg_0 (K tokens), seg_1 (K tokens), ...  seg_{N-1} (K tokens)
@@ -498,7 +498,7 @@ class AggregatorState:
 
 @dataclass
 class SegmentAggregatorConfig:
-    # d_input == a stage-1 (qbase) token dim. Under TwoStageCompressor this is the
+    # d_input == a qbase token dim. Under TwoStageCompressor this is the
     # COMPRESSOR hidden (SigLIP-NaViT 1152), NOT the LLM hidden: the fold runs
     # before mm_projector, in encoder space, and output_proj decodes the readout
     # back to d_output so it re-enters the same frozen mm_projector as the qbase

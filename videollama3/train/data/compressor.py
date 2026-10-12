@@ -255,6 +255,7 @@ class DataCollatorWithCompressor:
         new_compression_frame_sec: List[List[int]] = []
         new_compression_qbase_only: List[bool] = []
         new_compression_is_image: List[bool] = []
+        new_compression_frame_ts_ids: List[List[List[int]]] = []
         accumulated_length = 0
         image_token_id = self.vlprocessor.tokenizer.convert_tokens_to_ids(DEFAULT_IMAGE_TOKEN)
         for sample_idx in range(0, len(input_ids)):
@@ -286,6 +287,11 @@ class DataCollatorWithCompressor:
             new_compression_is_image.extend(
                 instances[sample_idx].get(
                     "compression_is_image", [False] * len(compression_parts[sample_idx])
+                )
+            )
+            new_compression_frame_ts_ids.extend(
+                instances[sample_idx].get(
+                    "compression_frame_ts_ids", [[] for _ in compression_parts[sample_idx]]
                 )
             )
             # Full compression parts (same offset logic).
@@ -327,6 +333,10 @@ class DataCollatorWithCompressor:
         # step's kwargs are byte-identical to before this flag existed.
         if any(new_compression_is_image):
             batch["compression_is_image"] = new_compression_is_image
+        # Per-frame "Time X.Xs:" ids for raw/qbase hybrid samples (qbase_llm_full_ft.py);
+        # only sent when some sample carries them.
+        if any(new_compression_frame_ts_ids):
+            batch["compression_frame_ts_ids"] = new_compression_frame_ts_ids
 
         return batch
 

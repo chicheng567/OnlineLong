@@ -1,6 +1,7 @@
 import contextlib
 import math
 import os
+import random
 
 from torch.nn import LayerNorm
 import torch
@@ -342,6 +343,93 @@ def adaptive_segment_count(n_frames: int, target_frames: int = 4, force_every: i
     return N
 
 
+def hybrid_rng(seed) -> random.Random:
+    """RNG behind a sample's raw/qbase hybrid draw (``hybrid_raw_*`` on the flat
+    qbase). Keyed on the per-sample ``compression_seed`` but decorrelated from
+    ``pick_target_frames`` (``seed % len(choices)``) and from the segmenter's Gumbel
+    generator, so being a hybrid sample says nothing about its tf or its cut."""
+    return random.Random((int(seed) * 2_654_435_761 + 0x5EED) % (2 ** 61 - 1))
+
+
+def hybrid_raw_count(n_segments: int, seg_frac: float) -> int:
+    """Raw segments of a hybrid sample: ``round(seg_frac * N)``, always leaving at
+    least one qbase segment (so every sample keeps the qbase in the graph)."""
+    n = int(math.floor(float(seg_frac) * int(n_segments) + 0.5))
+    return max(0, min(n, int(n_segments) - 1))
+
+
+def rawdp_layout(n_frames: int, hw: int, tf: int, budget: int, k: int,
+                 force_every: int = 8) -> "tuple[int, int]":
+    """``(r, Q)`` for a budgeted raw/qbase window (``qbase_llm_full_ft.py --rawdp_budget``):
+    ``r`` frames stay raw (``hw`` rows each), the other ``T - r`` are covered by
+    ``Q = ⌊(T - r)/tf⌋ + 1`` qbase blocks (``k`` rows each, 1..``force_every`` frames).
+    ``r`` is the largest value with ``r*hw + Q*k <= budget`` and ``r <= T - 1``, so a
+    clip that fits raw still keeps one 1-frame qbase block (the qbase stays in every
+    sample's graph -- a rank with no qbase rows desyncs ZeRO's gradient buffer). If
+    even ``r = 0`` overflows, ``Q`` drops to ``budget // k`` (never below the
+    ``force_every`` floor). A pure function of the frame count, so the dataset's cost
+    estimate, ``output_len_for`` and ``forward`` agree."""
+    T, hw, tf, k = int(n_frames), int(hw), max(1, int(tf)), int(k)
+    if T <= 1:
+        return 0, 1
+
+    def q_for(n):
+        return min(n // tf + 1, n)
+
+    for r in range(T - 1, -1, -1):
+        if r * hw + q_for(T - r) * k <= budget:
+            return r, q_for(T - r)
+    return 0, max(-(-T // int(force_every)), min(q_for(T), int(budget) // k))
+
+
+def rawdp_place(per_frame_feat: torch.Tensor, n_raw: int, n_q: int,
+                max_len: int = 8) -> "tuple[list[int], set[int]]":
+    """Exact DP placement for ``rawdp_layout``'s ``(r, Q)``: cut the ``T`` frames into
+    ``r`` single raw frames and ``Q`` contiguous qbase blocks of 1..``max_len`` frames,
+    minimising the summed within-block WCSS of the L2-normalised per-frame features
+    (the budget fold's changepoint cost). Raw frames cost nothing, so they land on the
+    frames that would spread a block most. Returns ``(seg_lens, raw_idx)``: segment
+    frame-lengths in time order and the indices of the raw (1-frame) segments.
+    ``O(T * max_len * r * Q)``, float64, deterministic."""
+    T = int(per_frame_feat.shape[0])
+    R, Q, Lm = int(n_raw), int(n_q), int(max_len)
+    assert R + Q <= T and Q >= 1 and Q * Lm >= T - R, (T, R, Q, Lm)
+    x = torch.nn.functional.normalize(per_frame_feat.detach().float(), dim=-1).double().cpu()
+    S1 = torch.zeros(T + 1, x.shape[1], dtype=torch.float64)
+    S1[1:] = x.cumsum(0)
+    S2 = torch.zeros(T + 1, dtype=torch.float64)
+    S2[1:] = (x * x).sum(-1).cumsum(0)
+    inf = float("inf")
+    dp = torch.full((T + 1, R + 1, Q + 1), inf, dtype=torch.float64)
+    bt = torch.zeros((T + 1, R + 1, Q + 1), dtype=torch.int8)     # 0 = raw frame, L = block of L
+    dp[0, 0, 0] = 0.0
+    for t in range(1, T + 1):
+        best = torch.full((R + 1, Q + 1), inf, dtype=torch.float64)
+        arg = torch.zeros((R + 1, Q + 1), dtype=torch.int8)
+        if R > 0:                                                   # frame t-1 raw
+            best[1:, :] = dp[t - 1, :-1, :]
+        for L in range(1, min(Lm, t) + 1):                          # block [t-L, t)
+            a = t - L
+            d = S1[t] - S1[a]
+            w = float(S2[t] - S2[a] - (d * d).sum() / L)
+            cand = torch.full((R + 1, Q + 1), inf, dtype=torch.float64)
+            cand[:, 1:] = dp[a, :, :-1] + max(w, 0.0)
+            take = cand < best
+            best = torch.where(take, cand, best)
+            arg[take] = L
+        dp[t], bt[t] = best, arg
+    assert dp[T, R, Q] < inf, f"rawdp_place: no layout for T={T} r={R} Q={Q} max_len={Lm}"
+    lens, raw, t, r, q = [], [], T, R, Q
+    while t > 0:
+        L = int(bt[t, r, q])
+        if L == 0:
+            lens.append(1); raw.append(True); t -= 1; r -= 1
+        else:
+            lens.append(L); raw.append(False); t -= L; q -= 1
+    lens.reverse(); raw.reverse()
+    return lens, {j for j, is_raw in enumerate(raw) if is_raw}
+
+
 def pick_target_frames(choices, seed, default: int) -> int:
     """Per-sample frames/segment for the mixed-granularity qbase stream
     (``--segment_target_frames_choices``): ``choices[seed % len(choices)]`` when both
@@ -398,7 +486,7 @@ def adaptive_segment_lengths(
     n_segments: "int | None" = None,   # explicit N (Phase-3 target-N rule); overrides target_frames
 ) -> "list[int]":
     """Fixed-count, adaptively-placed segmentation (design doc §4 Phase 1, validated
-    in ``eval_ablation/segmenter_validate.py``).
+    in ``eval_ablation/archive/segmenter_validate.py``).
 
     Returns segment frame-lengths, ``sum == T`` and ``len == adaptive_segment_count``
     (or ``n_segments`` when given — the Phase-3 target-``N`` rule, §4 Phase 3).
@@ -824,9 +912,74 @@ class TransformerDecoderFlatCompressor(nn.Module):
         # "target_n" -> N = clip(segment_target_n, N_min(T), T), i.e. the cut is
         # denominated in TOKENS (segment_target_n = c * ⌊B/M⌋) like the budget is.
         self.segment_count_rule = str(getattr(config, "segment_count_rule", "frames") or "frames")
+        # Read by the arch's token rewrite: one `Time:{a}s-{b}s:` per segment.
+        self.segment_time_marks = bool(getattr(config, "segment_time_marks", False))
         self.gradient_checkpointing = bool(getattr(config, "compressor_gradient_checkpointing", False))
         self.segment_target_n = int(getattr(config, "segment_target_n", 64) or 64)
         self.segment_min_adapt = float(getattr(config, "segment_min_adapt", 0.5) or 0.0)
+        # Raw/qbase hybrid samples (qbase_llm_full_ft.py, training only): with
+        # probability ``hybrid_raw_sample_prob`` a seeded sample sends
+        # ``hybrid_raw_seg_frac`` of its segments, drawn uniformly from the
+        # ``hybrid_raw_pool_frac`` lowest-change ones, to the LLM as the segment's
+        # middle frame's raw encoder tokens (merge 2, h*w rows) instead of K qbase
+        # rows. A segment is either raw or qbase, never both. Off by default.
+        self.hybrid_raw_sample_prob = float(getattr(config, "hybrid_raw_sample_prob", 0.0) or 0.0)
+        self.hybrid_raw_seg_frac = float(getattr(config, "hybrid_raw_seg_frac", 0.0) or 0.0)
+        self.hybrid_raw_pool_frac = float(getattr(config, "hybrid_raw_pool_frac", 0.5) or 0.5)
+        self._last_hybrid_plan = None
+        # Budgeted raw/qbase windows (qbase_llm_full_ft.py --rawdp_budget, 2026-10-10):
+        # every frame is raw unless the window overflows ``rawdp_budget`` rows; then
+        # ``rawdp_layout`` sets (r raw frames, Q qbase blocks) and ``rawdp_place`` puts
+        # them by exact DP. Training only, unless an eval tool sets ``rawdp_at_eval``
+        # (the checkpoint config carries the budget; a plain qbase eval must not
+        # silently switch modes).
+        self.rawdp_budget = int(getattr(config, "rawdp_budget", 0) or 0)
+        self.rawdp_at_eval = False
+        if self.rawdp_budget > 0 and self.hybrid_raw_sample_prob > 0.0:
+            raise ValueError("rawdp_budget and hybrid_raw_sample_prob are exclusive")
+
+    def hybrid_n_raw(self, n_frames: int, seed=None) -> int:
+        """Raw segments this window gets (0 = plain qbase). Active only in training,
+        with a per-sample seed and the adaptive segmenter on; a pure function of the
+        frame count and the seed, so ``output_len_for`` and ``forward`` agree."""
+        if (not self.training or seed is None or not self.adaptive_segmentation
+                or self.hybrid_raw_sample_prob <= 0.0 or self.hybrid_raw_seg_frac <= 0.0
+                or self.rawdp_on()):
+            return 0
+        if hybrid_rng(seed).random() >= self.hybrid_raw_sample_prob:
+            return 0
+        return hybrid_raw_count(self.segment_count_for(n_frames, seed=seed), self.hybrid_raw_seg_frac)
+
+    def rawdp_on(self) -> bool:
+        return (self.rawdp_budget > 0 and self.adaptive_segmentation
+                and (self.training or self.rawdp_at_eval))
+
+    def rawdp_counts(self, n_frames: int, hw: int, seed=None) -> "tuple[int, int]":
+        """``(r, Q)`` of a budgeted window -- ``rawdp_layout`` with this sample's tf."""
+        tf = pick_target_frames(self.segment_target_frames_choices, seed, self.segment_target_frames)
+        return rawdp_layout(n_frames, hw, tf, self.rawdp_budget, self.num_queries,
+                            self.segment_force_every)
+
+    def _hybrid_raw_segments(self, seg_lens, per_frame, n_raw: int, seed) -> "set[int]":
+        """Indices of the ``n_raw`` raw segments: rank segments by change (mean
+        ``1 - cos`` of consecutive per-frame mean encoder features inside the segment;
+        a 1-frame segment uses its step from the previous frame, the first frame its
+        step to the next), keep the lowest ``ceil(pool_frac * N)``, draw ``n_raw`` of
+        them uniformly with the seeded RNG."""
+        f = torch.nn.functional.normalize(per_frame.float(), dim=-1)
+        diff = (1.0 - (f[1:] * f[:-1]).sum(-1)).tolist()            # diff[j]: frame j -> j+1
+        change, s = [], 0
+        for L in seg_lens:
+            if L >= 2:
+                change.append(sum(diff[s:s + L - 1]) / (L - 1))
+            else:
+                change.append(diff[s - 1] if s >= 1 else diff[0])
+            s += L
+        N = len(seg_lens)
+        pool = sorted(range(N), key=lambda j: (change[j], j))[:int(math.ceil(self.hybrid_raw_pool_frac * N))]
+        rng = hybrid_rng(seed)
+        rng.random()                                                  # the hybrid draw (hybrid_n_raw)
+        return set(rng.sample(pool, min(n_raw, len(pool))))
 
     def segment_count_for(self, n_frames: int, seed=None) -> int:
         """``N`` for a window of ``n_frames`` frames, under the configured rule.
@@ -852,7 +1005,12 @@ class TransformerDecoderFlatCompressor(nn.Module):
         ``segment_count_for`` (a pure function of the frame count)."""
         if not self.adaptive_segmentation:
             return int(self.num_queries)
-        return self.segment_count_for(n_frames, seed=seed) * int(self.num_queries)
+        if self.rawdp_on():
+            r, q = self.rawdp_counts(n_frames, int(h) * int(w), seed=seed)
+            return r * int(h) * int(w) + q * int(self.num_queries)
+        n = self.segment_count_for(n_frames, seed=seed) * int(self.num_queries)
+        n_raw = self.hybrid_n_raw(n_frames, seed=seed)
+        return n + n_raw * (int(h) * int(w) - int(self.num_queries))
 
     def _build_cross_rotary_kv(self, compression_cu_seqlens, device, grid_hws, kept_idx=None):
         """KV-side-only counterpart of TransformerDecoderCompressor._build_cross_rotary_3d
@@ -917,11 +1075,13 @@ class TransformerDecoderFlatCompressor(nn.Module):
         # sample_segmentation: None -> gate the per-epoch boundary jitter on
         # self.training (the Phase-1 single-stage behaviour). Pass an explicit bool
         # so a caller whose train-state differs from this module's can drive it --
-        # TwoStageCompressor.freeze_stage1() pins stage1 to eval(), which must NOT
+        # TwoStageCompressor.freeze_qbase() pins qbase to eval(), which must NOT
         # also silently disable the jitter the fold-variance thesis relies on.
         if kv.dim() == 3:
             kv = kv.squeeze(0)
         self._last_seg_lens = None
+        self._last_hybrid_plan = None
+        hybrid_src = None
         # Encoder-token reference stats (Options A/B), captured before KV pruning /
         # segmentation so the target is the whole window's encoder tokens.
         ref_mean, ref_std, ref_rows = _capture_ref_stats(self, kv)
@@ -949,6 +1109,7 @@ class TransformerDecoderFlatCompressor(nn.Module):
             new_cu = [0]
             new_grid = []
             seg_lens_per_window = []
+            hybrid_plan = []      # per window: None, or [(kind "q"/"r", rows, middle frame)] in time order
             C = kv.size(-1)
             for wi in range(W):
                 a, b = int(cu_in[wi]), int(cu_in[wi + 1])
@@ -967,15 +1128,45 @@ class TransformerDecoderFlatCompressor(nn.Module):
                         gen.manual_seed((int(sv) * 1_000_003 + wi) % (2 ** 63 - 1))
                 with torch.no_grad():
                     per_frame = kv[a:b].view(span // hw, hw, C).float().mean(1)
-                    seg_lens = adaptive_segment_lengths(
-                        per_frame, self.segment_target_frames, self.segment_force_every, tau, gen,
-                        n_segments=self.segment_count_for(span // hw, seed=sv),
-                    )
+                    if self.rawdp_on():
+                        r, q = self.rawdp_counts(span // hw, hw, seed=sv)
+                        seg_lens, raw_set = rawdp_place(per_frame, r, q, self.segment_force_every)
+                    else:
+                        seg_lens = adaptive_segment_lengths(
+                            per_frame, self.segment_target_frames, self.segment_force_every, tau, gen,
+                            n_segments=self.segment_count_for(span // hw, seed=sv),
+                        )
                 seg_lens_per_window.append([int(x) for x in seg_lens])
-                for L in seg_lens:
-                    new_cu.append(new_cu[-1] + L * hw)
-                    new_grid.append(grid_hws[wi])
+                if not self.rawdp_on():
+                    n_raw = self.hybrid_n_raw(span // hw, seed=sv)
+                    raw_set = (self._hybrid_raw_segments(seg_lens, per_frame, n_raw, sv)
+                               if n_raw > 0 else set())
+                plan, s = [], 0
+                for j, L in enumerate(seg_lens):
+                    if j in raw_set:
+                        plan.append(("r", hw, s + (L - 1) // 2))
+                    else:
+                        plan.append(("q", self.num_queries, None))
+                        new_cu.append(new_cu[-1] + L * hw)
+                        new_grid.append(grid_hws[wi])
+                    s += L
+                hybrid_plan.append(plan if raw_set else None)
             self._last_seg_lens = seg_lens_per_window
+            self._last_hybrid_plan = hybrid_plan
+            if any(p is not None for p in hybrid_plan):
+                # Raw segments drop out of the qbase's sub-windows: run the qbase on
+                # the remaining segments' tokens only (new_cu indexes that subset) and
+                # keep the full kv to read the raw rows from after the layer stack.
+                hybrid_src = (kv, cu_in)
+                keep = []
+                for wi, (lens, plan) in enumerate(zip(seg_lens_per_window, hybrid_plan)):
+                    hw = int(grid_hws[wi][0]) * int(grid_hws[wi][1])
+                    s = int(cu_in[wi])
+                    for L, (kind, _, _) in zip(lens, plan or [("q", 0, None)] * len(lens)):
+                        if kind == "q":
+                            keep.append(kv[s: s + L * hw])
+                        s += L * hw
+                kv = torch.cat(keep, dim=0)
             compression_cu_seqlens = torch.tensor(
                 new_cu, device=kv.device, dtype=compression_cu_seqlens.dtype
             )
@@ -1007,7 +1198,28 @@ class TransformerDecoderFlatCompressor(nn.Module):
                 query, kv, cu_seqlens_q, compression_cu_seqlens,
                 rotary_pos_emb=None, cross_rotary_q=None, cross_rotary_kv=cross_rotary_kv,
             )
-        return _finalize_compressed(self, query, ref_mean, ref_std, ref_rows)
+        query = _finalize_compressed(self, query, ref_mean, ref_std, ref_rows)
+        if hybrid_src is None:
+            return query
+        # Interleave, per window in time order: K qbase rows per qbase segment, the
+        # middle frame's h*w encoder rows per raw segment. Option A/B saw qbase rows only.
+        kv_full, cu_in = hybrid_src
+        out, q = [], 0
+        for wi, plan in enumerate(self._last_hybrid_plan):
+            if plan is None:
+                n = len(self._last_seg_lens[wi]) * self.num_queries
+                out.append(query[q: q + n])
+                q += n
+                continue
+            for kind, rows, mid in plan:
+                if kind == "q":
+                    out.append(query[q: q + rows])
+                    q += rows
+                else:
+                    a = int(cu_in[wi]) + mid * rows
+                    out.append(kv_full[a: a + rows].to(query.dtype))
+        assert q == query.shape[0], f"hybrid assembly used {q} of {query.shape[0]} qbase rows"
+        return torch.cat(out, dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -1202,7 +1414,7 @@ def _read_token_compressor_state_dict(path: str) -> dict:
 
     Keys come back relative to the compressor MODULE: only the
     ``model.token_compressor.`` / ``token_compressor.`` prefix is stripped, so a
-    two-stage checkpoint keeps its ``stage1.`` / ``stage2.`` prefixes and a
+    two-stage checkpoint keeps its ``qbase.`` / ``fold.`` prefixes and a
     single-stage one keeps its bare ``layers.…`` / ``query`` names. Mapping
     between the two layouts is ``load_pretrained_compressor``'s job — doing it
     here is what silently dropped every Phase-2 fold weight on a Phase-3
@@ -1240,13 +1452,13 @@ def _read_token_compressor_state_dict(path: str) -> dict:
 def _load_flat_compressor_state_dict(path: str) -> dict:
     """``_read_token_compressor_state_dict`` reduced to the **qbase** keys, ready
     for ``TransformerDecoderFlatCompressor.load_state_dict(..., strict=False)``:
-    a two-stage checkpoint's ``stage1.`` prefix is stripped and its ``stage2.``
+    a two-stage checkpoint's ``qbase.`` prefix is stripped and its ``fold.``
     keys dropped; a single-stage one passes through. Used by
-    ``TwoStageCompressor.load_stage1_pretrained`` (``--stage1_pretrained``)."""
+    ``TwoStageCompressor.load_qbase_pretrained`` (``--qbase_pretrained``)."""
     sd = _read_token_compressor_state_dict(path)
-    if any(k.startswith("stage1.") for k in sd):
-        return {k[len("stage1."):]: v for k, v in sd.items() if k.startswith("stage1.")}
-    return {k: v for k, v in sd.items() if not k.startswith("stage2.")}
+    if any(k.startswith("qbase.") for k in sd):
+        return {k[len("qbase."):]: v for k, v in sd.items() if k.startswith("qbase.")}
+    return {k: v for k, v in sd.items() if not k.startswith("fold.")}
 
 
 def load_pretrained_compressor(compressor, path: str, verbose: bool = True):
@@ -1254,13 +1466,13 @@ def load_pretrained_compressor(compressor, path: str, verbose: bool = True):
     adapting between the single-stage (qbase) and two-stage (qbase + fold) key
     layouts so a warm-start cannot silently load nothing:
 
-      * two-stage checkpoint -> ``TwoStageCompressor``: verbatim (``stage1.*``,
-        ``stage2.*``, and the wrapper's own ``out_gamma``/``out_beta``);
+      * two-stage checkpoint -> ``TwoStageCompressor``: verbatim (``qbase.*``,
+        ``fold.*``, and the wrapper's own ``out_gamma``/``out_beta``);
       * single-stage (Phase-1 qbase) -> ``TwoStageCompressor``: every key is
-        prefixed ``stage1.``, so the fold stays at its random init (the Phase-2
+        prefixed ``qbase.``, so the fold stays at its random init (the Phase-2
         cold-start case);
-      * two-stage checkpoint -> a single-stage compressor: ``stage1.`` stripped,
-        ``stage2.`` dropped.
+      * two-stage checkpoint -> a single-stage compressor: ``qbase.`` stripped,
+        ``fold.`` dropped.
 
     Raises when the adapted state dict overlaps NOTHING in the target — the
     failure mode this function exists to prevent (a Phase-2 run dir read through
@@ -1269,15 +1481,15 @@ def load_pretrained_compressor(compressor, path: str, verbose: bool = True):
     """
     sd = _read_token_compressor_state_dict(path)
     target_keys = set(compressor.state_dict().keys())
-    ckpt_two_stage = any(k.startswith(("stage1.", "stage2.")) for k in sd)
-    target_two_stage = hasattr(compressor, "stage1") and hasattr(compressor, "stage2")
+    ckpt_two_stage = any(k.startswith(("qbase.", "fold.")) for k in sd)
+    target_two_stage = hasattr(compressor, "qbase") and hasattr(compressor, "fold")
 
     if target_two_stage and not ckpt_two_stage:
-        sd = {f"stage1.{k}": v for k, v in sd.items()}
-        how = "single-stage qbase -> stage1.* (fold left at init)"
+        sd = {f"qbase.{k}": v for k, v in sd.items()}
+        how = "single-stage qbase -> qbase.* (fold left at init)"
     elif ckpt_two_stage and not target_two_stage:
         sd = _load_flat_compressor_state_dict(path)
-        how = "two-stage -> qbase only (stage2.* dropped)"
+        how = "two-stage -> qbase only (fold.* dropped)"
     else:
         how = "verbatim"
 
@@ -1298,7 +1510,7 @@ def load_pretrained_compressor(compressor, path: str, verbose: bool = True):
 
 
 class TwoStageCompressor(nn.Module):
-    """Stage-1 per-segment query compressor + Stage-2 Mamba-2 segment fold.
+    """Per-segment query compressor (the qbase) + Mamba-2 segment fold (the fold).
 
     ``compress_windows(kv, compression_cu_seqlens, grid_hws, unit_counts, seed)``
     takes one **whole-video** window per ``compression_part`` and splits it, model
@@ -1307,7 +1519,7 @@ class TwoStageCompressor(nn.Module):
 
         window's  T x h x w  input tokens
           └ adaptive_segment_lengths  -> N segments (1..8 frames each, forced-8 + top-diff)
-              └ Stage-1 flat compressor, per segment -> N x K tokens
+              └ qbase flat compressor, per segment -> N x K tokens
                   └ U-1 unit boundaries at largest inter-segment feature diff (+Gumbel)
                       └ per unit u (N_u segments): SegmentAggregator fold -> M readout tokens
 
@@ -1326,48 +1538,48 @@ class TwoStageCompressor(nn.Module):
     the feature probes).
 
     ``qbase_only`` is a list of bools aligned to windows; ``qbase_only[w]`` routes
-    window ``w`` straight through stage-1 (``N*K`` qbase tokens, stride-1 RoPE slots,
+    window ``w`` straight through qbase (``N*K`` qbase tokens, stride-1 RoPE slots,
     no unit split, no fold) -- the Phase-2 pure-qbase replay path.
 
     ``seed`` (int or None): when set **and** ``self.training``, seeds the Gumbel-top-k
     draws for the segment and unit boundaries, so a resume reproduces the
     partition. ``None`` / eval -> deterministic top-diff.
 
-    Stage-1 (``.stage1``, a ``TransformerDecoderFlatCompressor``) is warm-started from
-    the pretrained qbase; ``.stage1.adaptive_segmentation`` is forced **on** here (the
-    fold consumes per-segment qbase tokens, so stage-1 must self-segment and report
-    the cut via ``_last_seg_lens``). ``freeze_stage1()``
+    The qbase (``.qbase``, a ``TransformerDecoderFlatCompressor``) is warm-started from
+    the pretrained qbase; ``.qbase.adaptive_segmentation`` is forced **on** here (the
+    fold consumes per-segment qbase tokens, so qbase must self-segment and report
+    the cut via ``_last_seg_lens``). ``freeze_qbase()``
     pins it to ``eval()`` + ``requires_grad=False``. Option A/B on the fold readout
     live on this wrapper (``out_gamma``/``out_beta``, ``_last_distr_loss``,
     ``distr_loss_weight``) so the trainer's ``_compressor_distr_loss`` picks them up
-    unchanged; ``_last_distr_loss`` also folds in ``.stage1``'s own term when stage-1
+    unchanged; ``_last_distr_loss`` also folds in ``.qbase``'s own term when qbase
     is trainable.
     """
 
     def __init__(self, config):
         super().__init__()
-        self.stage1 = TransformerDecoderFlatCompressor(config)
-        # Stage-1 does the content-adaptive segmentation (same code path as Phase 1);
-        # it reports the cut via ``stage1._last_seg_lens`` and this wrapper groups
+        self.qbase = TransformerDecoderFlatCompressor(config)
+        # qbase does the content-adaptive segmentation (same code path as Phase 1);
+        # it reports the cut via ``qbase._last_seg_lens`` and this wrapper groups
         # those segments into units. The fold consumes per-segment qbase tokens, so
         # adaptive segmentation is required here — turn it on if the config left it off.
-        self.stage1.adaptive_segmentation = True
+        self.qbase.adaptive_segmentation = True
         self.tokens_per_segment = int(getattr(config, "num_queries", 64))                       # K
-        self.n_summary_tokens = int(getattr(config, "stage2_n_summary_tokens", self.tokens_per_segment))  # M
+        self.n_summary_tokens = int(getattr(config, "fold_n_summary_tokens", self.tokens_per_segment))  # M
         # N = adaptive_segment_count(T) is a pure function of the frame count, kept in
-        # sync with the collator/dataset via stage-1's own segment_target_frames.
-        self.segment_target_frames = int(getattr(self.stage1, "segment_target_frames", 4))
+        # sync with the collator/dataset via qbase's own segment_target_frames.
+        self.segment_target_frames = int(getattr(self.qbase, "segment_target_frames", 4))
         # RoPE-slot scale for the readout (design doc §1 / §7). "ratio" -> readout
         # token m at round(m * N_u*K / M), unit span N_u*K (Phase-1 footprint);
         # a float S -> seconds scale, unit span round((b-a)*S).
-        rss = getattr(config, "stage2_rope_slot_scale", "ratio")
+        rss = getattr(config, "fold_rope_slot_scale", "ratio")
         self.rope_slot_scale = rss if rss == "ratio" else float(rss)
         hidden = int(config.hidden_size)
         # The fold runs BEFORE mm_projector, in the compressor's own hidden space
         # (NOT the LLM hidden): d_input == d_output == the compressor hidden, and
         # SegmentAggregator.output_proj (d_model -> d_output) is the learned
         # readout DECODE -- the M summary tokens come out of the fold's working
-        # space (stage2_d_model, a bottleneck below `hidden`) and output_proj maps
+        # space (fold_d_model, a bottleneck below `hidden`) and output_proj maps
         # them onto the encoder scale mm_projector expects (Option A/B then pull
         # them onto its manifold). The qbase-only replay stream and this fold
         # readout are two distinct, independently-moving distributions, so each
@@ -1379,40 +1591,40 @@ class TwoStageCompressor(nn.Module):
         agg_cfg = SegmentAggregatorConfig(
             d_input=hidden,
             d_output=hidden,
-            d_model=int(getattr(config, "stage2_d_model", 1024)),
+            d_model=int(getattr(config, "fold_d_model", 1024)),
             tokens_per_segment=self.tokens_per_segment,
             n_summary_tokens=self.n_summary_tokens,
-            n_layers=int(getattr(config, "stage2_n_layers", 4)),
-            d_state=int(getattr(config, "stage2_d_state", 128)),
-            headdim=int(getattr(config, "stage2_headdim", 64)),
-            ngroups=int(getattr(config, "stage2_ngroups", 1)),
-            d_conv=int(getattr(config, "stage2_d_conv", 4)),
-            expand=int(getattr(config, "stage2_expand", 2)),
-            chunk_size=int(getattr(config, "stage2_chunk_size", 128)),
-            mlp_ratio=float(getattr(config, "stage2_mlp_ratio", 0.0)),
-            dropout=float(getattr(config, "stage2_dropout", 0.0)),
-            input_norm=bool(getattr(config, "stage2_input_norm", True)),
-            final_norm=str(getattr(config, "stage2_final_norm", "rmsnorm")),
-            time_embed=str(getattr(config, "stage2_time_embed", "index_sincos")),
+            n_layers=int(getattr(config, "fold_n_layers", 4)),
+            d_state=int(getattr(config, "fold_d_state", 128)),
+            headdim=int(getattr(config, "fold_headdim", 64)),
+            ngroups=int(getattr(config, "fold_ngroups", 1)),
+            d_conv=int(getattr(config, "fold_d_conv", 4)),
+            expand=int(getattr(config, "fold_expand", 2)),
+            chunk_size=int(getattr(config, "fold_chunk_size", 128)),
+            mlp_ratio=float(getattr(config, "fold_mlp_ratio", 0.0)),
+            dropout=float(getattr(config, "fold_dropout", 0.0)),
+            input_norm=bool(getattr(config, "fold_input_norm", True)),
+            final_norm=str(getattr(config, "fold_final_norm", "rmsnorm")),
+            time_embed=str(getattr(config, "fold_time_embed", "index_sincos")),
             gradient_checkpointing=bool(getattr(config, "compressor_gradient_checkpointing", False)),
         )
-        self.stage2 = SegmentAggregator(agg_cfg)
+        self.fold = SegmentAggregator(agg_cfg)
         # Batched-fold length bucketing (see _bucket_fold_tasks).
-        self.fold_bucket_ratio = float(getattr(config, "stage2_fold_bucket_ratio", 2.0))
-        self.fold_bucket_max_segments = int(getattr(config, "stage2_fold_bucket_max_segments", 512))
+        self.fold_bucket_ratio = float(getattr(config, "fold_bucket_ratio", 2.0))
+        self.fold_bucket_max_segments = int(getattr(config, "fold_bucket_max_segments", 512))
         # Phase-3 unit placement (design doc §4 Phase 3, §5 items 13/16). "greedy" =
         # Phase 2's validated top-diff + min_gap ranking (unchanged); "dp" = the exact
         # DP on WCSS + lam*depth_cost, which is what makes N_u == 1 (raw bypass)
         # reachable at all -- greedy's min_gap is a floor on every unit's size.
-        self.unit_placement = str(getattr(config, "stage2_unit_placement", "greedy") or "greedy")
-        self.dp_lambda = float(getattr(config, "stage2_dp_lambda", 0.05))
-        self.dp_soft_ratio = float(getattr(config, "stage2_dp_soft_ratio", 1.75))
+        self.unit_placement = str(getattr(config, "fold_unit_placement", "greedy") or "greedy")
+        self.dp_lambda = float(getattr(config, "fold_dp_lambda", 0.05))
+        self.dp_soft_ratio = float(getattr(config, "fold_dp_soft_ratio", 1.75))
         # Phase-3 raw bypass: a unit holding a single segment emits that segment's K
         # qbase tokens verbatim instead of folding a singleton (kind "qbase" -> the
         # qbase projector). NOT the banned retained-K: a segment is either raw or
         # absorbed into some other unit's fold, never both.
-        self.bypass_singletons = bool(getattr(config, "stage2_bypass_singletons", False))
-        self.stage1_frozen = False
+        self.bypass_singletons = bool(getattr(config, "fold_bypass_singletons", False))
+        self.qbase_frozen = False
         # Option A (out_gamma/out_beta) + Option B (distr_loss_weight, _last_distr_loss)
         # for the fold readout — same helper the single-stage compressors use.
         _init_encoder_scale_match(self, config)
@@ -1422,20 +1634,20 @@ class TwoStageCompressor(nn.Module):
         return 1, self.n_summary_tokens
 
     def segment_count_for(self, n_frames: int) -> int:
-        """``N`` for a ``n_frames``-frame window — stage-1's rule verbatim, so the
+        """``N`` for a ``n_frames``-frame window — qbase's rule verbatim, so the
         dataset can predict the partition without decoding anything."""
-        return self.stage1.segment_count_for(n_frames)
+        return self.qbase.segment_count_for(n_frames)
 
-    def freeze_stage1(self):
-        for p in self.stage1.parameters():
+    def freeze_qbase(self):
+        for p in self.qbase.parameters():
             p.requires_grad_(False)
-        self.stage1.eval()
-        self.stage1_frozen = True
+        self.qbase.eval()
+        self.qbase_frozen = True
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if self.stage1_frozen:
-            self.stage1.eval()
+        if self.qbase_frozen:
+            self.qbase.eval()
         return self
 
     # -- unit boundary placement (content-aware, model-side) -----------------
@@ -1493,7 +1705,7 @@ class TwoStageCompressor(nn.Module):
         input; a WCSS-space jitter analogue is an open item in the design doc.
         ``O(N^2 U)`` — ``N ~ 300``, ``U <= 16`` at Phase-3 scale, negligible next to
         one training step. Reference implementation + probe:
-        ``eval_ablation/phase3_dp_depth_probe.py``.
+        ``eval_ablation/archive/phase3_dp_depth_probe.py``.
         """
         N = int(seg_feat.shape[0])
         even = [round(N * u / U) for u in range(U + 1)]
@@ -1615,27 +1827,27 @@ class TwoStageCompressor(nn.Module):
         K, M = self.tokens_per_segment, self.n_summary_tokens
         _has_seed = seed is not None and not (isinstance(seed, (list, tuple)) and len(seed) == 0)
         # Per-epoch re-partitioning is governed by THIS wrapper's train state + the
-        # qbase's segment_sample_tau, NOT stage1.training -- freeze_stage1() pins
-        # stage1 to eval() and that must not also disable the segment/unit jitter
+        # qbase's segment_sample_tau, NOT qbase.training -- freeze_qbase() pins
+        # qbase to eval() and that must not also disable the segment/unit jitter
         # (docs/two_stage_compression_design.md §4 Phase 2). tau == 0 -> a true
         # fixed-partition ablation: segments AND unit boundaries deterministic.
-        seg_tau = float(getattr(self.stage1, "segment_sample_tau", 0.0) or 0.0)
+        seg_tau = float(getattr(self.qbase, "segment_sample_tau", 0.0) or 0.0)
         sample_partition = bool(self.training and seg_tau > 0.0)
         do_gumbel = bool(sample_partition and _has_seed)
 
-        # -- Stage-1: one call over ALL windows; it does the content-adaptive
+        # -- qbase: one call over ALL windows; it does the content-adaptive
         #    segmentation and reports the cut via ``_last_seg_lens`` (list per window).
         _nan_probe("encoder.tokens_in", kv)
         cc = compression_cu_seqlens.to(device=kv.device, dtype=torch.int32).contiguous()
-        ctx = torch.no_grad() if self.stage1_frozen else contextlib.nullcontext()
+        ctx = torch.no_grad() if self.qbase_frozen else contextlib.nullcontext()
         with ctx:
-            k_all = self.stage1(kv, cc, list(grid_hws),
+            k_all = self.qbase(kv, cc, list(grid_hws),
                                 seed=(seed if do_gumbel else None),
                                 sample_segmentation=sample_partition)
-        _nan_probe("stage1.qbase_out", k_all, windows=W)
-        seg_lens_all = self.stage1._last_seg_lens
+        _nan_probe("qbase.qbase_out", k_all, windows=W)
+        seg_lens_all = self.qbase._last_seg_lens
         assert seg_lens_all is not None and len(seg_lens_all) == W, (
-            "TwoStageCompressor needs stage1.adaptive_segmentation on (it reports _last_seg_lens)"
+            "TwoStageCompressor needs qbase.adaptive_segmentation on (it reports _last_seg_lens)"
         )
         k_all = k_all.reshape(-1, K, k_all.shape[-1])               # (Σ N_i, K, hidden)
 
@@ -1649,7 +1861,7 @@ class TwoStageCompressor(nn.Module):
         #    in exactly that order, see compress_visual_tokens_with_compressor's
         #    contiguous per-window replace_mask slicing.)
         items: "list[tuple]" = []       # ("ready", rows, meta) | ("fold", task_dict)
-        need_seg_secs = self.stage2.cfg.time_embed == "rel_gap_mlp"
+        need_seg_secs = self.fold.cfg.time_embed == "rel_gap_mlp"
 
         for wi in range(W):
             win = kv[cu[wi]:cu[wi + 1]]                          # (T*h*w, hidden)
@@ -1661,7 +1873,7 @@ class TwoStageCompressor(nn.Module):
             fstart = [0]
             for L in seg_lens:
                 fstart.append(fstart[-1] + L)                    # segment i -> frames [fstart[i], fstart[i+1])
-            k_tok = k_all[seg_row: seg_row + N]                  # (N, K, hidden) — stage1's qbase output
+            k_tok = k_all[seg_row: seg_row + N]                  # (N, K, hidden) — the qbase output
             seg_row += N
 
             # -- qbase-only passthrough (Phase-1 layout: no units, no fold) ----
@@ -1693,7 +1905,7 @@ class TwoStageCompressor(nn.Module):
 
             # -- unit boundaries from the SEGMENT (qbase) features ------------
             # Group segments by what the fold will actually consume: each
-            # segment's K stage-1 qbase tokens mean-pooled to one vector. NOT the
+            # segment's K qbase tokens mean-pooled to one vector. NOT the
             # raw frozen-encoder feature (whose ~0.94 common component dominates
             # the cosine and whose geometry the fold never sees).
             # docs/two_stage_compression_design.md §4 Phase 2.
@@ -1717,7 +1929,7 @@ class TwoStageCompressor(nn.Module):
                 # The segment is raw here and absorbed nowhere else -- there is no
                 # duplicate representation, so this is NOT the banned retained-K.
                 # Routed to mm_projector_qbase via kind="qbase"; Option A/B are
-                # already on these rows (stage-1 applied them in _finalize_compressed).
+                # already on these rows (qbase applied them in _finalize_compressed).
                 if N_u == 1 and self.bypass_singletons:
                     rows = k_u.reshape(K, k_u.shape[-1])
                     span = self._unit_slot_span(N_u, K, fstart[s_a], fstart[s_b])
@@ -1755,13 +1967,13 @@ class TwoStageCompressor(nn.Module):
         #    single group, i.e. the previous single-call behaviour.
         #    Falls back to nothing (empty tensor) when this call has no fold units
         #    at all (e.g. every window here is qbase_only).
-        # Every rank must touch stage2 (and the wrapper's Option-A params) on EVERY
+        # Every rank must touch fold (and the wrapper's Option-A params) on EVERY
         # step, whatever its one video happened to contain. A window can legitimately
         # produce no fold at all -- ``qbase_only`` replay (~6% of Phase-3 data), or a
         # Phase-3 clip short enough that every unit is a single-segment raw bypass
         # (N <= U, 1.4% of the pool) -- and ``group_by_compression_depth`` makes each
         # grad-accum window depth-homogeneous, so a whole no-fold window per rank is
-        # correlated, not an independent coin flip. Skipping stage2 leaves its 29.9M
+        # correlated, not an independent coin flip. Skipping fold leaves its 29.9M
         # params without a gradient on that rank only, which makes ZeRO's flattened
         # gradient buffer a DIFFERENT SIZE per rank and hangs the matching allreduce
         # -- measured: an 8-rank run died on step 1 in
@@ -1789,20 +2001,20 @@ class TwoStageCompressor(nn.Module):
                     seg_mask[i, N_max - n:] = True
                     if need_seg_secs:
                         secs_padded[i, N_max - n:] = t["seg_secs"]
-                _nan_probe("stage2.fold_in", padded, G=G, N_max=N_max)
-                m_tok_all = self.stage2(padded, segment_seconds=secs_padded,
+                _nan_probe("fold.fold_in", padded, G=G, N_max=N_max)
+                m_tok_all = self.fold(padded, segment_seconds=secs_padded,
                                         segment_valid_mask=seg_mask)           # (G, M, hidden)
-                _nan_probe("stage2.fold_out", m_tok_all, G=G, N_max=N_max)
+                _nan_probe("fold.fold_out", m_tok_all, G=G, N_max=N_max)
                 for i, t in enumerate(g_tasks):
                     t["m_tok"] = m_tok_all[i]
-        elif self.training and any(p.requires_grad for p in self.stage2.parameters()):
-            # No fold this window -> run a one-segment zero input through stage2 and
+        elif self.training and any(p.requires_grad for p in self.fold.parameters()):
+            # No fold this window -> run a one-segment zero input through fold and
             # carry its output into the graph at coefficient 0. Gradients are exactly
             # zero; the backward hooks still fire, so the reduction matches the ranks
             # that did fold.
             dummy = k_all.new_zeros(1, 1, K, k_all.shape[-1])
             dummy_secs = k_all.new_zeros(1, 1, 2) if need_seg_secs else None
-            null_term = self.stage2(dummy, segment_seconds=dummy_secs).sum() * 0.0
+            null_term = self.fold(dummy, segment_seconds=dummy_secs).sum() * 0.0
 
         # -- pass 3: Option A/B + RoPE-slot placement, in original order.
         outs: "list[torch.Tensor]" = []
@@ -1851,10 +2063,10 @@ class TwoStageCompressor(nn.Module):
                 "kind": "fold",
             })
 
-        # Option B: sum the fold-readout terms and fold in stage-1's own term
-        # (present only when stage-1 is trainable and in training).
+        # Option B: sum the fold-readout terms and fold in qbase's own term
+        # (present only when qbase is trainable and in training).
         last = torch.stack(distr_terms).mean() if distr_terms else None
-        s1 = getattr(self.stage1, "_last_distr_loss", None)
+        s1 = getattr(self.qbase, "_last_distr_loss", None)
         if s1 is not None:
             last = s1 if last is None else last + s1
         self._last_distr_loss = last
@@ -1862,13 +2074,13 @@ class TwoStageCompressor(nn.Module):
         compressed = torch.cat(outs, dim=0) if outs else kv.new_zeros(0, kv.shape[-1])
         _nan_probe("compress_windows.out", compressed, units=len(unit_meta))
         # Option A's out_gamma/out_beta are applied in the fold branch only, so a
-        # no-fold window starves them the same way it starves stage2 above. Fold
+        # no-fold window starves them the same way it starves fold above. Fold
         # them into the same zero-coefficient null term.
         if null_term is not None and getattr(self, "match_encoder_scale", False):
             null_term = null_term + (self.out_gamma.sum() + self.out_beta.sum()) * 0.0
         if null_term is not None and compressed.numel():
             # Adding an exact 0.0 leaves every value bit-identical; it only puts
-            # stage2 / out_gamma / out_beta on this rank's backward graph.
+            # fold / out_gamma / out_beta on this rank's backward graph.
             compressed = compressed + null_term.to(compressed.dtype)
         return compressed, unit_meta
 
@@ -1878,12 +2090,12 @@ class TwoStageCompressor(nn.Module):
                                      unit_counts=unit_counts, seed=seed,
                                      qbase_only=qbase_only)
 
-    def load_stage1_pretrained(self, path: str, verbose: bool = True):
+    def load_qbase_pretrained(self, path: str, verbose: bool = True):
         sd = _load_flat_compressor_state_dict(path)
-        missing, unexpected = self.stage1.load_state_dict(sd, strict=False)
+        missing, unexpected = self.qbase.load_state_dict(sd, strict=False)
         if verbose:
             print(
-                f"[TwoStageCompressor] loaded stage-1 qbase from {path} "
+                f"[TwoStageCompressor] loaded qbase from {path} "
                 f"({len(sd)} tensors; missing={len(missing)}, unexpected={len(unexpected)})"
             )
             if unexpected:
@@ -1950,35 +2162,41 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         segment_count_rule="frames",     # "frames" | "target_n"
         segment_target_n=64,             # c * ⌊B/M⌋ (decision: c = 4, B = 1024, M = 64)
         segment_min_adapt=0.5,
-        # Stage-2 fold (compressor_type "…+mamba" -> TwoStageCompressor). K is
-        # num_queries (the stage-1 qbase's query count); these size .stage2, the
+        # Per-segment timestamps (single-stage qbase): the arch emits one
+        # `Time:{a}s-{b}s: <cs> K rows <ce>` block PER SEGMENT ({a, b} = the segment's
+        # first / last frame second) instead of one whole-video range in front of all
+        # N*K rows. False = the pre-2026-10-12 layout every older checkpoint was
+        # trained with (their saved config has no such field).
+        segment_time_marks=False,
+        # fold (compressor_type "…+mamba" -> TwoStageCompressor). K is
+        # num_queries (the qbase's query count); these size .fold, the
         # SegmentAggregator. See docs/two_stage_compression_design.md.
-        stage2_n_summary_tokens=64,     # M (tie to K unless told otherwise)
-        stage2_frames_per_segment=4,    # frames per stage-1 segment, clamp [1, 8]
-        stage2_d_model=1024,            # fold working width (bottleneck below hidden); output_proj decodes back to hidden
-        stage2_n_layers=4,
-        stage2_d_state=128,
-        stage2_headdim=64,
-        stage2_ngroups=1,
-        stage2_d_conv=4,
-        stage2_expand=2,
-        stage2_chunk_size=128,
-        stage2_mlp_ratio=0.0,
-        stage2_dropout=0.0,
-        stage2_input_norm=True,
-        stage2_final_norm="rmsnorm",     # readout norm: rmsnorm|layernorm|scale|none
-        stage2_time_embed="index_sincos",
-        stage2_rope_slot_scale="ratio",  # "ratio" (readout stride N_u*K/M) or float S (slots/sec)
+        fold_n_summary_tokens=64,     # M (tie to K unless told otherwise)
+        fold_frames_per_segment=4,    # frames per qbase segment, clamp [1, 8]
+        fold_d_model=1024,            # fold working width (bottleneck below hidden); output_proj decodes back to hidden
+        fold_n_layers=4,
+        fold_d_state=128,
+        fold_headdim=64,
+        fold_ngroups=1,
+        fold_d_conv=4,
+        fold_expand=2,
+        fold_chunk_size=128,
+        fold_mlp_ratio=0.0,
+        fold_dropout=0.0,
+        fold_input_norm=True,
+        fold_final_norm="rmsnorm",     # readout norm: rmsnorm|layernorm|scale|none
+        fold_time_embed="index_sincos",
+        fold_rope_slot_scale="ratio",  # "ratio" (readout stride N_u*K/M) or float S (slots/sec)
         # Length bucketing for the batched fold (TwoStageCompressor.compress_windows
         # pass 2). Units are front-padded to their group's deepest N_u, so a group
         # must not mix wildly different depths. See _bucket_fold_tasks.
-        stage2_fold_bucket_ratio=2.0,        # max N_u spread inside one group (<=0 -> one group)
-        stage2_fold_bucket_max_segments=512,  # cap on group_size * N_max padded segments
+        fold_bucket_ratio=2.0,        # max N_u spread inside one group (<=0 -> one group)
+        fold_bucket_max_segments=512,  # cap on group_size * N_max padded segments
         # Phase-3 unit placement + raw bypass (§4 Phase 3, §5 items 13/16).
-        stage2_unit_placement="greedy",   # "greedy" (Phase 2, validated) | "dp" (Phase 3)
-        stage2_dp_lambda=0.05,            # depth_cost weight; >= 0.01 is insensitive
-        stage2_dp_soft_ratio=1.75,        # N_u_soft = ratio * N/U (1.5-2; NOT a fixed 16)
-        stage2_bypass_singletons=False,   # N_u == 1 -> emit the segment's K qbase tokens raw
+        fold_unit_placement="greedy",   # "greedy" (Phase 2, validated) | "dp" (Phase 3)
+        fold_dp_lambda=0.05,            # depth_cost weight; >= 0.01 is insensitive
+        fold_dp_soft_ratio=1.75,        # N_u_soft = ratio * N/U (1.5-2; NOT a fixed 16)
+        fold_bypass_singletons=False,   # N_u == 1 -> emit the segment's K qbase tokens raw
         **kwargs,
     ):
 
@@ -2017,29 +2235,30 @@ class Videollama3TokenCompressorConfig(PretrainedConfig):
         self.segment_count_rule = segment_count_rule
         self.segment_target_n = segment_target_n
         self.segment_min_adapt = segment_min_adapt
-        # Stage-2 fold knobs (only read when compressor_type endswith "+mamba").
-        self.stage2_n_summary_tokens = stage2_n_summary_tokens
-        self.stage2_frames_per_segment = stage2_frames_per_segment
-        self.stage2_d_model = stage2_d_model
-        self.stage2_n_layers = stage2_n_layers
-        self.stage2_d_state = stage2_d_state
-        self.stage2_headdim = stage2_headdim
-        self.stage2_ngroups = stage2_ngroups
-        self.stage2_d_conv = stage2_d_conv
-        self.stage2_expand = stage2_expand
-        self.stage2_chunk_size = stage2_chunk_size
-        self.stage2_mlp_ratio = stage2_mlp_ratio
-        self.stage2_dropout = stage2_dropout
-        self.stage2_input_norm = stage2_input_norm
-        self.stage2_final_norm = stage2_final_norm
-        self.stage2_time_embed = stage2_time_embed
-        self.stage2_rope_slot_scale = stage2_rope_slot_scale
-        self.stage2_fold_bucket_ratio = stage2_fold_bucket_ratio
-        self.stage2_fold_bucket_max_segments = stage2_fold_bucket_max_segments
-        self.stage2_unit_placement = stage2_unit_placement
-        self.stage2_dp_lambda = stage2_dp_lambda
-        self.stage2_dp_soft_ratio = stage2_dp_soft_ratio
-        self.stage2_bypass_singletons = stage2_bypass_singletons
+        self.segment_time_marks = segment_time_marks
+        # fold knobs (only read when compressor_type endswith "+mamba").
+        self.fold_n_summary_tokens = fold_n_summary_tokens
+        self.fold_frames_per_segment = fold_frames_per_segment
+        self.fold_d_model = fold_d_model
+        self.fold_n_layers = fold_n_layers
+        self.fold_d_state = fold_d_state
+        self.fold_headdim = fold_headdim
+        self.fold_ngroups = fold_ngroups
+        self.fold_d_conv = fold_d_conv
+        self.fold_expand = fold_expand
+        self.fold_chunk_size = fold_chunk_size
+        self.fold_mlp_ratio = fold_mlp_ratio
+        self.fold_dropout = fold_dropout
+        self.fold_input_norm = fold_input_norm
+        self.fold_final_norm = fold_final_norm
+        self.fold_time_embed = fold_time_embed
+        self.fold_rope_slot_scale = fold_rope_slot_scale
+        self.fold_bucket_ratio = fold_bucket_ratio
+        self.fold_bucket_max_segments = fold_bucket_max_segments
+        self.fold_unit_placement = fold_unit_placement
+        self.fold_dp_lambda = fold_dp_lambda
+        self.fold_dp_soft_ratio = fold_dp_soft_ratio
+        self.fold_bypass_singletons = fold_bypass_singletons
 
 def bake_time_tokens(config, tokenizer, max_seconds: int = 4096):
     """Pre-tokenise the pieces the arch assembles ``Time:{a}s-{b}s:`` from and stash
@@ -2101,8 +2320,8 @@ def build_token_compressor(config):
         compressor = Videollama3TokenCompressorConfig(**compressor)
     if isinstance(compressor, Videollama3TokenCompressorConfig):
         ct = compressor.compressor_type
-        # "transformer_decoder_flat+mamba" -> Stage-1 flat qbase + Stage-2 Mamba-2
-        # fold. Checked BEFORE the substring test below (which would otherwise pick
+        # "transformer_decoder_flat+mamba" -> flat qbase + Mamba-2 fold.
+        # Checked BEFORE the substring test below (which would otherwise pick
         # the grid variant).
         if ct.endswith("+mamba"):
             base = ct[: -len("+mamba")]

@@ -289,6 +289,8 @@ class Videollama3MetaForCausalLM(ABC):
         compressor = self.get_token_compressor()
         two_stage = hasattr(compressor, "compress_windows")
 
+        self._last_hybrid_plans = None
+        self._last_seg_lens_by_part = None
         compression_cu_seqlens = [0]
         need_compress_parts = torch.zeros(vision_tokens.shape[0], device=device, dtype=torch.bool)
         replace_mask = torch.zeros(vision_tokens.shape[0], device=device, dtype=torch.bool)
@@ -364,6 +366,20 @@ class Videollama3MetaForCausalLM(ABC):
                 grid_hws,
                 seed=seed,
             )
+            # Raw/qbase hybrid samples (training only, flat qbase): the per-part
+            # piece layout the token rewrite needs to place each raw segment's own
+            # "Time X.Xs:" marker. Keyed by the part's [start, end).
+            plans = getattr(compressor, "_last_hybrid_plan", None)
+            if plans and any(pl is not None for pl in plans):
+                self._last_hybrid_plans = {
+                    tuple(part): pl for part, pl in zip(compression_parts, plans) if pl is not None}
+            # The adaptive segmenter's cut (frames per segment, per window == part, in
+            # compression_parts order): the per-segment `Time:{a}s-{b}s:` rewrite
+            # (segment_time_marks) needs each segment's first / last frame.
+            seg_lens = getattr(compressor, "_last_seg_lens", None)
+            if seg_lens is not None:
+                self._last_seg_lens_by_part = {
+                    tuple(part): [int(x) for x in lens] for part, lens in zip(compression_parts, seg_lens)}
         keeping_masks = ~need_compress_parts | replace_mask
         vision_tokens[replace_mask] = compressed
         vision_tokens = vision_tokens[keeping_masks]
@@ -546,6 +562,7 @@ class Videollama3MetaForCausalLM(ABC):
         compression_frame_sec: Optional[List[List[int]]] = None,
         compression_qbase_only: Optional[List[bool]] = None,
         compression_is_image: Optional[List[bool]] = None,
+        compression_frame_ts_ids: Optional[List[List[List[int]]]] = None,
     ):
         B, N = input_ids.shape
         device = input_ids.device
@@ -690,9 +707,71 @@ class Videollama3MetaForCausalLM(ABC):
                     n_frames = (part[1] - part[0]) // (part_h * part_w)
                     compact = _compressed_len(compressor, n_frames, part_h, part_w,
                                               seed=_seed_for(_seed, part_idx))
+                    plan = (getattr(self, "_last_hybrid_plans", None) or {}).get(tuple(part))
+                    part_is_image = part_idx < len(is_image_part) and bool(is_image_part[part_idx])
+                    if getattr(compressor, "segment_time_marks", False) and not part_is_image:
+                        # Every qbase segment carries its own time:
+                        # `Time:{a}s-{b}s: <cs> K rows <ce>` per segment, {a, b} = the
+                        # segment's first / last frame second. Replaces the whole-span
+                        # range (ts_extra); the old per-frame text is already cut above.
+                        if plan is not None:
+                            raise NotImplementedError(
+                                "segment_time_marks with raw/qbase hybrid samples: the raw "
+                                "segments' layout is undecided -- turn one of them off.")
+                        seg_lens = (getattr(self, "_last_seg_lens_by_part", None) or {}).get(tuple(part))
+                        k = int(getattr(compressor, "num_queries", 0) or 0)
+                        assert seg_lens and sum(seg_lens) == n_frames and len(seg_lens) * k == compact, (
+                            f"segment_time_marks: part {part_idx} cut {seg_lens} (K={k}) does not "
+                            f"match {n_frames} frames / {compact} compressed rows")
+                        frame_sec = (compression_frame_sec[part_idx]
+                                     if compression_frame_sec is not None
+                                     and part_idx < len(compression_frame_sec) else None)
+                        if not frame_sec or len(frame_sec) != n_frames:
+                            raise ValueError(
+                                f"segment_time_marks: part {part_idx} needs compression_frame_sec "
+                                f"(one integer second per frame, {n_frames} frames), got "
+                                f"{None if frame_sec is None else len(frame_sec)} -- the caller must "
+                                f"pass the real frame times (sparse / subsampled frames are not 0,1,2..).")
+                        n_tab = len(getattr(self.config, "time_tok_digits", None) or [])
+                        if max(frame_sec) >= n_tab:
+                            raise ValueError(
+                                f"segment_time_marks: frame second {max(frame_sec)} is past the "
+                                f"baked time table ({n_tab} entries, bake_time_tokens).")
+                        s0 = 0
+                        for L in seg_lens:
+                            _append_ids(self._time_range_token_ids(frame_sec[s0], frame_sec[s0 + L - 1]))
+                            _append_ids([cs_id])
+                            _append_placeholders(k, None)
+                            _append_ids([ce_id])
+                            s0 += L
+                        prev = part_end + 1
+                        continue
                     _append_ids(list(ts_extra) if ts_extra else [])
                     _append_ids([cs_id])
-                    _append_placeholders(compact, None)
+                    if plan is None:
+                        _append_placeholders(compact, None)
+                    else:
+                        # Hybrid sample: in time order, a qbase segment's K rows, or a
+                        # raw segment's middle frame behind its own "Time X.Xs:" (the
+                        # base model's per-frame marker, pre-tokenised by the dataset).
+                        frame_ts = (compression_frame_ts_ids[part_idx]
+                                    if compression_frame_ts_ids is not None
+                                    and part_idx < len(compression_frame_ts_ids) else [])
+                        assert sum(rows for _, rows, _ in plan) == compact, (
+                            f"hybrid plan holds {sum(rows for _, rows, _ in plan)} rows, "
+                            f"output_len_for says {compact}")
+                        for kind, rows, mid in plan:
+                            if kind == "r":
+                                assert mid < len(frame_ts), (
+                                    f"raw segment at frame {mid} but the part carries "
+                                    f"{len(frame_ts)} frame markers (compression_frame_ts_ids)")
+                                _append_ids(list(frame_ts[mid]))
+                            _append_placeholders(int(rows), None)
+                        if os.environ.get("VL3_HYBRID_DEBUG"):
+                            raw = [(mid, rows) for kind, rows, mid in plan if kind == "r"]
+                            print(f"[hybrid] part {part_idx}: {len(plan)} segments, {len(raw)} raw "
+                                  f"(frame, rows) {raw[:4]}, rows {compact}, "
+                                  f"first marker ids {list(frame_ts[raw[0][0]])}", flush=True)
                     _append_ids([ce_id])
 
                 prev = part_end + 1
@@ -737,6 +816,19 @@ class Videollama3MetaForCausalLM(ABC):
                         pieces.append(cur + offsets.to(device=device, dtype=torch.long))
                         cur = cur + int(span)
                 position_ids = torch.cat(pieces).to(torch.long)
+
+        # Debug: VL3_DUMP_REWRITE=<prefix> saves the first rewritten sequence of this
+        # process (<prefix>.pid<pid>.pt) to check the token layout the LLM reads.
+        _dump = os.environ.get("VL3_DUMP_REWRITE")
+        if _dump and not getattr(self, "_rewrite_dumped", False):
+            self._rewrite_dumped = True
+            torch.save({"input_ids": input_ids.detach().cpu(),
+                        "labels": None if labels is None else labels.detach().cpu(),
+                        "position_ids": None if position_ids is None else position_ids.detach().cpu(),
+                        "compression_parts": compression_parts,
+                        "compression_frame_sec": compression_frame_sec,
+                        "seg_lens": getattr(self, "_last_seg_lens_by_part", None)},
+                       f"{_dump}.pid{os.getpid()}.pt")
 
         # 3. embed text tokens
         inputs_embeds = self.get_model().embed_tokens(input_ids).clone()

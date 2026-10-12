@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""qbase LLM-SFT -- LoRA-unfreeze the LLM on top of a frozen qbase, QA-dominant data.
+"""qbase LLM-SFT -- LoRA-unfreeze the LLM on top of the qbase, QA-dominant data.
 
 Why (2026-10-01): with the LLM frozen, qbase_enhance ties raw frames on Video-MME long
 perception questions but trails on reasoning / synopsis (``eval_ablation/long_mcq_budget.py``
@@ -21,8 +21,9 @@ Thin wrapper over ``qbase_enhance_pretrain.py`` (its dataset, args and hooks, th
   the raw arm a valid control after the unfreeze. Raw and compressed tokens never share a
   sample (the training rule in CLAUDE.md).
 
-Trainable: LoRA on the LLM (``--llm_lr``) + ``mm_projector`` (``--mm_projector_lr``). The
-qbase is frozen (``--compressor_lr 0``) so any gain is attributable to the LLM side.
+Trainable: LoRA on the LLM (``--llm_lr``) + ``mm_projector`` (``--mm_projector_lr``) + the
+qbase at ``--compressor_lr`` (the launcher defaults it to 5e-6; ``0`` freezes it, which is the
+setting to use when the gain must be attributable to the LLM side alone).
 Canonical invocation: ``shell/sft_qbase_lora.sh``. The run writes a PEFT adapter; merge
 with ``eval_ablation/merge_lora_checkpoint.py --base work_dirs/qbase_enhance`` before eval.
 """

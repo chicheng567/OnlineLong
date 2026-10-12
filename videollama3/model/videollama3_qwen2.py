@@ -205,6 +205,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
         compression_frame_sec: Optional[List[List[int]]] = None,
         compression_qbase_only: Optional[List[bool]] = None,
         compression_is_image: Optional[List[bool]] = None,
+        compression_frame_ts_ids: Optional[List[List[List[int]]]] = None,
         **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if inputs_embeds is None:
@@ -232,6 +233,7 @@ class Videollama3Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama3MetaForCausalLM):
                 compression_frame_sec=compression_frame_sec,
                 compression_qbase_only=compression_qbase_only,
                 compression_is_image=compression_is_image,
+                compression_frame_ts_ids=compression_frame_ts_ids,
             )
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions

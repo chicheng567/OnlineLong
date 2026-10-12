@@ -28,12 +28,12 @@ no monkeypatching). Three changes:
   uniform random draw.
 
 Warm start: ``--pretrained_compressor_path`` (qbase + its projector + the two
-compression-token rows; a two-stage source contributes ``stage1.*`` and
+compression-token rows; a two-stage source contributes ``qbase.*`` and
 ``mm_projector_qbase``).
 
     PYTHONPATH=. torchrun --nproc_per_node 8 videollama3/train/qbase_enhance_pretrain.py \\
         --compressor_type transformer_decoder_flat --adaptive_segmentation True \\
-        --segment_target_frames_choices 1,2,3,4 --max_frames 64 \\
+        --segment_target_frames_choices 1,2,3,4 --max_frames 180 \\
         --pretrained_compressor_path work_dirs/phase1_qbase_internvid \\
         --multi_dataset True --data_path anno_data/phase3_blend_img.json ...
 (canonical invocation: ``shell/pretrain_qbase_enhance.sh``)
@@ -145,6 +145,11 @@ class QbaseEnhanceDataset(GlobalCompressorLazySupervisedDataset):
         data_dict.setdefault("compression_seed", [seed])
         return data_dict
 
+    def _expected_vision_llm_tokens(self, t: int, hw: int, is_image: bool, tfs, fe: int, k: int) -> float:
+        """Expected compressed rows the LLM reads for a ``t``-frame sample with ``hw``
+        merged tokens per frame: ``E_tf[N] * K``."""
+        return statistics.mean(adaptive_segment_count(t, tf, fe) for tf in tfs) * k
+
     @property
     def encode_costs(self) -> Optional[list]:
         """Estimated step cost per sample, for ``--group_by_encode_cost``: frozen-encoder
@@ -193,7 +198,7 @@ class QbaseEnhanceDataset(GlobalCompressorLazySupervisedDataset):
             if max_frames:
                 t = min(t, max_frames)
             p = _patches_per_frame(h, w, t, proc, merge)
-            n_llm = (statistics.mean(adaptive_segment_count(t, tf, fe) for tf in tfs) * k
+            n_llm = (self._expected_vision_llm_tokens(t, p // (merge * merge), is_image, tfs, fe, k)
                      + _TOKENS_PER_WORD * sum(len(str(c.get("value", "")).split()) for c in conv or []))
             costs.append(_ENC_S_PER_PATCH * t * p + _ENC_S_PER_ATTN * t * p * p
                          + _LLM_S_PER_TOKEN * n_llm)

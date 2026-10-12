@@ -159,7 +159,7 @@ class GlobalCompressorLazySupervisedDataset(LazySupervisedDataset):
         # true); only QbaseLLMSFTDataset (videollama3/train/qbase_llm_sft.py) acts on it.
         self.raw_frames = bool(raw_frames)
         # Phase-2 pure-qbase replay: when True, this dataset's samples bypass the
-        # unit split + fold and route straight through stage-1 (N*K qbase tokens).
+        # unit split + fold and route straight through qbase (N*K qbase tokens).
         # Set per meta-JSON entry ("qbase_only": true); only Phase2FoldDataset acts
         # on it. docs/two_stage_compression_design.md §4 Phase 2.
         self.qbase_only = bool(qbase_only)
@@ -309,6 +309,17 @@ class GlobalCompressorLazySupervisedDataset(LazySupervisedDataset):
             # carries that to the model so the two-stage path does not emit a
             # degenerate `Time:0s-0s:` either (videollama3_arch.py).
             data_dict["compression_is_image"] = [is_still_image]
+            # Integer second of every frame, for the per-segment `Time:{a}s-{b}s:`
+            # (--segment_time_marks): the model picks the segment cuts, so it needs the
+            # whole frame -> second map. Always set (an image gets [0]) so the
+            # collator's per-part list stays aligned with compression_parts.
+            ts = content.get("timestamps")
+            if ts is None or len(ts) == 0:
+                ts = list(range(total_frames))
+            frame_sec = [int(round(float(t))) for t in ts][:total_frames]
+            if len(frame_sec) < total_frames:
+                frame_sec += [frame_sec[-1] if frame_sec else 0] * (total_frames - len(frame_sec))
+            data_dict["compression_frame_sec"] = [frame_sec]
 
         except TooManySampleRejections:
             raise
