@@ -358,78 +358,6 @@ def hybrid_raw_count(n_segments: int, seg_frac: float) -> int:
     return max(0, min(n, int(n_segments) - 1))
 
 
-def rawdp_layout(n_frames: int, hw: int, tf: int, budget: int, k: int,
-                 force_every: int = 8) -> "tuple[int, int]":
-    """``(r, Q)`` for a budgeted raw/qbase window (``qbase_llm_full_ft.py --rawdp_budget``):
-    ``r`` frames stay raw (``hw`` rows each), the other ``T - r`` are covered by
-    ``Q = ⌊(T - r)/tf⌋ + 1`` qbase blocks (``k`` rows each, 1..``force_every`` frames).
-    ``r`` is the largest value with ``r*hw + Q*k <= budget`` and ``r <= T - 1``, so a
-    clip that fits raw still keeps one 1-frame qbase block (the qbase stays in every
-    sample's graph -- a rank with no qbase rows desyncs ZeRO's gradient buffer). If
-    even ``r = 0`` overflows, ``Q`` drops to ``budget // k`` (never below the
-    ``force_every`` floor). A pure function of the frame count, so the dataset's cost
-    estimate, ``output_len_for`` and ``forward`` agree."""
-    T, hw, tf, k = int(n_frames), int(hw), max(1, int(tf)), int(k)
-    if T <= 1:
-        return 0, 1
-
-    def q_for(n):
-        return min(n // tf + 1, n)
-
-    for r in range(T - 1, -1, -1):
-        if r * hw + q_for(T - r) * k <= budget:
-            return r, q_for(T - r)
-    return 0, max(-(-T // int(force_every)), min(q_for(T), int(budget) // k))
-
-
-def rawdp_place(per_frame_feat: torch.Tensor, n_raw: int, n_q: int,
-                max_len: int = 8) -> "tuple[list[int], set[int]]":
-    """Exact DP placement for ``rawdp_layout``'s ``(r, Q)``: cut the ``T`` frames into
-    ``r`` single raw frames and ``Q`` contiguous qbase blocks of 1..``max_len`` frames,
-    minimising the summed within-block WCSS of the L2-normalised per-frame features
-    (the budget fold's changepoint cost). Raw frames cost nothing, so they land on the
-    frames that would spread a block most. Returns ``(seg_lens, raw_idx)``: segment
-    frame-lengths in time order and the indices of the raw (1-frame) segments.
-    ``O(T * max_len * r * Q)``, float64, deterministic."""
-    T = int(per_frame_feat.shape[0])
-    R, Q, Lm = int(n_raw), int(n_q), int(max_len)
-    assert R + Q <= T and Q >= 1 and Q * Lm >= T - R, (T, R, Q, Lm)
-    x = torch.nn.functional.normalize(per_frame_feat.detach().float(), dim=-1).double().cpu()
-    S1 = torch.zeros(T + 1, x.shape[1], dtype=torch.float64)
-    S1[1:] = x.cumsum(0)
-    S2 = torch.zeros(T + 1, dtype=torch.float64)
-    S2[1:] = (x * x).sum(-1).cumsum(0)
-    inf = float("inf")
-    dp = torch.full((T + 1, R + 1, Q + 1), inf, dtype=torch.float64)
-    bt = torch.zeros((T + 1, R + 1, Q + 1), dtype=torch.int8)     # 0 = raw frame, L = block of L
-    dp[0, 0, 0] = 0.0
-    for t in range(1, T + 1):
-        best = torch.full((R + 1, Q + 1), inf, dtype=torch.float64)
-        arg = torch.zeros((R + 1, Q + 1), dtype=torch.int8)
-        if R > 0:                                                   # frame t-1 raw
-            best[1:, :] = dp[t - 1, :-1, :]
-        for L in range(1, min(Lm, t) + 1):                          # block [t-L, t)
-            a = t - L
-            d = S1[t] - S1[a]
-            w = float(S2[t] - S2[a] - (d * d).sum() / L)
-            cand = torch.full((R + 1, Q + 1), inf, dtype=torch.float64)
-            cand[:, 1:] = dp[a, :, :-1] + max(w, 0.0)
-            take = cand < best
-            best = torch.where(take, cand, best)
-            arg[take] = L
-        dp[t], bt[t] = best, arg
-    assert dp[T, R, Q] < inf, f"rawdp_place: no layout for T={T} r={R} Q={Q} max_len={Lm}"
-    lens, raw, t, r, q = [], [], T, R, Q
-    while t > 0:
-        L = int(bt[t, r, q])
-        if L == 0:
-            lens.append(1); raw.append(True); t -= 1; r -= 1
-        else:
-            lens.append(L); raw.append(False); t -= L; q -= 1
-    lens.reverse(); raw.reverse()
-    return lens, {j for j, is_raw in enumerate(raw) if is_raw}
-
-
 def pick_target_frames(choices, seed, default: int) -> int:
     """Per-sample frames/segment for the mixed-granularity qbase stream
     (``--segment_target_frames_choices``): ``choices[seed % len(choices)]`` when both
@@ -920,45 +848,25 @@ class TransformerDecoderFlatCompressor(nn.Module):
         # Raw/qbase hybrid samples (qbase_llm_full_ft.py, training only): with
         # probability ``hybrid_raw_sample_prob`` a seeded sample sends
         # ``hybrid_raw_seg_frac`` of its segments, drawn uniformly from the
-        # ``hybrid_raw_pool_frac`` lowest-change ones, to the LLM as the segment's
-        # middle frame's raw encoder tokens (merge 2, h*w rows) instead of K qbase
-        # rows. A segment is either raw or qbase, never both. Off by default.
+        # ``hybrid_raw_pool_frac`` lowest-change ones, to the LLM raw instead of as K
+        # qbase rows. This module only decides which (``_last_raw_segments``) and
+        # leaves them out of the qbase; their frames' rows, at most
+        # ``hybrid_raw_max_tokens_per_frame`` each, come from ``hybrid_raw.py``.
         self.hybrid_raw_sample_prob = float(getattr(config, "hybrid_raw_sample_prob", 0.0) or 0.0)
         self.hybrid_raw_seg_frac = float(getattr(config, "hybrid_raw_seg_frac", 0.0) or 0.0)
         self.hybrid_raw_pool_frac = float(getattr(config, "hybrid_raw_pool_frac", 0.5) or 0.5)
-        self._last_hybrid_plan = None
-        # Budgeted raw/qbase windows (qbase_llm_full_ft.py --rawdp_budget, 2026-10-10):
-        # every frame is raw unless the window overflows ``rawdp_budget`` rows; then
-        # ``rawdp_layout`` sets (r raw frames, Q qbase blocks) and ``rawdp_place`` puts
-        # them by exact DP. Training only, unless an eval tool sets ``rawdp_at_eval``
-        # (the checkpoint config carries the budget; a plain qbase eval must not
-        # silently switch modes).
-        self.rawdp_budget = int(getattr(config, "rawdp_budget", 0) or 0)
-        self.rawdp_at_eval = False
-        if self.rawdp_budget > 0 and self.hybrid_raw_sample_prob > 0.0:
-            raise ValueError("rawdp_budget and hybrid_raw_sample_prob are exclusive")
+        self.hybrid_raw_max_tokens_per_frame = int(getattr(config, "hybrid_raw_max_tokens_per_frame", 0) or 0)
+        self._last_raw_segments = None
 
     def hybrid_n_raw(self, n_frames: int, seed=None) -> int:
         """Raw segments this window gets (0 = plain qbase). Active only in training,
-        with a per-sample seed and the adaptive segmenter on; a pure function of the
-        frame count and the seed, so ``output_len_for`` and ``forward`` agree."""
+        with a per-sample seed and the adaptive segmenter on."""
         if (not self.training or seed is None or not self.adaptive_segmentation
-                or self.hybrid_raw_sample_prob <= 0.0 or self.hybrid_raw_seg_frac <= 0.0
-                or self.rawdp_on()):
+                or self.hybrid_raw_sample_prob <= 0.0 or self.hybrid_raw_seg_frac <= 0.0):
             return 0
         if hybrid_rng(seed).random() >= self.hybrid_raw_sample_prob:
             return 0
         return hybrid_raw_count(self.segment_count_for(n_frames, seed=seed), self.hybrid_raw_seg_frac)
-
-    def rawdp_on(self) -> bool:
-        return (self.rawdp_budget > 0 and self.adaptive_segmentation
-                and (self.training or self.rawdp_at_eval))
-
-    def rawdp_counts(self, n_frames: int, hw: int, seed=None) -> "tuple[int, int]":
-        """``(r, Q)`` of a budgeted window -- ``rawdp_layout`` with this sample's tf."""
-        tf = pick_target_frames(self.segment_target_frames_choices, seed, self.segment_target_frames)
-        return rawdp_layout(n_frames, hw, tf, self.rawdp_budget, self.num_queries,
-                            self.segment_force_every)
 
     def _hybrid_raw_segments(self, seg_lens, per_frame, n_raw: int, seed) -> "set[int]":
         """Indices of the ``n_raw`` raw segments: rank segments by change (mean
@@ -1002,15 +910,12 @@ class TransformerDecoderFlatCompressor(nn.Module):
         """Compressed token count for a window of ``n_frames`` frames — what the arch
         reserves as placeholder slots. Fixed ``num_queries`` unless the adaptive
         segmenter is on, then ``N * num_queries`` with ``N`` from
-        ``segment_count_for`` (a pure function of the frame count)."""
+        ``segment_count_for`` (a pure function of the frame count). A raw/qbase
+        hybrid window (training only) swaps some segments' K rows for raw frames;
+        its count depends on the cut (``hybrid_raw.window_rows``)."""
         if not self.adaptive_segmentation:
             return int(self.num_queries)
-        if self.rawdp_on():
-            r, q = self.rawdp_counts(n_frames, int(h) * int(w), seed=seed)
-            return r * int(h) * int(w) + q * int(self.num_queries)
-        n = self.segment_count_for(n_frames, seed=seed) * int(self.num_queries)
-        n_raw = self.hybrid_n_raw(n_frames, seed=seed)
-        return n + n_raw * (int(h) * int(w) - int(self.num_queries))
+        return self.segment_count_for(n_frames, seed=seed) * int(self.num_queries)
 
     def _build_cross_rotary_kv(self, compression_cu_seqlens, device, grid_hws, kept_idx=None):
         """KV-side-only counterpart of TransformerDecoderCompressor._build_cross_rotary_3d
@@ -1077,11 +982,13 @@ class TransformerDecoderFlatCompressor(nn.Module):
         # so a caller whose train-state differs from this module's can drive it --
         # TwoStageCompressor.freeze_qbase() pins qbase to eval(), which must NOT
         # also silently disable the jitter the fold-variance thesis relies on.
+        # Hybrid windows: ``self._last_raw_segments`` holds, per window, the sorted
+        # indices of the segments sent raw; they are left out of the qbase, so the
+        # output holds K rows per QBASE segment only (hybrid_raw.py adds the rest).
         if kv.dim() == 3:
             kv = kv.squeeze(0)
         self._last_seg_lens = None
-        self._last_hybrid_plan = None
-        hybrid_src = None
+        self._last_raw_segments = None
         # Encoder-token reference stats (Options A/B), captured before KV pruning /
         # segmentation so the target is the whole window's encoder tokens.
         ref_mean, ref_std, ref_rows = _capture_ref_stats(self, kv)
@@ -1109,7 +1016,7 @@ class TransformerDecoderFlatCompressor(nn.Module):
             new_cu = [0]
             new_grid = []
             seg_lens_per_window = []
-            hybrid_plan = []      # per window: None, or [(kind "q"/"r", rows, middle frame)] in time order
+            raw_segs_per_window = []
             C = kv.size(-1)
             for wi in range(W):
                 a, b = int(cu_in[wi]), int(cu_in[wi + 1])
@@ -1128,42 +1035,29 @@ class TransformerDecoderFlatCompressor(nn.Module):
                         gen.manual_seed((int(sv) * 1_000_003 + wi) % (2 ** 63 - 1))
                 with torch.no_grad():
                     per_frame = kv[a:b].view(span // hw, hw, C).float().mean(1)
-                    if self.rawdp_on():
-                        r, q = self.rawdp_counts(span // hw, hw, seed=sv)
-                        seg_lens, raw_set = rawdp_place(per_frame, r, q, self.segment_force_every)
-                    else:
-                        seg_lens = adaptive_segment_lengths(
-                            per_frame, self.segment_target_frames, self.segment_force_every, tau, gen,
-                            n_segments=self.segment_count_for(span // hw, seed=sv),
-                        )
+                    seg_lens = adaptive_segment_lengths(
+                        per_frame, self.segment_target_frames, self.segment_force_every, tau, gen,
+                        n_segments=self.segment_count_for(span // hw, seed=sv),
+                    )
                 seg_lens_per_window.append([int(x) for x in seg_lens])
-                if not self.rawdp_on():
-                    n_raw = self.hybrid_n_raw(span // hw, seed=sv)
-                    raw_set = (self._hybrid_raw_segments(seg_lens, per_frame, n_raw, sv)
-                               if n_raw > 0 else set())
-                plan, s = [], 0
+                n_raw = self.hybrid_n_raw(span // hw, seed=sv)
+                raw_set = self._hybrid_raw_segments(seg_lens, per_frame, n_raw, sv) if n_raw > 0 else set()
+                raw_segs_per_window.append(sorted(raw_set))
                 for j, L in enumerate(seg_lens):
-                    if j in raw_set:
-                        plan.append(("r", hw, s + (L - 1) // 2))
-                    else:
-                        plan.append(("q", self.num_queries, None))
+                    if j not in raw_set:
                         new_cu.append(new_cu[-1] + L * hw)
                         new_grid.append(grid_hws[wi])
-                    s += L
-                hybrid_plan.append(plan if raw_set else None)
             self._last_seg_lens = seg_lens_per_window
-            self._last_hybrid_plan = hybrid_plan
-            if any(p is not None for p in hybrid_plan):
+            self._last_raw_segments = raw_segs_per_window
+            if any(raw_segs_per_window):
                 # Raw segments drop out of the qbase's sub-windows: run the qbase on
-                # the remaining segments' tokens only (new_cu indexes that subset) and
-                # keep the full kv to read the raw rows from after the layer stack.
-                hybrid_src = (kv, cu_in)
+                # the remaining segments' tokens only (new_cu indexes that subset).
                 keep = []
-                for wi, (lens, plan) in enumerate(zip(seg_lens_per_window, hybrid_plan)):
+                for wi, (lens, raw) in enumerate(zip(seg_lens_per_window, raw_segs_per_window)):
                     hw = int(grid_hws[wi][0]) * int(grid_hws[wi][1])
                     s = int(cu_in[wi])
-                    for L, (kind, _, _) in zip(lens, plan or [("q", 0, None)] * len(lens)):
-                        if kind == "q":
+                    for j, L in enumerate(lens):
+                        if j not in raw:
                             keep.append(kv[s: s + L * hw])
                         s += L * hw
                 kv = torch.cat(keep, dim=0)
@@ -1198,28 +1092,7 @@ class TransformerDecoderFlatCompressor(nn.Module):
                 query, kv, cu_seqlens_q, compression_cu_seqlens,
                 rotary_pos_emb=None, cross_rotary_q=None, cross_rotary_kv=cross_rotary_kv,
             )
-        query = _finalize_compressed(self, query, ref_mean, ref_std, ref_rows)
-        if hybrid_src is None:
-            return query
-        # Interleave, per window in time order: K qbase rows per qbase segment, the
-        # middle frame's h*w encoder rows per raw segment. Option A/B saw qbase rows only.
-        kv_full, cu_in = hybrid_src
-        out, q = [], 0
-        for wi, plan in enumerate(self._last_hybrid_plan):
-            if plan is None:
-                n = len(self._last_seg_lens[wi]) * self.num_queries
-                out.append(query[q: q + n])
-                q += n
-                continue
-            for kind, rows, mid in plan:
-                if kind == "q":
-                    out.append(query[q: q + rows])
-                    q += rows
-                else:
-                    a = int(cu_in[wi]) + mid * rows
-                    out.append(kv_full[a: a + rows].to(query.dtype))
-        assert q == query.shape[0], f"hybrid assembly used {q} of {query.shape[0]} qbase rows"
-        return torch.cat(out, dim=0)
+        return _finalize_compressed(self, query, ref_mean, ref_std, ref_rows)
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@
 import math
 from typing import Dict, List, Optional, Sequence, Union
 
+import einops
 import numpy as np
 
 import torch
@@ -87,6 +88,25 @@ def make_batched_images(images) -> List[List[ImageInput]]:
         return [images]
 
     raise ValueError(f"Could not make batched images from {images}")
+
+
+# The flattened ``pixel_values`` layout: frame-major, then merged-token row / column,
+# then that token's merge x merge patches, each patch's (C, p, p) values in one row.
+# patchify / unpatchify are the only places that spell it (numpy or torch input).
+_PATCH_LAYOUT = "t c (h m1 p1) (w m2 p2) -> (t h w m1 m2) (c p1 p2)"
+
+
+def patchify(frames, merge_size: int, patch_size: int):
+    """``(t, C, H, W)`` frames -> ``(t * H/p * W/p, C * p * p)`` pixel rows."""
+    return einops.rearrange(frames, _PATCH_LAYOUT, m1=merge_size, m2=merge_size, p1=patch_size, p2=patch_size)
+
+
+def unpatchify(patches, t: int, grid_h: int, grid_w: int, merge_size: int, patch_size: int):
+    """Inverse of ``patchify``: pixel rows of ``t`` frames on a ``grid_h x grid_w``
+    patch grid -> ``(t, C, grid_h * p, grid_w * p)``."""
+    src, dst = _PATCH_LAYOUT.split(" -> ")
+    return einops.rearrange(patches, f"{dst} -> {src}", t=t, h=grid_h // merge_size, w=grid_w // merge_size,
+                            m1=merge_size, m2=merge_size, p1=patch_size, p2=patch_size)
 
 
 def simple_batched_resize(
@@ -349,22 +369,8 @@ class Videollama3ImageProcessor(BaseImageProcessor):
         if data_format == ChannelDimension.LAST:
             patches = patches.transpose(0, 3, 1, 2)
         t = patches.shape[0]
-        channel = patches.shape[1]
         grid_h, grid_w = resized_height // self.patch_size, resized_width // self.patch_size
-        patches = patches.reshape(
-            t,
-            channel,
-            grid_h // merge_size,
-            merge_size,
-            self.patch_size,
-            grid_w // merge_size,
-            merge_size,
-            self.patch_size,
-        )
-        patches = patches.transpose(0, 2, 5, 3, 6, 1, 4, 7)
-        flatten_patches = patches.reshape(
-            t * grid_h * grid_w, channel * self.patch_size * self.patch_size
-        )
+        flatten_patches = patchify(patches, merge_size, self.patch_size)
 
         return flatten_patches, (t, grid_h, grid_w)
 

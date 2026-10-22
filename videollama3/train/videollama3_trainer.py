@@ -481,9 +481,16 @@ class VideoLLaMA3Trainer(Trainer):
         # times (empirically confirmed: reported step loss == sum of per-micro-batch
         # loss_partial + loss_distr, so a GAS=16 run applies distr_loss_weight as if
         # it were 16x larger than configured).
+        #
+        # Same for the world size: num_items_in_batch is gathered across ranks (HF
+        # average_tokens_across_devices), so each rank's CE is sum_local / N_global,
+        # and the DeepSpeed gradient allreduce then averages over ranks once more
+        # (this override skips HF's `loss *= num_processes`). `aux` is a per-rank
+        # mean, so it must be divided by world_size too to keep the same CE:distr
+        # ratio as configured by distr_loss_weight.
         aux = self._compressor_distr_loss(model)
         if aux is not None and loss is not None:
-            aux = aux / self.args.gradient_accumulation_steps
+            aux = aux / (self.args.gradient_accumulation_steps * max(1, self.args.world_size))
             loss = loss + aux
             log_dict["loss_distr"] = aux.detach().item()
 
