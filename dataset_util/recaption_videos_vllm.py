@@ -462,8 +462,11 @@ def _probe_clip(
 # vLLM request assembly
 # ---------------------------------------------------------------------------
 
-def _parse_kv_int(spec: str) -> Dict[str, int]:
-    """"image=16,video=1" -> {"image": 16, "video": 1}."""
+def _parse_kv_int(spec: str) -> Dict:
+    """"image=16,video=1" -> {"image": 16, "video": 1}. A JSON object passes through
+    as-is, for vLLM's per-modality dummy options ({"video": {"count": 1, ...}})."""
+    if spec.lstrip().startswith("{"):
+        return json.loads(spec)
     out: Dict[str, int] = {}
     for part in spec.split(","):
         part = part.strip()
@@ -576,7 +579,139 @@ def _run_chat(llm, sampling_params, convs: List[List[Dict]], rank: int) -> List[
     return res
 
 
+# ---------------------------------------------------------------------------
+# --predecode_fps: frames decoded here, handed to vLLM pre-sampled
+# ---------------------------------------------------------------------------
+#
+# With vLLM 0.28 sampling the frames itself (video_url + fps), the HF processor
+# and vLLM's _get_video_second_idx() each recompute the sampled-frame count and
+# disagree on some clips, which trips the FATAL `len(timestamps) ==
+# len(tokens_per_frame)` assert. Decoding here pins the exact frame list (an
+# even count at exactly --predecode_fps), passes it with do_sample_frames=False,
+# keeps the native resolution (the processor only rounds to a multiple of 32
+# under the --mm_processor_kwargs_json size budget), and makes the timestamps
+# real: frames_indices / source fps.
+
+def _decode_video_fps(path: str, fps: float, num_frames: int = 0, max_video_tokens: int = 0) -> Tuple["object", Dict]:
+    """(frames uint8 (T, H, W, 3) RGB, vLLM video metadata) at `fps`, T even.
+    num_frames > 0 instead takes that many frames uniformly over the whole clip
+    (every frame when the clip has fewer)."""
+    import cv2
+    import numpy as np
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise ValueError(f"cannot open {path}")
+    src_fps = float(cap.get(cv2.CAP_PROP_FPS))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if src_fps <= 0 or total <= 0:
+        cap.release()
+        raise ValueError(f"unusable video metadata (frames={total}, fps={src_fps})")
+    if num_frames > 0:
+        n = min(num_frames, total)
+        wanted = sorted({int(round(i * (total - 1) / max(n - 1, 1))) for i in range(n)})
+    else:
+        step = src_fps / fps
+        wanted = sorted({int(round(i * step)) for i in range(max(1, int(total / step)))} & set(range(total)))
+    wanted_set, frames, kept, idx = set(wanted), [], [], 0
+    while idx <= wanted[-1]:
+        if not cap.grab():
+            break
+        if idx in wanted_set:
+            ok, frame = cap.retrieve()
+            if ok:
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                kept.append(idx)
+        idx += 1
+    cap.release()
+    if not frames:
+        raise ValueError(f"no decodable frame in {path}")
+    while len(frames) < 4 or len(frames) % 2:  # temporal_patch_size 2, processor min 4
+        frames.append(frames[-1])
+        kept.append(kept[-1])
+    # Native resolution unless the clip would not fit the context: only then
+    # shrink (aspect kept) until (T/2) * (H/32) * (W/32) <= max_video_tokens.
+    h, w = frames[0].shape[:2]
+    scale = 1.0
+    if max_video_tokens > 0:
+        tok = len(frames) / 2 * round(h / 32) * round(w / 32)
+        if tok > max_video_tokens:
+            scale = (max_video_tokens / tok) ** 0.5 * 0.97
+            nh, nw = max(32, int(h * scale)), max(32, int(w * scale))
+            frames = [cv2.resize(f, (nw, nh), interpolation=cv2.INTER_AREA) for f in frames]
+    meta = {
+        "fps": src_fps,
+        "total_num_frames": total,
+        "frames_indices": kept,
+        "duration": total / src_fps,
+        "video_backend": "opencv",
+        "do_sample_frames": False,
+        "_downscale": scale,
+    }
+    return np.stack(frames), meta
+
+
+def _build_generate_input(sample: Dict, args, media_root: Optional[str], tokenizer) -> Dict:
+    """One llm.generate() input with pre-decoded frames (video samples only)."""
+    path = _resolve_path(sample["raw"], str(sample["video"]), media_root)
+    frames, meta = _decode_video_fps(path, args.predecode_fps, args.predecode_num_frames,
+                                     args.max_video_tokens)
+    sample["_downscale"] = meta.pop("_downscale")
+    msgs: List[Dict] = []
+    if args.system_prompt:
+        msgs.append({"role": "system", "content": args.system_prompt})
+    msgs.append({"role": "user", "content": [{"type": "video"}, {"type": "text", "text": sample["prompt"]}]})
+    text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    sample["_approx_frames"] = len(meta["frames_indices"])
+    sample["_duration"] = meta["duration"]
+    sample["_real_timestamps"] = [round(i / meta["fps"], 2) for i in meta["frames_indices"]]
+    return {"prompt": text, "multi_modal_data": {"video": (frames, meta)}}
+
+
+def _engine_dead(exc: BaseException) -> bool:
+    """A dead EngineCore fails every later request instantly; skipping on would
+    'finish' the shard with nothing written. Re-raise so the run stops (resumable)."""
+    return type(exc).__name__ == "EngineDeadError" or "EngineCore encountered" in str(exc)
+
+
+def _run_generate(llm, sampling_params, inputs: List[Dict], rank: int) -> List[Optional[str]]:
+    """llm.generate counterpart of _run_chat, with the same per-sample retry."""
+    try:
+        outs = llm.generate(inputs, sampling_params, use_tqdm=False)
+        return [o.outputs[0].text for o in outs]
+    except Exception as exc:  # noqa: BLE001
+        if _engine_dead(exc):
+            raise
+        logger.warning("rank %d: chunk generate failed (%s); retrying per-sample.", rank, exc)
+
+    res: List[Optional[str]] = []
+    for inp in inputs:
+        try:
+            res.append(llm.generate([inp], sampling_params, use_tqdm=False)[0].outputs[0].text)
+        except Exception as exc:  # noqa: BLE001
+            if _engine_dead(exc):
+                raise
+            logger.warning("rank %d: sample generate failed: %s", rank, exc)
+            res.append(None)
+    return res
+
+
 def _make_record(sample: Dict, text: str, args) -> Dict:
+    if sample.get("_real_timestamps") is not None:
+        return {
+            "video_id": sample["video_id"],
+            "video": sample["video"],
+            "num_frames": sample["_approx_frames"],
+            "video_duration": round(sample["_duration"], 2),
+            "sampling_fps": None if args.predecode_num_frames > 0 else args.predecode_fps,
+            "timestamps": sample["_real_timestamps"],
+            "timestamps_synthetic": False,
+            "downscaled_from_native": round(sample.get("_downscale", 1.0), 3) if sample.get("_downscale", 1.0) < 1.0 else None,
+            "prompt_name": sample["prompt_name"],
+            "prompt": sample["prompt"],
+            "caption": text.strip(),
+            "model": args.model,
+        }
     nf = sample.get("_approx_frames")
     dur = sample.get("_duration")
     if nf is None and args.timestamps == "uniform":
@@ -716,7 +851,8 @@ def main():
     parser.add_argument("--max_num_seqs", type=int, default=16,
                         help="vLLM's concurrent-sequence cap. Lower to ~4-8 on a smaller card.")
     parser.add_argument("--limit_mm_per_prompt", default="image=16,video=1",
-                        help="Per-prompt multimodal-item ceiling passed to vLLM, 'k=v,k=v'.")
+                        help="Per-prompt multimodal-item ceiling passed to vLLM, 'k=v,k=v' or a JSON "
+                             "object (e.g. to cap the profiling dummy video's num_frames/width/height).")
     parser.add_argument("--dtype", default="auto", choices=["auto", "bfloat16", "float16"])
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--enforce_eager", action="store_true",
@@ -738,6 +874,23 @@ def main():
                              "ODD frame count, which trips a FATAL assert in vLLM 0.28's Qwen3-VL "
                              "processor and kills the rank. A clip with fewer real frames than "
                              "this is skipped (that is ~1-2% of internVid, the <30 s clips).")
+    parser.add_argument("--mm_encoder_attn_backend", default=None,
+                        help="vLLM ViT attention backend override (e.g. TORCH_SDPA). vLLM 0.28's FA3 "
+                             "ViT kernel failed mid-run on 1 fps native-res internVid clips.")
+    parser.add_argument("--predecode_fps", type=float, default=0.0,
+                        help="Decode frames here at exactly this fps (count padded to even) and pass "
+                             "them pre-sampled with do_sample_frames=False, instead of letting vLLM "
+                             "sample from the file. Avoids vLLM 0.28's odd-frame timestamp assert and "
+                             "yields REAL timestamps. 0 = off (vLLM samples via --fps / --num_frames).")
+    parser.add_argument("--predecode_num_frames", type=int, default=0,
+                        help="With --predecode_fps: take this many frames uniformly over the clip "
+                             "instead of a fixed fps (0 = use --predecode_fps).")
+    parser.add_argument("--max_video_tokens", type=int, default=0,
+                        help="With --predecode_fps: shrink ONLY clips whose native-res video tokens "
+                             "exceed this, to fit the context (0 = never shrink).")
+    parser.add_argument("--decode_workers", type=int, default=16,
+                        help="Threads decoding the next chunk while the current one generates "
+                             "(--predecode_fps only).")
     parser.add_argument("--fps", type=float, default=2.0,
                         help="Frames per second vLLM samples from each video (Qwen3-VL builds its "
                              "timestamp markers from this grid). 0 leaves the processor default. "
@@ -910,6 +1063,8 @@ def main():
             allowed_local_media_path=args.allowed_local_media_path,
             seed=args.seed,
             disable_log_stats=True,
+            **({"mm_encoder_attn_backend": args.mm_encoder_attn_backend}
+               if args.mm_encoder_attn_backend else {}),
         )
 
         sampling_params = SamplingParams(
@@ -924,26 +1079,50 @@ def main():
         n_fail = 0
         fout = open(rank_file, "a", encoding="utf-8")
         pbar = tqdm(total=len(shard), desc=f"[rank {rank}] captioning", disable=(rank != 0))
-        for start in range(0, len(shard), args.chunk_size):
-            chunk = shard[start:start + args.chunk_size]
-            convs: List[List[Dict]] = []
+        chunks = [shard[i:i + args.chunk_size] for i in range(0, len(shard), args.chunk_size)]
+        if args.predecode_fps > 0:
+            # Decode chunk k+1 on a thread pool (cv2 releases the GIL) while
+            # chunk k is in llm.generate().
+            from concurrent.futures import ThreadPoolExecutor
+            tokenizer = llm.get_tokenizer()
+            pool = ThreadPoolExecutor(args.decode_workers)
+            submit = lambda ch: [pool.submit(_build_generate_input, s, args, media_root, tokenizer) for s in ch]
+            pending = submit(chunks[0]) if chunks else []
+        for ci, chunk in enumerate(chunks):
+            convs: List = []
             kept: List[Dict] = []
-            for s in chunk:
-                try:
-                    convs.append(_build_messages(s, args, media_root))
-                    kept.append(s)
-                except Exception as exc:  # noqa: BLE001
-                    n_fail += 1
-                    logger.warning("Skipping %s: %s", s["video_id"], exc)
+            if args.predecode_fps > 0:
+                futures = pending
+                pending = submit(chunks[ci + 1]) if ci + 1 < len(chunks) else []
+                for s, fut in zip(chunk, futures):
+                    try:
+                        convs.append(fut.result())
+                        kept.append(s)
+                    except Exception as exc:  # noqa: BLE001
+                        n_fail += 1
+                        logger.warning("Skipping %s: %s", s["video_id"], exc)
+            else:
+                for s in chunk:
+                    try:
+                        convs.append(_build_messages(s, args, media_root))
+                        kept.append(s)
+                    except Exception as exc:  # noqa: BLE001
+                        n_fail += 1
+                        logger.warning("Skipping %s: %s", s["video_id"], exc)
 
             if convs:
-                texts = _run_chat(llm, sampling_params, convs, rank)
+                if args.predecode_fps > 0:
+                    texts = _run_generate(llm, sampling_params, convs, rank)
+                else:
+                    texts = _run_chat(llm, sampling_params, convs, rank)
                 for s, text in zip(kept, texts):
                     if text is None:
                         n_fail += 1
                         continue
                     fout.write(json.dumps(_make_record(s, text, args), ensure_ascii=False) + "\n")
                 fout.flush()
+            for s in kept:  # drop decoded frames refs / per-sample state
+                s.pop("_real_timestamps", None)
             pbar.update(len(chunk))
 
         pbar.close()
